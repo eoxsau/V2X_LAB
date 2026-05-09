@@ -1,0 +1,15 @@
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+build/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+*.log
+packages/db/generated/

@@ -1,0 +1,20 @@
+{
+  "name": "autonomous-v2x-ai-routing-lab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser-based autonomous-driving V2X network-aware AI routing and analysis platform.",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev:web": "corepack pnpm --filter web dev",
+    "build:web": "corepack pnpm --filter web build",
+    "dev:api": "cd apps/api && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000",
+    "db:generate": "corepack pnpm --filter @v2x-lab/db generate",
+    "db:migrate": "corepack pnpm --filter @v2x-lab/db migrate",
+    "db:studio": "corepack pnpm --filter @v2x-lab/db studio",
+    "db:validate": "corepack pnpm --filter @v2x-lab/db validate"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

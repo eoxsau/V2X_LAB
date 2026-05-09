@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: autonomous_v2x_lab_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: v2x_lab
+      POSTGRES_PASSWORD: v2x_lab
+      POSTGRES_DB: v2x_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U v2x_lab -d v2x_lab"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

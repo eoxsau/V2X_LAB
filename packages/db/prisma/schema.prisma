@@ -1,0 +1,333 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ScenarioMode {
+  URBAN_MOBILITY
+  V2X_RESEARCH
+}
+
+enum SimulationStatus {
+  CREATED
+  RUNNING
+  STOPPED
+  COMPLETED
+  FAILED
+}
+
+enum OptimizationMode {
+  RULE_BASELINE
+  TRAFFIC_AWARE
+  NETWORK_AWARE_AI
+}
+
+enum ObstacleType {
+  BUILDING_ZONE
+  ACCIDENT_ZONE
+  CONSTRUCTION_ZONE
+  LOW_VISIBILITY_ZONE
+  NETWORK_BLOCKAGE_ZONE
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  name      String?
+  projects  Project[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+model Project {
+  id          String       @id @default(cuid())
+  name        String
+  description String?
+  ownerId     String?
+  owner       User?        @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  scenarios   Scenario[]
+  experiments Experiment[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([ownerId])
+}
+
+model Scenario {
+  id           String        @id @default(cuid())
+  projectId    String
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  mode         ScenarioMode  @default(URBAN_MOBILITY)
+  mapCenterLat Float         @default(37.5667)
+  mapCenterLng Float         @default(126.9784)
+  vehicles     Vehicle[]
+  roadSegments RoadSegment[]
+  baseStations BaseStation[]
+  edgeNodes    EdgeNode[]
+  obstacles    Obstacle[]
+  routes       Route[]
+  simulations  Simulation[]
+  experiments  Experiment[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([projectId])
+}
+
+model Vehicle {
+  id                     String       @id @default(cuid())
+  scenarioId             String
+  scenario               Scenario     @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId             String?
+  name                   String
+  latitude               Float
+  longitude              Float
+  speed                  Float        @default(0)
+  heading                Float        @default(0)
+  currentRouteId         String?
+  currentRoute           Route?       @relation(fields: [currentRouteId], references: [id], onDelete: SetNull)
+  connectedBaseStationId String?
+  connectedBaseStation   BaseStation? @relation(fields: [connectedBaseStationId], references: [id], onDelete: SetNull)
+  connectedEdgeNodeId    String?
+  connectedEdgeNode      EdgeNode?    @relation(fields: [connectedEdgeNodeId], references: [id], onDelete: SetNull)
+  currentLatencyMs       Float?
+  obstacleRisk           Float        @default(0)
+  networkBlockageRisk    Float        @default(0)
+  routeStatus            String?
+  metadata               Json?
+  aiAnalyses             AIAnalysis[]
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+  @@index([currentRouteId])
+  @@index([connectedBaseStationId])
+  @@index([connectedEdgeNodeId])
+}
+
+model RoadSegment {
+  id                 String   @id @default(cuid())
+  scenarioId         String
+  scenario           Scenario @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId         String?
+  name               String
+  geometry           Json
+  averageSpeed       Float    @default(0)
+  congestionScore    Float    @default(0)
+  travelTimeEstimate Float    @default(0)
+  obstacleRisk       Float    @default(0)
+  metadata           Json?
+  routes             Route[]  @relation("RoadSegmentsOnRoutes")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+}
+
+model BaseStation {
+  id                       String       @id @default(cuid())
+  scenarioId               String
+  scenario                 Scenario     @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId               String?
+  name                     String
+  latitude                 Float
+  longitude                Float
+  frequency                Float?
+  txPower                  Float?
+  capacity                 Int
+  currentConnectedVehicles Int          @default(0)
+  congestionScore          Float        @default(0)
+  source                   String       @default("synthetic")
+  rawPayload               Json?
+  connectedVehicles        Vehicle[]
+  aiAnalyses               AIAnalysis[]
+  createdAt                DateTime     @default(now())
+  updatedAt                DateTime     @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+}
+
+model EdgeNode {
+  id                String    @id @default(cuid())
+  scenarioId        String
+  scenario          Scenario  @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId        String?
+  name              String
+  latitude          Float
+  longitude         Float
+  capacity          Int
+  computeLoad       Float     @default(0)
+  edgeLatencyMs     Float     @default(0)
+  source            String    @default("synthetic")
+  connectedVehicles Vehicle[]
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+}
+
+model Obstacle {
+  id         String       @id @default(cuid())
+  scenarioId String
+  scenario   Scenario     @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId String?
+  type       ObstacleType
+  latitude   Float
+  longitude  Float
+  radiusM    Float
+  severity   Float
+  source     String       @default("synthetic")
+  metadata   Json?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+}
+
+model Route {
+  id                  String        @id @default(cuid())
+  scenarioId          String
+  scenario            Scenario      @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  externalId          String?
+  name                String
+  geometry            Json
+  distanceKm          Float
+  roadCongestion      Float         @default(0)
+  obstacleRisk        Float         @default(0)
+  networkLatencyMs    Float?
+  edgeNodeDistanceKm  Float?
+  v2xStability        Float?
+  scoreBreakdown      Json?
+  riskySegments       Json?
+  roadSegments        RoadSegment[] @relation("RoadSegmentsOnRoutes")
+  currentVehicles     Vehicle[]
+  recommendedAnalyses AIAnalysis[]
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  @@unique([scenarioId, externalId])
+  @@index([scenarioId])
+}
+
+model Simulation {
+  id               String             @id @default(cuid())
+  scenarioId       String
+  scenario         Scenario           @relation(fields: [scenarioId], references: [id], onDelete: Cascade)
+  status           SimulationStatus   @default(CREATED)
+  optimizationMode OptimizationMode   @default(NETWORK_AWARE_AI)
+  startedAt        DateTime?
+  stoppedAt        DateTime?
+  ticks            SimulationTick[]
+  metrics          SimulationMetric[]
+  aiAnalyses       AIAnalysis[]
+  assistantLogs    AssistantLog[]
+  experiments      Experiment[]
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  @@index([scenarioId])
+  @@index([status])
+}
+
+model SimulationTick {
+  id           String     @id @default(cuid())
+  simulationId String
+  simulation   Simulation @relation(fields: [simulationId], references: [id], onDelete: Cascade)
+  tick         Int
+  vehicles     Json
+  roads        Json
+  baseStations Json
+  edgeNodes    Json
+  obstacles    Json
+  routes       Json
+  eventLogs    Json?
+  createdAt    DateTime   @default(now())
+
+  @@unique([simulationId, tick])
+  @@index([simulationId])
+}
+
+model SimulationMetric {
+  id                       String     @id @default(cuid())
+  simulationId             String
+  simulation               Simulation @relation(fields: [simulationId], references: [id], onDelete: Cascade)
+  tick                     Int?
+  avgVehicleLatency        Float
+  avgPredictedLatency      Float
+  avgRoadCongestion        Float
+  avgBaseStationCongestion Float
+  avgObstacleRisk          Float
+  routeChangeCount         Int
+  baseStationHandoffCount  Int
+  createdAt                DateTime   @default(now())
+
+  @@index([simulationId])
+  @@index([simulationId, tick])
+}
+
+model AIAnalysis {
+  id                       String      @id @default(cuid())
+  simulationId             String
+  simulation               Simulation  @relation(fields: [simulationId], references: [id], onDelete: Cascade)
+  vehicleId                String
+  vehicle                  Vehicle     @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  predictedLatencyMs       Float
+  predictedCongestionScore Float
+  predictedBlockageRisk    Float
+  recommendedRouteId       String
+  recommendedRoute         Route       @relation(fields: [recommendedRouteId], references: [id], onDelete: Cascade)
+  recommendedBaseStationId String
+  recommendedBaseStation   BaseStation @relation(fields: [recommendedBaseStationId], references: [id], onDelete: Cascade)
+  confidence               Float
+  explanationFactors       Json
+  createdAt                DateTime    @default(now())
+
+  @@index([simulationId])
+  @@index([vehicleId])
+  @@index([recommendedRouteId])
+  @@index([recommendedBaseStationId])
+}
+
+model Experiment {
+  id           String      @id @default(cuid())
+  projectId    String
+  project      Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  scenarioId   String?
+  scenario     Scenario?   @relation(fields: [scenarioId], references: [id], onDelete: SetNull)
+  simulationId String?
+  simulation   Simulation? @relation(fields: [simulationId], references: [id], onDelete: SetNull)
+  name         String
+  description  String?
+  parameters   Json?
+  results      Json?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([projectId])
+  @@index([scenarioId])
+  @@index([simulationId])
+}
+
+model AssistantLog {
+  id           String      @id @default(cuid())
+  simulationId String?
+  simulation   Simulation? @relation(fields: [simulationId], references: [id], onDelete: SetNull)
+  role         String
+  title        String?
+  content      String
+  metadata     Json?
+  createdAt    DateTime    @default(now())
+
+  @@index([simulationId])
+}
