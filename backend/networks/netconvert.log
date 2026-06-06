@@ -1,0 +1,53 @@
+Parsing types from 'C:\Program Files (x86)\Eclipse\Sumo\/data/typemap/osmNetconvert.typ.xml' ... done.
+Parsing nodes from osm-file 'C:\Users\최동혁\Desktop\sumo_connect\backend\networks\area.osm' ... done (35ms).
+Parsing edges from osm-file 'C:\Users\최동혁\Desktop\sumo_connect\backend\networks\area.osm' ... done (6ms).
+Removing duplicate edges ... done.
+ Removed 31 traffic lights before loading plain-XML
+ Import done:
+   522 nodes loaded.
+   38 types loaded.
+   1116 edges loaded.
+Proj projection parameters used: '+proj=utm +zone=52 +ellps=WGS84 +datum=WGS84 +units=m +no_defs'.
+Removing self-loops ... done (0ms).
+Joining junction clusters ...
+ done (3ms).
+ Joined 30 junction cluster(s).
+Removing empty nodes and geometry nodes ... done (0ms).
+   59 nodes removed.
+Moving network to origin ... done (9ms).
+Computing turning directions ...
+ done (0ms).
+Assigning nodes to traffic lights ... done (1ms).
+Guessing and setting on-/off-ramps ... done (3ms).
+Sorting nodes' edges ... done (0ms).
+Computing node shapes ... done (11ms).
+Computing edge shapes ... done (5ms).
+Computing node types ... done (0ms).
+Computing priorities ... done (1ms).
+Computing approached edges ... done (1ms).
+Guessing and setting roundabouts ... done (0ms).
+Computing approaching lanes ... done (4ms).
+Dividing of lanes on approached lanes ... done (4ms).
+Processing turnarounds ... done (0ms).
+Rechecking of lane endings ... done (1ms).
+Computing traffic light control information ... done (0ms).
+Computing node logics ... done (5ms).
+Computing traffic light logics ...
+ done (0ms).
+ 2 traffic light(s) computed.
+Building inner edges ...
+ done (14ms).
+-----------------------------------------------------
+Summary:
+ Node type statistics:
+  Unregulated junctions       : 0
+  Dead-end junctions          : 86
+  Priority junctions          : 318
+  Right-before-left junctions : 8
+  Traffic light junctions      : 2
+ Network boundaries:
+  Original boundary  : 127.02,37.50,127.05,37.53
+  Applied offset     : -325028.63,-4152437.15
+  Converted boundary : 0.00,0.00,2428.41,3298.36
+-----------------------------------------------------
+Writing network ... done (61ms).
