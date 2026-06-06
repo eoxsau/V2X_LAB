@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# SUMO generated files (created automatically at runtime)
+backend/networks/*.net.xml
+backend/networks/*.osm
+backend/networks/*.log
+backend/networks/*.rou.xml
+backend/networks/*.sumocfg
+
+# Claude Code IDE
+.claude/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Design drafts
+design.html
+design_extracted/
