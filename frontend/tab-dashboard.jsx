@@ -34,15 +34,84 @@ function WorkflowDiagram({ current = 4 }) {
   );
 }
 
-function Dashboard({ sim, go }) {
+function Dashboard({ sim, go, vehiclePos, networkTelemetry, simHistory }) {
+  const hasLive = !!vehiclePos;
+  const connNode = networkTelemetry?.ego_vehicle?.connected_network_node_name
+    ?? networkTelemetry?.connected_node?.name
+    ?? null;
+  const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
+    ?? networkTelemetry?.latency_ms
+    ?? null;
+  const speed = vehiclePos?.speed ?? null;
+  const progress = vehiclePos?.progress ?? 0;
+
+  const latencyTxt = latency !== null ? latency.toFixed(1) : '—';
+  const latencyTone = latency !== null ? (latency >= 20 ? 'bad' : latency >= 12 ? 'warn' : 'good') : null;
+
   const cards = [
-    { label: '시뮬레이션 상태', icon: 'clock', value: sim.running ? '실행 중' : sim.elapsed > 0 ? '일시정지' : '미시작', sub: fmtClock(sim.elapsed) + ' 경과', accent: true },
-    { label: '총 차량 수', icon: 'car', value: '12', unit: '대', sub: '이동 7 · 정지 5' },
-    { label: '평균 속도', icon: 'speed', value: '34.7', unit: 'km/h', sub: 'σ ±11.2 km/h' },
-    { label: '네트워크 모드', icon: 'net', value: sim.mode === '6G' ? '6G-like' : '5G NR', sub: sim.mode === '6G' ? 'L_base 0.1ms' : 'L_base 1.0ms' },
-    { label: '활성 기지국', icon: 'antenna', value: '3', unit: '개', sub: 'BS-02 혼잡 (62.4%)' },
-    { label: '평균 지연 Latency', icon: 'latency', value: '8.2', unit: 'ms', sub: '위험 이벤트 3건' },
+    {
+      label: '시뮬레이션 상태', icon: 'clock',
+      value: sim.running ? '실행 중' : sim.elapsed > 0 ? '일시정지' : '미시작',
+      sub: fmtClock(sim.elapsed) + ' 경과', accent: true,
+    },
+    {
+      label: '차량 수', icon: 'car',
+      value: hasLive ? '1' : '12', unit: '대',
+      sub: hasLive ? (vehiclePos.arrived ? '도착 완료' : `진행 ${(progress * 100).toFixed(0)}%`) : '이동 7 · 정지 5',
+    },
+    {
+      label: '현재 속도', icon: 'speed',
+      value: speed !== null ? speed.toFixed(1) : '34.7', unit: 'km/h',
+      sub: speed !== null ? (hasLive ? '실시간 SUMO 데이터' : 'SUMO 데이터') : 'σ ±11.2 km/h',
+    },
+    {
+      label: '네트워크 모드', icon: 'net',
+      value: sim.mode === '6G' ? '6G-like' : '5G NR',
+      sub: sim.mode === '6G' ? 'L_base 0.1ms' : 'L_base 1.0ms',
+    },
+    {
+      label: '연결 기지국', icon: 'antenna',
+      value: connNode ?? '—', unit: '',
+      sub: connNode
+        ? `거리 ${(networkTelemetry?.distance_m ?? 0).toFixed(0)}m`
+        : (hasLive ? '기지국 없음' : 'BS-02 혼잡 (62.4%)'),
+    },
+    {
+      label: '현재 Latency', icon: 'latency',
+      value: latencyTxt, unit: latency !== null ? 'ms' : '',
+      sub: latency !== null
+        ? (latency > 20 ? '위험 상태 (>20ms)' : latency > 12 ? '보통' : '정상 범위')
+        : (hasLive ? '기지국 미연결' : '위험 이벤트 3건'),
+    },
   ];
+
+  const latencyHistory = simHistory.length >= 2
+    ? simHistory.map(h => h.latency ?? 0)
+    : DATA.series.latencyAvg;
+  const latencyLabels = simHistory.length >= 2
+    ? simHistory.map((h, i) => i % Math.max(1, Math.floor(simHistory.length / 6)) === 0 ? fmtClock(h.t) : '')
+    : ['0:00','','0:30','','1:00','','1:30','','2:00','','3:00','','3:42'];
+
+  const congestionScore = networkTelemetry?.connected_node?.congestion_score ?? null;
+  const donutValue = congestionScore !== null ? Math.round(congestionScore * 100) : 29;
+
+  const candidates = networkTelemetry?.candidate_nodes ?? [];
+  const bsItems = candidates.length > 0
+    ? candidates.slice(0, 5).map(c => {
+        const ms = c.predicted_latency_ms ?? 0;
+        const pct = Math.min(100, Math.round(ms / 0.3));
+        return {
+          label: (c.name ?? c.id ?? '').replace(/기지국\s*/, 'BS-'),
+          value: pct,
+          display: ms.toFixed(1) + 'ms',
+          color: pct > 50 ? 'var(--bad)' : pct > 25 ? 'var(--warn)' : 'var(--good)',
+        };
+      })
+    : DATA.baseStations.map(b => ({
+        label: b.id, value: b.rho, display: b.rho + '%',
+        color: b.rho > 50 ? 'var(--bad)' : b.rho > 25 ? 'var(--warn)' : 'var(--good)',
+      }));
+
   return (
     <div className="page-pad fade">
       <div className="page-head">
@@ -52,6 +121,7 @@ function Dashboard({ sim, go }) {
           <div className="sub">자율주행 V2X AI 라우팅 시뮬레이션 전체 현황</div>
         </div>
         <div className="row gap12">
+          {hasLive && <Chip tone="good" dot>LIVE</Chip>}
           <button className="btn" onClick={() => go('analysis')}><Icon.chart size={15} /> 분석 보기</button>
           <button className="btn primary" onClick={() => go('simulation')}><Icon.map size={15} /> 시뮬레이션 열기</button>
         </div>
@@ -66,22 +136,35 @@ function Dashboard({ sim, go }) {
       </Card>
 
       <div className="grid" style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 18 }}>
-        <Card title="평균 Latency 추이" en="Avg latency / time" right={<Chip tone="good" dot>안정</Chip>}>
-          <LineChart series={[DATA.series.latencyAvg]} height={190} yUnit="ms" yMax={32} threshold={20}
-            labels={['0:00','','0:30','','1:00','','1:30','','2:00','','3:00','','3:42']} />
+        <Card
+          title="Latency 추이"
+          en={simHistory.length >= 2 ? '실시간 · ms' : 'Avg latency / time'}
+          right={
+            latency !== null
+              ? <Chip tone={latencyTone} dot>{latencyTxt}ms</Chip>
+              : <Chip tone="good" dot>안정</Chip>
+          }
+        >
+          <LineChart series={[latencyHistory]} height={190} yUnit="ms" yMax={32} threshold={20} labels={latencyLabels} />
           <div className="row gap16" style={{ marginTop: 8, fontSize: 11 }}>
-            <span className="row gap8"><span style={{ width: 18, height: 3, background: 'var(--brand-2)', borderRadius: 2 }} /> 평균 Latency</span>
+            <span className="row gap8"><span style={{ width: 18, height: 3, background: 'var(--brand-2)', borderRadius: 2 }} /> {simHistory.length >= 2 ? '실시간 Latency' : '평균 Latency'}</span>
             <span className="row gap8"><span style={{ width: 18, height: 0, borderTop: '2px dashed var(--bad)' }} /> 위험 임계 20ms</span>
           </div>
         </Card>
-        <Card title="네트워크 부하" en="Network load" right={<span className="mono muted" style={{ fontSize: 10 }}>% capacity</span>}>
+        <Card
+          title="네트워크 부하"
+          en={candidates.length > 0 ? '후보 기지국 · latency' : 'Network load'}
+          right={<span className="mono muted" style={{ fontSize: 10 }}>{candidates.length > 0 ? 'ms' : '% capacity'}</span>}
+        >
           <div className="row" style={{ justifyContent: 'center', padding: '6px 0 14px' }}>
-            <Donut value={29} label="전체 점유율" color="var(--brand-2)" size={120} />
+            <Donut
+              value={donutValue}
+              label={congestionScore !== null ? '혼잡도' : '전체 점유율'}
+              color="var(--brand-2)"
+              size={120}
+            />
           </div>
-          <BarChart items={DATA.baseStations.map(b => ({
-            label: b.id, value: b.rho, display: b.rho + '%',
-            color: b.rho > 50 ? 'var(--bad)' : b.rho > 25 ? 'var(--warn)' : 'var(--good)'
-          }))} max={100} />
+          <BarChart items={bsItems} max={100} />
         </Card>
       </div>
     </div>

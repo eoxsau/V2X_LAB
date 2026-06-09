@@ -7,13 +7,14 @@
      4) 시작 → POST /api/simulation/start (SUMO TraCI + Dijkstra)
      5) WebSocket → 차량 마커 실시간 이동
    ============================================================ */
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, api }) {
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, api }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
   const prevVehPos = useRef(null);
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
+  const MAX_SETUP_AREA_KM2 = 25;
 
   const [mode,       setMode]       = useState(null);
   const [area,       setArea]       = useState(null);
@@ -23,8 +24,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [destDone,   setDestDone]   = useState(false);
   const [osmStage,   setOsmStage]   = useState(0); // 0 idle · 1 download · 2 convert · 3 ready
   const [osmError,   setOsmError]   = useState(null);
+  const [osmWarning, setOsmWarning] = useState(null);
   const [showLayers, setShowLayers] = useState({ vehicles: true, routes: true });
   const [simError,   setSimError]   = useState(null);
+  const [stations,   setStations]   = useState([]);   // user_created base stations from DB
+  const [stationsErr,setStationsErr]= useState(null);
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
@@ -52,6 +56,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       { maxZoom: 19, subdomains: 'abcd' }).addTo(map);
     groups.current.wp    = L.layerGroup().addTo(map);
     groups.current.route = L.layerGroup().addTo(map);
+    groups.current.network = L.layerGroup().addTo(map);
+    groups.current.blocks = L.layerGroup().addTo(map);
+    groups.current.stations = L.layerGroup().addTo(map);
     mapObj.current = map;
     return () => { map.remove(); mapObj.current = null; groups.current = {}; };
   }, []);
@@ -59,6 +66,19 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   useEffect(() => {
     if (active && mapObj.current) setTimeout(() => mapObj.current.invalidateSize(), 60);
   }, [active]);
+
+  /* ── load user-created base stations from DB (persists across reloads) ──── */
+  async function loadStations() {
+    try {
+      const res = await fetch(`${api}/network-nodes`);
+      const body = await res.json();
+      setStations((body.nodes || []).filter(n => n.source === 'user_created'));
+      setStationsErr(null);
+    } catch (e) {
+      setStationsErr(e.message);
+    }
+  }
+  useEffect(() => { loadStations(); }, []);
 
   /* ── draw origin/dest markers ───────────────────────────────── */
   useEffect(() => {
@@ -78,6 +98,99 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       L.polyline(routeCoords, { color: '#2E75B6', weight: 4, opacity: 0.7 }).addTo(g);
     }
   }, [routeCoords, showLayers.routes]);
+
+  useEffect(() => {
+    const ng = groups.current.network;
+    const bg = groups.current.blocks;
+    const map = mapObj.current;
+    if (!ng || !bg || !map) return;
+    ng.clearLayers();
+    bg.clearLayers();
+    if (!networkTelemetry) return;
+
+    const selected = networkTelemetry.connected_node;
+    (networkTelemetry.candidate_nodes || []).forEach((node, idx) => {
+      // user_created: already rendered by the stations layer (avoid overlap)
+      // synthetic: auto-generated placeholders — hidden when user has real stations
+      if (node.source === 'user_created' || node.source === 'synthetic') return;
+      const base = idx === 0 ? '#1E88E5' : '#607D8B';
+      const marker = L.circleMarker([node.lat || selected.lat, node.lng || selected.lng], {
+        radius: idx === 0 ? 8 : 6,
+        color: '#fff',
+        weight: 2,
+        fillColor: base,
+        fillOpacity: 0.9,
+      }).addTo(ng);
+      marker.bindTooltip(`${node.name || node.id} · ${node.predicted_latency_ms.toFixed(1)}ms`, { direction: 'top' });
+    });
+
+    const lines = networkTelemetry.connection_lines?.length
+      ? networkTelemetry.connection_lines.map(l => [[l.from.lat, l.from.lng], [l.to.lat, l.to.lng]])
+      : (selected && networkTelemetry.connection_line?.length === 2)
+        ? [networkTelemetry.connection_line.map(p => [p.lat, p.lng])]
+        : [];
+    if (lines.length) {
+      const loss = networkTelemetry.estimated_penetration_loss_db || 0;
+      const color = loss >= 20 ? '#E0463C' : loss >= 10 ? '#B97B11' : '#1F9D57';
+      lines.forEach(coords => {
+        L.polyline(coords, { color, weight: 3, opacity: 0.85, dashArray: loss >= 10 ? '8 6' : undefined }).addTo(ng);
+      });
+    }
+
+    (networkTelemetry.highlighted_buildings || []).forEach((b) => {
+      if (!b.geometry || b.geometry.length < 3) return;
+      L.polygon(
+        b.geometry.map(p => [p.lat, p.lng]),
+        { color: '#E0463C', weight: 1.5, fillColor: '#E0463C', fillOpacity: 0.18 }
+      ).addTo(bg);
+    });
+  }, [networkTelemetry]);
+
+  /* ── user-created base station markers ──────────────────────────
+     Always blue (#1E88E5) with white border — same style as synthetic nodes.
+     Delete-hover: gray (#9AA5B1) to indicate the target being removed.
+     Label always visible below marker.
+  ── */
+  useEffect(() => {
+    const g = groups.current.stations; if (!g) return;
+    g.clearLayers();
+    const deleteMode = mode === 'bs_delete';
+    // latency lookup so label can include it when sim is running
+    const latencyMap = {};
+    (networkTelemetry?.candidate_nodes || []).forEach(n => { latencyMap[n.id] = n.predicted_latency_ms; });
+    stations.forEach((st) => {
+      const marker = L.circleMarker([st.lat, st.lng], {
+        radius: 8,
+        color: '#fff',
+        weight: 2.5,
+        fillColor: '#1E88E5',
+        fillOpacity: 0.93,
+        interactive: true,
+      }).addTo(g);
+      // permanent label below marker — name only (latency shown in right panel Top 3)
+      const lat_ms = latencyMap[st.id];
+      const labelText = lat_ms != null ? `${st.name} · ${lat_ms.toFixed(1)}ms` : st.name;
+      marker.bindTooltip(labelText, {
+        permanent: true,
+        direction: 'bottom',
+        offset: [0, 6],
+        className: 'bs-label',
+      });
+      if (deleteMode) {
+        // hover purely via Leaflet mouse events — no state update to avoid re-render mid-click
+        marker.on('mouseover', (e) => {
+          e.target.setStyle({ fillColor: '#9AA5B1', color: '#5B6670' });
+        });
+        marker.on('mouseout', (e) => {
+          e.target.setStyle({ fillColor: '#1E88E5', color: '#fff' });
+        });
+        marker.on('click', (e) => {
+          L.DomEvent.stopPropagation(e);
+          deleteStation(st.id);
+        });
+      }
+    });
+  }, [stations, mode, networkTelemetry]);
 
   /* ── vehicle marker from WebSocket position ─────────────────── */
   useEffect(() => {
@@ -147,13 +260,66 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       map.on('click', onClick);
       return () => { map.off('click', onClick); map.getContainer().style.cursor = ''; };
     }
+    if (mode === 'bs_create') {
+      map.getContainer().style.cursor = 'crosshair';
+      const onClick = (e) => { createStation(e.latlng.lat, e.latlng.lng); };
+      map.on('click', onClick);
+      return () => { map.off('click', onClick); map.getContainer().style.cursor = ''; };
+    }
+    if (mode === 'bs_delete') {
+      map.getContainer().style.cursor = 'crosshair';
+      return () => { map.getContainer().style.cursor = ''; };
+    }
   }, [mode]);
+
+  /* ── user-created base station create / delete ───────────────── */
+  async function createStation(lat, lng) {
+    setStationsErr(null);
+    try {
+      const res = await fetch(`${api}/network-nodes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lat, lng, node_type: 'base_station' }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || '기지국 생성 실패');
+      setStations(s => [...s, body]);
+    } catch (e) {
+      setStationsErr(e.message);
+    }
+  }
+
+  async function deleteStation(id) {
+    setStationsErr(null);
+    try {
+      const res = await fetch(`${api}/network-nodes/${id}`, { method: 'DELETE' });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || '기지국 삭제 실패');
+      setStations(s => s.filter(st => st.id !== id));
+    } catch (e) {
+      setStationsErr(e.message);
+    }
+  }
+
+  async function resetUserStations() {
+    setStationsErr(null);
+    try {
+      const res = await fetch(`${api}/network-nodes/reset-user-created`, { method: 'POST' });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || '기지국 초기화 실패');
+      setStations([]);
+    } catch (e) {
+      setStationsErr(e.message);
+    }
+  }
 
   /* ── finalizeArea — real OSM + netconvert via backend ────────── */
   async function finalizeArea(bounds) {
     setArea({ s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() });
     setMode(null);
     setOsmError(null);
+    setOsmWarning(null);
+    setSimNotice(null);
     setOsmStage(1); // downloading
 
     try {
@@ -167,11 +333,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
       setOsmStage(2); // converting (response received means OSM done, converting is fast)
 
+      const body = await res.json();
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || 'Network setup failed');
+        throw new Error(body.detail || 'Network setup failed');
       }
 
+      if (body.warning) setOsmWarning(body.warning);
       setOsmStage(3); // ready
       if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
       setTimeout(() => setOsmStage(0), 1200);
@@ -195,10 +362,13 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (mode === 'dest') { if (dest) { setDestDone(true); setMode(null); } }
     else setMode('dest');
   };
+  const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
+  const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
 
   async function handleStart() {
     if (!ready) return;
     setSimError(null);
+    setSimNotice(null);
     setRouteCoords([]);
     setVehiclePos(null);
 
@@ -208,10 +378,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ origin, dest }),
       });
+      const body = await res.json();
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || '시뮬레이션 시작 실패');
+        throw new Error(body.detail || '시뮬레이션 시작 실패');
       }
+      if (body.warning) setSimNotice(body.warning);
       dispatch({ type: 'start' });
     } catch (e) {
       setSimError(e.message);
@@ -223,16 +394,25 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     dispatch({ type: 'pause' });
   }
 
-  function clearAll() {
-    handleStop().catch(() => {});
+  async function clearAll() {
+    try {
+      await fetch(`${api}/api/simulation/reset`, { method: 'POST' });
+    } catch (_) {}
     setMode(null); setArea(null);
     setOrigin(null); setOriginDone(false);
     setDest(null);   setDestDone(false);
     setOsmStage(0);  setOsmError(null);
+    setOsmWarning(null);
     setSimError(null);
+    setSimNotice(null);
+    setNetworkTelemetry(null);
     setRouteCoords([]); setVehiclePos(null);
     if (groups.current.areaRect) { groups.current.areaRect.remove(); groups.current.areaRect = null; }
     if (groups.current.veh)      { groups.current.veh.remove();      groups.current.veh = null; }
+    if (groups.current.route)    { groups.current.route.clearLayers(); }
+    if (groups.current.wp)       { groups.current.wp.clearLayers(); }
+    if (groups.current.network)  { groups.current.network.clearLayers(); }
+    if (groups.current.blocks)   { groups.current.blocks.clearLayers(); }
     if (mapObj.current) mapObj.current.setView(KR_CENTER, KR_ZOOM);
     dispatch({ type: 'reset' });
   }
@@ -248,6 +428,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (mode === 'area')   return '지도에서 드래그하여 시뮬레이션 구역을 선택하세요';
     if (mode === 'origin') return origin ? "'출발지'를 눌러 확정 (다시 클릭하면 위치 변경)" : '지도를 클릭해 출발지를 선택하세요';
     if (mode === 'dest')   return dest   ? "'도착지'를 눌러 확정 (다시 클릭하면 위치 변경)"  : '지도를 클릭해 도착지를 선택하세요';
+    if (mode === 'bs_create') return '지도에서 기지국을 배치할 위치를 클릭하세요.';
+    if (mode === 'bs_delete') return '삭제할 기지국을 클릭하세요.';
     return '';
   })();
 
@@ -291,6 +473,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             {[
               ['origin', '출발지', '#1F9D57', originDone, tryOrigin],
               ['dest',   '도착지', '#E0463C', destDone,   tryDest],
+              ['bs_create', '기지국 생성', '#1E88E5', false, tryBsCreate],
+              ['bs_delete', '기지국 제거', '#9AA5B1', false, tryBsDelete],
             ].map(([k, lbl, c, done, fn]) => (
               <button key={k} className={mode === k ? 'active' : ''}
                 disabled={!area} style={!area ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
@@ -373,9 +557,19 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             <Icon.warn size={14} /> {osmError}
           </div>
         )}
+        {osmWarning && (
+          <div style={{ position: 'absolute', top: 60, left: '50%', transform: 'translateX(-50%)', zIndex: 790, background: '#B97B11', color: '#fff', borderRadius: 8, padding: '10px 18px', fontSize: 13, boxShadow: 'var(--sh-2)', maxWidth: 520, textAlign: 'center' }}>
+            <Icon.warn size={14} /> {osmWarning}
+          </div>
+        )}
         {simError && (
           <div style={{ position: 'absolute', top: 60, left: '50%', transform: 'translateX(-50%)', zIndex: 800, background: '#E0463C', color: '#fff', borderRadius: 8, padding: '10px 18px', fontSize: 13, boxShadow: 'var(--sh-2)', maxWidth: 400, textAlign: 'center' }}>
             <Icon.warn size={14} /> {simError}
+          </div>
+        )}
+        {simNotice && (
+          <div style={{ position: 'absolute', top: 110, left: '50%', transform: 'translateX(-50%)', zIndex: 790, background: '#1E3A5F', color: '#fff', borderRadius: 8, padding: '10px 18px', fontSize: 13, boxShadow: 'var(--sh-2)', maxWidth: 520, textAlign: 'center' }}>
+            <Icon.warn size={14} /> {simNotice}
           </div>
         )}
       </div>
@@ -413,7 +607,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 </div>
                 {areaKm2(area) > 5 && (
                   <div className="row gap8" style={{ padding: '8px 11px', background: 'var(--warn-tint)', borderRadius: 8, fontSize: 10.5, color: 'var(--warn)' }}>
-                    <Icon.warn size={13} style={{ flex: '0 0 auto' }} /> 동 단위 이하로 선택을 권장합니다
+                    <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
+                    {areaKm2(area) > MAX_SETUP_AREA_KM2 ? `선택 구역이 너무 큽니다. ${MAX_SETUP_AREA_KM2}km² 이하로 줄여주세요` : '동 단위 이하로 선택을 권장합니다'}
                   </div>
                 )}
                 <button className="btn sm" onClick={() => setMode('area')}><Icon.layers size={13} /> 구역 다시 그리기</button>
@@ -454,6 +649,87 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           )}
 
+          {networkTelemetry && (
+            <div className="card" style={{ padding: 14, background: 'var(--surface-2)' }}>
+              {/* header */}
+              <div className="row between" style={{ marginBottom: 10 }}>
+                <b style={{ fontSize: 13 }}>기지국 연결 상태</b>
+                <span className="chip" style={{ fontSize: 10 }}>
+                  {networkTelemetry.ego_vehicle?.connected_network_node_name || networkTelemetry.connected_node?.name || networkTelemetry.connected_node?.id}
+                </span>
+              </div>
+
+              {/* 연결 정보 */}
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>연결 기지국</span>
+                <span className="num">
+                  {networkTelemetry.ego_vehicle?.connected_network_node_name || networkTelemetry.connected_node?.name || networkTelemetry.connected_node?.id}
+                </span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>기지국까지 거리</span>
+                <span className="num">
+                  {(networkTelemetry.distance_m?.toFixed?.(1) ?? networkTelemetry.distance_m)} m
+                </span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>혼잡도</span>
+                <span className="num">{networkTelemetry.connected_node?.congestion_score ?? '—'}</span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 10 }}>
+                <span>예상 지연시간</span>
+                <span className="num">
+                  {networkTelemetry.ego_vehicle?.current_latency_ms ?? networkTelemetry.latency_ms} ms
+                </span>
+              </div>
+
+              {/* 신호 품질 구분선 */}
+              <div style={{ borderTop: '1px solid var(--border)', marginBottom: 8 }} />
+              <div style={{ fontSize: 10.5, color: 'var(--ink-3)', marginBottom: 6 }}>신호 품질</div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>교차 건물</span>
+                <span className="num">{networkTelemetry.intersected_building_count ?? '—'} 개</span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>최대 건물 높이</span>
+                <span className="num">{networkTelemetry.max_building_height_m ?? '—'} m</span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                <span>신호 손실</span>
+                <span className="num">{networkTelemetry.estimated_penetration_loss_db ?? '—'} dB</span>
+              </div>
+              <div className="row between" style={{ fontSize: 11.5 }}>
+                <span>안정성 점수</span>
+                <span className="num">{networkTelemetry.stability_score ?? '—'}</span>
+              </div>
+
+              {/* 후보 기지국 Top 3 */}
+              {!!(networkTelemetry.candidate_nodes || []).length && (
+                <>
+                  <div style={{ borderTop: '1px solid var(--border)', margin: '10px 0 8px' }} />
+                  <div style={{ fontSize: 10.5, color: 'var(--ink-3)', marginBottom: 6 }}>후보 기지국 Top 3</div>
+                  <div className="col gap6">
+                    {networkTelemetry.candidate_nodes.slice(0, 3).map((c, i) => (
+                      <div key={c.id} className="row between" style={{
+                        fontSize: 11, padding: '6px 9px', borderRadius: 7,
+                        background: i === 0 ? 'var(--surface)' : 'transparent',
+                        border: '1px solid var(--border)',
+                      }}>
+                        <span className="row gap8">
+                          <span className="mono" style={{ color: 'var(--ink-4)' }}>{i + 1}</span>
+                          <span>{c.name}</span>
+                        </span>
+                        <span className="num" style={{ color: 'var(--ink-3)' }}>
+                          {c.distance_m?.toFixed?.(0) ?? c.distance_m} m · {c.predicted_latency_ms} ms
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           <div style={{ flex: 1 }} />
 
           {/* controls */}
@@ -468,6 +744,16 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </button>}
               <button className="btn icon" onClick={clearAll} title="시나리오 초기화"><Icon.reset size={15} /></button>
             </div>
+            {stations.length > 0 && (
+              <button className="btn sm block" onClick={resetUserStations} title="사용자 지정 기지국만 모두 제거합니다 (시뮬레이션 시나리오는 유지)">
+                <Icon.reset size={13} /> 사용자 기지국 초기화 ({stations.length})
+              </button>
+            )}
+            {stationsErr && (
+              <div style={{ padding: '8px 11px', background: 'var(--warn-tint)', border: '1px solid var(--warn-line)', borderRadius: 9, color: 'var(--warn)', fontSize: 11 }}>
+                {stationsErr}
+              </div>
+            )}
             {!ready && !sim.running && (
               <div className="muted" style={{ fontSize: 10.5, textAlign: 'center' }}>
                 구역 · 출발지 · 도착지를 확정하면 시작할 수 있습니다
@@ -477,6 +763,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               <span style={{ fontSize: 11, opacity: 0.7 }}>경과 시간 <span className="mono">ELAPSED</span></span>
               <span className="num" style={{ fontSize: 19, fontWeight: 600 }}>{fmtClock(sim.elapsed)}</span>
             </div>
+            {(osmWarning || simNotice) && (
+              <div style={{ padding: '10px 12px', background: 'var(--warn-tint)', border: '1px solid var(--warn-line)', borderRadius: 10, color: 'var(--warn)', fontSize: 11.5 }}>
+                현재 시스템에서는 SUMO 대신 OSM fallback mode가 사용될 수 있습니다.
+              </div>
+            )}
           </div>
         </div>
       </div>

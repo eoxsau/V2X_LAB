@@ -3,3 +3,14 @@ uvicorn[standard]==0.29.0
 websockets>=13.0
 requests==2.31.0
 pydantic>=2.9.0
+pyproj>=3.7.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+geopandas>=1.1.0
+shapely>=2.0.0
+pyogrio>=0.12.0
+pyarrow>=24.0.0
+networkx>=3.4.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+osmnx>=2.1.0

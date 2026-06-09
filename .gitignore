@@ -14,6 +14,8 @@ backend/networks/*.osm
 backend/networks/*.log
 backend/networks/*.rou.xml
 backend/networks/*.sumocfg
+backend/tmp_building_test/
+data/processed/demo/*.dump
 
 # Claude Code IDE
 .claude/
@@ -21,6 +23,21 @@ backend/networks/*.sumocfg
 # Environment
 .env
 .env.local
+
+# Managed GIS data
+data/raw/*
+data/processed/*
+!data/raw/**/.gitkeep
+!data/processed/**/.gitkeep
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.gpkg
+*.parquet
+*.sqlite
+*.zip
 
 # OS
 .DS_Store

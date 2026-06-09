@@ -5,12 +5,22 @@ const TECH_PRESETS = {
   '6G': { L_base: '0.1', P_tx: '48', beta: '2.5', alpha: '100', N_max: '3', T_retx: '0.1', C_tech: '2000' },
 };
 
-function SettingsTab({ sim, dispatch }) {
+function SettingsTab({ sim, dispatch, api }) {
   const [tech, setTech] = useState(sim.mode === '6G' ? '6G' : '5G');
   const [vals, setVals] = useState(() => {
     const o = {}; DATA.params.forEach(p => { if (p.type !== 'tech') o[p.v] = p.def; }); return o;
   });
   const [saved, setSaved] = useState(false);
+  const [buildingStatus, setBuildingStatus] = useState(null);
+
+  useEffect(() => {
+    let dead = false;
+    fetch(`${api}/admin/buildings/status`)
+      .then(r => r.json())
+      .then(data => { if (!dead) setBuildingStatus(data); })
+      .catch(() => {});
+    return () => { dead = true; };
+  }, [api]);
 
   function applyTech(t) {
     setTech(t);
@@ -80,6 +90,18 @@ function SettingsTab({ sim, dispatch }) {
           </table>
         </div>
       </Card>
+
+      {buildingStatus && (
+        <Card title="건물 데이터 상태" en="Building data status" style={{ marginTop: 18 }}>
+          <div className="row between" style={{ marginBottom: 8 }}><span>처리 준비</span><b>{buildingStatus.processed_ready ? 'ready' : 'not ready'}</b></div>
+          <div className="row between" style={{ marginBottom: 8 }}><span>건물 수</span><b className="num">{buildingStatus.building_count?.toLocaleString?.() || buildingStatus.building_count}</b></div>
+          <div className="row between" style={{ marginBottom: 8 }}><span>HEIGHT 직접 사용</span><b className="num">{buildingStatus.height_available_count?.toLocaleString?.() || buildingStatus.height_available_count}</b></div>
+          <div className="row between"><span>추정 높이</span><b className="num">{buildingStatus.height_estimated_count?.toLocaleString?.() || buildingStatus.height_estimated_count}</b></div>
+          {buildingStatus.last_preprocess_time && (
+            <div className="muted" style={{ marginTop: 10, fontSize: 11 }}>last preprocess: {buildingStatus.last_preprocess_time}</div>
+          )}
+        </Card>
+      )}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 /* ============================================================ App shell + state */
-const API = 'http://localhost:8001';
-const WS_URL = 'ws://localhost:8001/ws';
+const API = window.location.origin;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
 function simReducer(s, a) {
   switch (a.type) {
@@ -16,12 +16,20 @@ function simReducer(s, a) {
 function App() {
   const [tab, setTab] = useState(() => location.hash.replace('#', '') || 'dashboard');
   const [sim, dispatch] = React.useReducer(simReducer, { running: false, elapsed: 0, tick: 0, mode: '5G' });
+  const [bootReady, setBootReady]      = useState(false);
 
   // Vehicle state from WebSocket
   const [vehiclePos, setVehiclePos]     = useState(null);
   const [routeCoords, setRouteCoords]   = useState([]);
   const [wsConnected, setWsConnected]   = useState(false);
+  const [simNotice, setSimNotice]       = useState(null);
+  const [networkTelemetry, setNetworkTelemetry] = useState(null);
   const wsRef = useRef(null);
+
+  // Cross-tab live data
+  const [simHistory, setSimHistory] = useState([]);   // {t, speed, progress, latency, bs} per tick
+  const [simLogs,    setSimLogs]    = useState([]);   // {t, target, kind, ko} event log
+  const prevBsRef = useRef(null);
 
   // hash routing
   useEffect(() => {
@@ -38,8 +46,44 @@ function App() {
     return () => clearInterval(t);
   }, [sim.running]);
 
+  useEffect(() => {
+    let closed = false;
+
+    async function bootReset() {
+      try {
+        await fetch(`${API}/api/simulation/reset`, { method: 'POST' });
+      } catch (_) {}
+      if (!closed) {
+        setVehiclePos(null);
+        setRouteCoords([]);
+        setSimNotice(null);
+        setNetworkTelemetry(null);
+        setSimHistory([]);
+        setSimLogs([]);
+        prevBsRef.current = null;
+        dispatch({ type: 'reset' });
+        setBootReady(true);
+      }
+    }
+
+    bootReset();
+
+    const resetOnUnload = () => {
+      try {
+        navigator.sendBeacon(`${API}/api/simulation/reset`);
+      } catch (_) {}
+    };
+    window.addEventListener('beforeunload', resetOnUnload);
+
+    return () => {
+      closed = true;
+      window.removeEventListener('beforeunload', resetOnUnload);
+    };
+  }, []);
+
   // WebSocket — connect once, auto-reconnect
   useEffect(() => {
+    if (!bootReady) return;
     let ws;
     let dead = false;
 
@@ -64,15 +108,81 @@ function App() {
         } else if (msg.type === 'arrived') {
           dispatch({ type: 'pause' });
           setVehiclePos(v => v ? { ...v, arrived: true } : v);
+        } else if (msg.type === 'warning') {
+          setSimNotice(msg.message);
         } else if (msg.type === 'error') {
           console.error('[WS]', msg.message);
+        } else if (msg.type === 'telemetry') {
+          setNetworkTelemetry(msg);
         }
       };
     }
 
     connect();
     return () => { dead = true; ws && ws.close(); };
-  }, []);
+  }, [bootReady]);
+
+  // Accumulate simHistory + detect events each tick
+  useEffect(() => {
+    if (!sim.running) return;
+    const bs = networkTelemetry?.ego_vehicle?.connected_network_node_name
+      ?? networkTelemetry?.connected_node?.name
+      ?? null;
+    const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
+      ?? networkTelemetry?.latency_ms
+      ?? null;
+    const entry = {
+      t: sim.elapsed,
+      speed: vehiclePos?.speed ?? 0,
+      progress: vehiclePos?.progress ?? 0,
+      latency,
+      bs,
+    };
+    setSimHistory(prev => {
+      const next = [...prev, entry];
+      return next.length > 60 ? next.slice(1) : next;
+    });
+    if (latency !== null && latency > 20) {
+      setSimLogs(prev => [...prev, {
+        t: fmtClock(sim.elapsed), target: 'EGO', kind: 'warn',
+        ko: `Latency 위험: ${latency.toFixed(1)}ms (임계치 초과)`
+      }]);
+    }
+    if (bs && prevBsRef.current && prevBsRef.current !== bs) {
+      setSimLogs(prev => [...prev, {
+        t: fmtClock(sim.elapsed), target: 'EGO', kind: 'handover',
+        ko: `${prevBsRef.current} → ${bs} 핸드오버`
+      }]);
+    }
+    if (bs) prevBsRef.current = bs;
+  }, [sim.tick]);
+
+  // Log arrival event
+  useEffect(() => {
+    if (!vehiclePos?.arrived) return;
+    setSimLogs(prev => [...prev, {
+      t: fmtClock(sim.elapsed), target: 'EGO', kind: 'done',
+      ko: '목적지 도착 완료'
+    }]);
+  }, [vehiclePos?.arrived]);
+
+  // Log simulation start
+  useEffect(() => {
+    if (!sim.running) return;
+    setSimLogs(prev => {
+      if (prev.length > 0 && prev[prev.length - 1].kind === 'info' && prev[prev.length - 1].target === 'SYS') return prev;
+      return [...prev, { t: fmtClock(sim.elapsed), target: 'SYS', kind: 'info', ko: '시뮬레이션 시작됨' }];
+    });
+  }, [sim.running]);
+
+  // Reset history/logs on full reset
+  useEffect(() => {
+    if (!sim.running && sim.elapsed === 0) {
+      setSimHistory([]);
+      setSimLogs([]);
+      prevBsRef.current = null;
+    }
+  }, [sim.running, sim.elapsed]);
 
   const current = NAV.find(n => n.id === tab) || NAV[0];
 
@@ -111,7 +221,7 @@ function App() {
       </header>
 
       <main className="page" style={tab === 'simulation' ? { overflow: 'hidden' } : {}}>
-        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} />}
+        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
         <div style={{ display: tab === 'simulation' ? 'block' : 'none', height: '100%' }}>
           <SimulationTab
             sim={sim}
@@ -121,14 +231,18 @@ function App() {
             routeCoords={routeCoords}
             setRouteCoords={setRouteCoords}
             setVehiclePos={setVehiclePos}
+            simNotice={simNotice}
+            setSimNotice={setSimNotice}
+            networkTelemetry={networkTelemetry}
+            setNetworkTelemetry={setNetworkTelemetry}
             api={API}
           />
         </div>
-        {tab === 'vehicles'   && <VehiclesTab />}
-        {tab === 'network'    && <NetworkTab />}
-        {tab === 'routes'     && <RoutesTab />}
-        {tab === 'analysis'   && <AnalysisTab />}
-        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} />}
+        {tab === 'vehicles'   && <VehiclesTab sim={sim} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
+        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} />}
+        {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
+        {tab === 'analysis'   && <AnalysisTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
+        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} />}
       </main>
     </div>
   );

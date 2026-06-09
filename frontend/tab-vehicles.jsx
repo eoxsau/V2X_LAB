@@ -1,8 +1,17 @@
 /* ============================================================ Vehicles tab */
-function VehicleDetail({ v, onClose }) {
+function VehicleDetail({ v, simHistory, onClose }) {
   if (!v) return null;
-  const s = DATA.series.perVeh[v.id] || { speed: [], lat: [] };
+  const isLive = !!v._live;
   const tone = latencyTone(v.latency);
+
+  const hasHistory = isLive && simHistory.length >= 2;
+  const speedSeries = hasHistory
+    ? [simHistory.map(h => h.speed ?? 0)]
+    : (isLive ? null : [DATA.series.perVeh[v.id]?.speed ?? []]);
+  const latSeries = hasHistory
+    ? [simHistory.map(h => h.latency ?? 0)]
+    : (isLive ? null : [DATA.series.perVeh[v.id]?.lat ?? []]);
+
   return (
     <>
       <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(20,40,60,0.18)', zIndex: 90 }} />
@@ -16,6 +25,7 @@ function VehicleDetail({ v, onClose }) {
                 <div className="row gap8" style={{ marginTop: 2 }}>
                   <Chip tone={v.state === 'moving' ? 'good' : ''} dot>{v.state === 'moving' ? '이동 중' : '정지'}</Chip>
                   <Chip tone="brand">{v.mode}</Chip>
+                  {isLive && <Chip tone="good">LIVE</Chip>}
                 </div>
               </div>
             </div>
@@ -25,31 +35,46 @@ function VehicleDetail({ v, onClose }) {
 
         <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 18 }}>
           <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <div className="stat" style={{ padding: '13px 14px' }}><div className="label">현재 속도</div><div className="value" style={{ fontSize: 22 }}>{v.speed}<span className="unit">km/h</span></div></div>
-            <div className="stat" style={{ padding: '13px 14px' }}><div className="label">Latency</div><div className="value" style={{ fontSize: 22, color: `var(--${tone})` }}>{v.latency}<span className="unit">ms</span></div></div>
+            <div className="stat" style={{ padding: '13px 14px' }}><div className="label">현재 속도</div><div className="value" style={{ fontSize: 22 }}>{v.speed.toFixed(1)}<span className="unit">km/h</span></div></div>
+            <div className="stat" style={{ padding: '13px 14px' }}><div className="label">Latency</div><div className="value" style={{ fontSize: 22, color: `var(--${tone})` }}>{v.latency.toFixed(1)}<span className="unit">ms</span></div></div>
           </div>
 
+          {isLive && (
+            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <div className="stat" style={{ padding: '13px 14px' }}><div className="label">진행률</div><div className="value" style={{ fontSize: 22 }}>{(v.progress * 100).toFixed(0)}<span className="unit">%</span></div></div>
+              <div className="stat" style={{ padding: '13px 14px' }}><div className="label">신호 손실</div><div className="value" style={{ fontSize: 22 }}>{v.lossDb !== null ? v.lossDb.toFixed(1) : '—'}<span className="unit">{v.lossDb !== null ? 'dB' : ''}</span></div></div>
+            </div>
+          )}
+
           <div>
-            <div className="row between" style={{ marginBottom: 8 }}><b style={{ fontSize: 12.5, whiteSpace: 'nowrap' }}>실시간 속도</b><span className="mono muted" style={{ fontSize: 10 }}>km/h · last 10 steps</span></div>
-            <LineChart series={[s.speed]} height={130} yMax={60} colors={['var(--brand-2)']} />
+            <div className="row between" style={{ marginBottom: 8 }}><b style={{ fontSize: 12.5, whiteSpace: 'nowrap' }}>실시간 속도</b><span className="mono muted" style={{ fontSize: 10 }}>km/h · {isLive ? 'SUMO 실시간' : 'last 10 steps'}</span></div>
+            {speedSeries
+              ? <LineChart series={speedSeries} height={130} yMax={60} colors={['var(--brand-2)']} />
+              : <div style={{ height: 130, display: 'grid', placeItems: 'center', color: 'var(--ink-4)', fontSize: 12, background: 'var(--surface-2)', borderRadius: 8 }}>데이터 수집 중…</div>
+            }
           </div>
 
           <div>
             <div className="row between" style={{ marginBottom: 8 }}><b style={{ fontSize: 12.5, whiteSpace: 'nowrap' }}>Latency 추이</b><span className="mono muted" style={{ fontSize: 10 }}>ms · 위험 20ms</span></div>
-            <LineChart series={[s.lat]} height={130} yMax={32} colors={[`var(--${tone})`]} threshold={20} />
+            {latSeries
+              ? <LineChart series={latSeries} height={130} yMax={32} colors={[`var(--${tone})`]} threshold={20} />
+              : <div style={{ height: 130, display: 'grid', placeItems: 'center', color: 'var(--ink-4)', fontSize: 12, background: 'var(--surface-2)', borderRadius: 8 }}>데이터 수집 중…</div>
+            }
           </div>
 
-          <div>
-            <div className="row between" style={{ marginBottom: 8 }}><b style={{ fontSize: 12.5, whiteSpace: 'nowrap' }}>경로 (엣지)</b><span className="mono muted" style={{ fontSize: 10 }}>EDGE PATH</span></div>
-            <div className="row gap8 wrap">
-              {v.path.map((e, i) => (
-                <React.Fragment key={e}>
-                  <span className={'chip ' + (DATA.routes[v.id] && i === 0 ? 'brand' : '')} style={{ fontFamily: 'var(--mono)' }}>{e}</span>
-                  {i < v.path.length - 1 && <Icon.route size={12} style={{ color: 'var(--ink-4)' }} />}
-                </React.Fragment>
-              ))}
+          {!isLive && (
+            <div>
+              <div className="row between" style={{ marginBottom: 8 }}><b style={{ fontSize: 12.5, whiteSpace: 'nowrap' }}>경로 (엣지)</b><span className="mono muted" style={{ fontSize: 10 }}>EDGE PATH</span></div>
+              <div className="row gap8 wrap">
+                {(v.path || []).map((e, i) => (
+                  <React.Fragment key={e}>
+                    <span className={'chip ' + (DATA.routes[v.id] && i === 0 ? 'brand' : '')} style={{ fontFamily: 'var(--mono)' }}>{e}</span>
+                    {i < v.path.length - 1 && <Icon.route size={12} style={{ color: 'var(--ink-4)' }} />}
+                  </React.Fragment>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="row between" style={{ padding: '13px 15px', background: 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)' }}>
             <div className="row gap12">
@@ -64,9 +89,38 @@ function VehicleDetail({ v, onClose }) {
   );
 }
 
-function VehiclesTab() {
+function VehiclesTab({ sim, vehiclePos, networkTelemetry, simHistory }) {
   const [sel, setSel] = useState(null);
-  const moving = DATA.vehicles.filter(v => v.state === 'moving').length;
+
+  const connNode = networkTelemetry?.ego_vehicle?.connected_network_node_name
+    ?? networkTelemetry?.connected_node?.name
+    ?? '--';
+  const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
+    ?? networkTelemetry?.latency_ms
+    ?? 0;
+  const lossDb = networkTelemetry?.estimated_penetration_loss_db ?? null;
+
+  const liveVehicle = vehiclePos ? {
+    _live: true,
+    id: 'EGO-001',
+    lat: vehiclePos.lat,
+    lng: vehiclePos.lng,
+    speed: vehiclePos.speed ?? 0,
+    latency,
+    lossDb,
+    progress: vehiclePos.progress ?? 0,
+    bs: connNode,
+    mode: sim?.mode ?? '5G',
+    state: vehiclePos.arrived ? 'stopped' : 'moving',
+    edge: '--',
+    path: [],
+  } : null;
+
+  const hasLive = !!liveVehicle;
+  const vehicles = hasLive ? [liveVehicle] : DATA.vehicles;
+  const moving = vehicles.filter(v => v.state === 'moving').length;
+  const selVehicle = vehicles.find(v => v.id === sel);
+
   return (
     <div className="page-pad fade">
       <div className="page-head">
@@ -76,9 +130,10 @@ function VehiclesTab() {
           <div className="sub">차량별 위치 · 속도 · 경로 · 연결 기지국 — 행을 클릭하면 상세 정보가 열립니다</div>
         </div>
         <div className="row gap8">
-          <Chip tone="brand">전체 {DATA.vehicles.length}대</Chip>
+          {hasLive && <Chip tone="good" dot>LIVE</Chip>}
+          <Chip tone="brand">전체 {vehicles.length}대</Chip>
           <Chip tone="good" dot>이동 {moving}</Chip>
-          <Chip dot>정지 {DATA.vehicles.length - moving}</Chip>
+          <Chip dot>정지 {vehicles.length - moving}</Chip>
         </div>
       </div>
 
@@ -90,7 +145,10 @@ function VehiclesTab() {
                 <th>차량 ID<span className="en">Vehicle</span></th>
                 <th>현재 위치<span className="en">Lat, Lng</span></th>
                 <th className="r">속도<span className="en">Speed</span></th>
-                <th>경로<span className="en">Edge path</span></th>
+                {hasLive
+                  ? <th className="r">진행률<span className="en">Progress</span></th>
+                  : <th>경로<span className="en">Edge path</span></th>
+                }
                 <th>현재 엣지<span className="en">Current edge</span></th>
                 <th>모드<span className="en">Mode</span></th>
                 <th className="r">Latency<span className="en">ms</span></th>
@@ -98,14 +156,20 @@ function VehiclesTab() {
               </tr>
             </thead>
             <tbody>
-              {DATA.vehicles.map(v => {
+              {vehicles.map(v => {
                 const tone = latencyTone(v.latency);
                 return (
                   <tr key={v.id} className={'clickable ' + (sel === v.id ? 'selected' : '')} onClick={() => setSel(v.id)}>
-                    <td><span className="mono" style={{ fontWeight: 600 }}>{v.id}</span></td>
+                    <td>
+                      <span className="mono" style={{ fontWeight: 600 }}>{v.id}</span>
+                      {v._live && <span className="chip good" style={{ marginLeft: 6, fontSize: 9.5, padding: '1px 5px' }}>LIVE</span>}
+                    </td>
                     <td><span className="num muted">{v.lat.toFixed(4)}, {v.lng.toFixed(4)}</span></td>
                     <td className="r"><span className="num" style={{ fontWeight: 600, color: v.speed === 0 ? 'var(--ink-4)' : 'var(--ink)' }}>{v.speed.toFixed(1)}</span> <span className="muted" style={{ fontSize: 10 }}>km/h</span></td>
-                    <td><span className="mono muted" style={{ fontSize: 11.5 }}>{v.path.join(' → ')}</span></td>
+                    {hasLive
+                      ? <td className="r"><span className="num" style={{ fontWeight: 600 }}>{(v.progress * 100).toFixed(0)}</span> <span className="muted" style={{ fontSize: 10 }}>%</span></td>
+                      : <td><span className="mono muted" style={{ fontSize: 11.5 }}>{(v.path || []).join(' → ')}</span></td>
+                    }
                     <td><span className="chip" style={{ fontFamily: 'var(--mono)' }}>{v.edge}</span></td>
                     <td><Chip tone="brand">{v.mode}</Chip></td>
                     <td className="r"><span className="num" style={{ fontWeight: 600, color: `var(--${tone})` }}>{v.latency.toFixed(1)}</span></td>
@@ -118,7 +182,7 @@ function VehiclesTab() {
         </div>
       </Card>
 
-      <VehicleDetail v={DATA.vehicles.find(v => v.id === sel)} onClose={() => setSel(null)} />
+      <VehicleDetail v={selVehicle} simHistory={simHistory} onClose={() => setSel(null)} />
     </div>
   );
 }

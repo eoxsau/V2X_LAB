@@ -1,0 +1,16 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: v2x_lab_postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: v2x_lab
+      POSTGRES_USER: v2x_lab
+      POSTGRES_PASSWORD: v2x_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+
+volumes:
+  postgis_data:
