@@ -7,11 +7,60 @@
      4) 시작 → POST /api/simulation/start (SUMO TraCI + Dijkstra)
      5) WebSocket → 차량 마커 실시간 이동
    ============================================================ */
+const ROUTE_ALGORITHMS = [
+  'dijkstra',
+  'astar',
+  'k_shortest_path',
+  'network_aware_routing',
+  'look_ahead_routing',
+  'rl_routing',
+];
+const LATENCY_ALGORITHMS = [
+  'distance_based_latency',
+  'load_aware_latency',
+  'blockage_aware_latency',
+  'mec_aware_latency',
+  'full_composite_latency',
+];
+const BS_SELECTION_ALGORITHMS = [
+  'nearest_bs',
+  'lowest_latency_bs',
+  'strongest_signal_bs',
+  'load_balanced_bs',
+  'look_ahead_bs_selection',
+  'rl_based_bs_selection',
+];
+const RESOURCE_ALLOCATION_ALGORITHMS = [
+  'equal_allocation',
+  'proportional_allocation',
+  'traffic_aware_allocation',
+  'load_balancing_allocation',
+  'latency_minimizing_allocation',
+  'priority_based_allocation',
+  'custom_allocation_algorithm',
+];
+const DEFAULT_ALGORITHM_SELECTION = {
+  route: 'dijkstra',
+  latency: 'full_composite_latency',
+  base_station_selection: 'lowest_latency_bs',
+  resource_allocation: 'equal_allocation',
+};
+const NETWORK_ROUTING_ALGORITHMS = new Set([
+  'network_aware_routing',
+  'look_ahead_routing',
+  'rl_routing',
+]);
+
+function formatAlgorithmName(name) {
+  return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
 function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, api }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
   const prevVehPos = useRef(null);
+  const algorithmMenuRef = useRef(null);
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
   const MAX_SETUP_AREA_KM2 = 25;
@@ -29,6 +78,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [simError,   setSimError]   = useState(null);
   const [stations,   setStations]   = useState([]);   // user_created base stations from DB
   const [stationsErr,setStationsErr]= useState(null);
+  const [showAlgorithmMenu, setShowAlgorithmMenu] = useState(false);
+  const [openAlgorithmGroup, setOpenAlgorithmGroup] = useState(null);
+  const [selectedAlgorithms, setSelectedAlgorithms] = useState(DEFAULT_ALGORITHM_SELECTION);
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
@@ -364,6 +416,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   };
   const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
   const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
+  const tryAlgorithms = () => {
+    setShowAlgorithmMenu(v => !v);
+    if (showAlgorithmMenu) setOpenAlgorithmGroup(null);
+  };
 
   async function handleStart() {
     if (!ready) return;
@@ -376,7 +432,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       const res = await fetch(`${api}/api/simulation/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ origin, dest }),
+        body: JSON.stringify({
+          origin,
+          dest,
+          use_network_routing: NETWORK_ROUTING_ALGORITHMS.has(selectedAlgorithms.route),
+          algorithm_config: selectedAlgorithms,
+        }),
       });
       const body = await res.json();
       if (!res.ok) {
@@ -455,6 +516,57 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     </div>
   );
 
+  const AlgorithmGroup = ({ groupKey, label, options }) => {
+    const isOpen = openAlgorithmGroup === groupKey;
+    const selected = selectedAlgorithms[groupKey];
+    return (
+      <div className="col gap8">
+        <button
+          className="row between"
+          style={{
+            padding: '8px 11px',
+            background: 'var(--surface-2)',
+            borderRadius: 9,
+            border: '1px solid var(--border)',
+            cursor: 'pointer',
+            width: '100%',
+          }}
+          onClick={() => setOpenAlgorithmGroup(isOpen ? null : groupKey)}
+        >
+          <span className="row gap8" style={{ minWidth: 0 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: '#8C6CF6', display: 'inline-block' }} />
+            <span style={{ fontSize: 11.5, fontWeight: 600 }}>{label}</span>
+          </span>
+          <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+            {formatAlgorithmName(selected)}
+          </span>
+        </button>
+        {isOpen && (
+          <div className="col gap6" style={{ paddingLeft: 4 }}>
+            {options.map((option) => (
+              <button
+                key={option}
+                className="btn sm"
+                style={{
+                  justifyContent: 'space-between',
+                  background: selected === option ? undefined : 'var(--surface-2)',
+                  color: selected === option ? undefined : 'var(--ink-2)',
+                  borderColor: 'var(--border)',
+                }}
+                onClick={() => {
+                  setSelectedAlgorithms((prev) => ({ ...prev, [groupKey]: option }));
+                }}
+              >
+                <span>{formatAlgorithmName(option)}</span>
+                {selected === option ? <Icon.check size={12} /> : null}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="fade" style={{ display: 'grid', gridTemplateColumns: '1fr 340px', height: '100%', overflow: 'hidden' }}>
       {/* ── MAP ────────────────────────────────────────── */}
@@ -485,6 +597,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 </span>
               </button>
             ))}
+            <button className={showAlgorithmMenu ? 'active' : ''} onClick={tryAlgorithms}>
+              <span className="row gap8">
+                <span style={{ width: 8, height: 8, borderRadius: 2, background: '#8C6CF6', display: 'inline-block' }} />
+                알고리즘
+              </span>
+            </button>
           </div>
 
           {hint && (
@@ -498,6 +616,31 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           )}
         </div>
+
+        {showAlgorithmMenu && (
+          <div
+            ref={algorithmMenuRef}
+            style={{
+              position: 'absolute',
+              top: 64,
+              left: 14,
+              zIndex: 610,
+              width: 340,
+              background: '#fff',
+              borderRadius: 12,
+              boxShadow: 'var(--sh-2)',
+              padding: 12,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+            }}
+          >
+            <AlgorithmGroup groupKey="route" label="경로 알고리즘" options={ROUTE_ALGORITHMS} />
+            <AlgorithmGroup groupKey="latency" label="지연시간 알고리즘" options={LATENCY_ALGORITHMS} />
+            <AlgorithmGroup groupKey="base_station_selection" label="기지국 선택 알고리즘" options={BS_SELECTION_ALGORITHMS} />
+            <AlgorithmGroup groupKey="resource_allocation" label="자원할당 알고리즘" options={RESOURCE_ALLOCATION_ALGORITHMS} />
+          </div>
+        )}
 
         {/* layer panel bottom-left */}
         <div style={{ position: 'absolute', bottom: 14, left: 14, zIndex: 600, background: '#fff', borderRadius: 12, boxShadow: 'var(--sh-2)', padding: '10px 14px', minWidth: 188 }}>

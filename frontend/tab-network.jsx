@@ -15,7 +15,7 @@ function NetworkTab({ networkTelemetry }) {
   const congestion = connNode?.congestion_score ?? null;
 
   const totalVeh = DATA.baseStations.reduce((a, b) => a + b.vehicles, 0);
-  const statCount = hasLive ? (liveStations.length || '—') : '3';
+  const statCount = hasLive ? (candidates.length || '—') : '3';
   const statConnected = hasLive ? (connName ?? '없음') : '3개';
   const statLatency = latency !== null ? latency.toFixed(1) : '4.7';
   const statCong = congestion !== null ? (congestion * 100).toFixed(1) : '29.9';
