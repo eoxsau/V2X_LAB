@@ -242,6 +242,9 @@ _state = {
     "building_debug": {"sample_links": [], "warnings": []},
     "simulation_run_id": None,
     "route_cost_result": None,
+    "route_cost_version": 0,
+    "route_edge_names": {},
+    "edge_telemetry": [],
     "k_path_candidates": None,
     "algorithm_metrics": {},
     "simulation_summary": None,
@@ -249,6 +252,8 @@ _state = {
     "latency_algorithm": "full_composite_latency",
     "allocation_algorithm": "traffic_aware_allocation",
     "last_allocation_result": None,
+    "simulation_config": None,   # Stage-1: persisted user config
+    "policy_options": None,      # Stage-1: policy options from last applied config
 }
 _ws_clients: list[WebSocket] = []
 _sim_thread: Optional[threading.Thread] = None
@@ -267,11 +272,151 @@ class BBox(BaseModel):
 class SetupRequest(BaseModel):
     bbox: BBox
 
+# ── Stage-1 Simulation Config ─────────────────────────────────────────────────
+
+class SimConfigCostWeights(BaseModel):
+    w_distance: float = 1.0
+    w_time:     float = 2.0
+    w_latency:  float = 3.0
+    w_load:     float = 1.5
+    w_resource: float = 1.0   # → CostWeights.w_resource_deficit
+    w_handover: float = 1.0
+    w_blockage: float = 1.5
+    w_future:   float = 2.5   # → CostWeights.w_coverage_risk
+
+class SimConfigAlgorithmSelection(BaseModel):
+    route_algorithm:                  str = "dijkstra"
+    latency_algorithm:                str = "full_composite_latency"
+    base_station_selection_algorithm: str = "lowest_latency_bs"
+    resource_allocation_algorithm:    str = "traffic_aware_allocation"
+
+class SimConfigPolicyOptions(BaseModel):
+    lookahead_k:          int   = 3
+    lookahead_time:       float = 10.0
+    max_handover_allowed: int   = 10
+    prefer_low_latency:   bool  = True
+    prefer_load_balance:  bool  = False
+    avoid_disconnection:  bool  = True
+
+class SimulationConfigModel(BaseModel):
+    cost_weights:        SimConfigCostWeights        = SimConfigCostWeights()
+    algorithm_selection: SimConfigAlgorithmSelection = SimConfigAlgorithmSelection()
+    policy_options:      SimConfigPolicyOptions      = SimConfigPolicyOptions()
+
+class SimulationConfigRequest(BaseModel):
+    simulation_config: dict
+
+_VALID_ROUTE_ALGORITHMS = frozenset({
+    "dijkstra", "astar", "k_shortest_path",
+    "network_aware", "lookahead", "rl_routing",
+})
+
+def validate_simulation_config(raw: dict) -> SimulationConfigModel:
+    """Parse user config dict; invalid individual fields fall back to per-field defaults."""
+    section_map = {
+        "cost_weights":        SimConfigCostWeights,
+        "algorithm_selection": SimConfigAlgorithmSelection,
+        "policy_options":      SimConfigPolicyOptions,
+    }
+    safe: dict[str, Any] = {}
+    for key, cls in section_map.items():
+        if key in raw and isinstance(raw[key], dict):
+            defaults = cls()
+            field_data: dict[str, Any] = {}
+            for fname in cls.model_fields:
+                raw_val = raw[key].get(fname, getattr(defaults, fname))
+                try:
+                    cls.model_validate({fname: raw_val})
+                    field_data[fname] = raw_val
+                except Exception:
+                    field_data[fname] = getattr(defaults, fname)
+            try:
+                safe[key] = cls.model_validate(field_data)
+            except Exception:
+                safe[key] = defaults
+    try:
+        return SimulationConfigModel(**safe)
+    except Exception:
+        return SimulationConfigModel()
+
+
+def merge_with_default_config(user_config: Optional[dict]) -> SimulationConfigModel:
+    """Merge user-supplied config with defaults. None returns pure defaults."""
+    if not user_config or not isinstance(user_config, dict):
+        return SimulationConfigModel()
+    return validate_simulation_config(user_config)
+
+
+def sanitize_algorithm_selection(cfg: SimulationConfigModel) -> SimConfigAlgorithmSelection:
+    """Validate algorithm IDs against registered algorithms; unknown IDs fall back to defaults."""
+    algo = cfg.algorithm_selection
+    defaults = SimConfigAlgorithmSelection()
+    if algo.route_algorithm not in _VALID_ROUTE_ALGORITHMS:
+        algo = algo.model_copy(update={"route_algorithm": defaults.route_algorithm})
+    if LATENCY_AVAILABLE:
+        try:
+            valid_lat = {a["id"] for a in LATENCY_REGISTRY.list_algorithms()}
+            if algo.latency_algorithm not in valid_lat:
+                algo = algo.model_copy(update={"latency_algorithm": defaults.latency_algorithm})
+        except Exception:
+            pass
+    if RESOURCE_DEMAND_AVAILABLE:
+        try:
+            valid_alloc = {a["id"] for a in ALLOCATION_REGISTRY.list_algorithms()}
+            if algo.resource_allocation_algorithm not in valid_alloc:
+                algo = algo.model_copy(update={
+                    "resource_allocation_algorithm": defaults.resource_allocation_algorithm,
+                })
+        except Exception:
+            pass
+    return algo
+
+
+def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
+    """Write validated config values to global routing weights and algorithm registries."""
+    global _route_cost_weights
+    cw = cfg.cost_weights
+    _route_cost_weights = CostWeights(
+        w_distance=        max(0.0, cw.w_distance),
+        w_time=            max(0.0, cw.w_time),
+        w_latency=         max(0.0, cw.w_latency),
+        w_load=            max(0.0, cw.w_load),
+        w_handover=        max(0.0, cw.w_handover),
+        w_blockage=        max(0.0, cw.w_blockage),
+        w_coverage_risk=   max(0.0, cw.w_future),
+        w_resource_deficit=max(0.0, cw.w_resource),
+    )
+    algo = sanitize_algorithm_selection(cfg)
+    if LATENCY_AVAILABLE:
+        try:
+            LATENCY_REGISTRY.set_algorithm(algo.latency_algorithm)
+            _state["latency_algorithm"] = algo.latency_algorithm
+        except Exception:
+            pass
+    if RESOURCE_DEMAND_AVAILABLE:
+        try:
+            ALLOCATION_REGISTRY.set_algorithm(algo.resource_allocation_algorithm)
+        except Exception:
+            pass
+    _state["allocation_algorithm"] = algo.resource_allocation_algorithm
+    pol = cfg.policy_options
+    _state["policy_options"] = {
+        "lookahead_k":          max(1, min(pol.lookahead_k, 10)),
+        "lookahead_time":       max(1.0, min(pol.lookahead_time, 120.0)),
+        "max_handover_allowed": max(0, min(pol.max_handover_allowed, 50)),
+        "prefer_low_latency":   bool(pol.prefer_low_latency),
+        "prefer_load_balance":  bool(pol.prefer_load_balance),
+        "avoid_disconnection":  bool(pol.avoid_disconnection),
+    }
+    _state["simulation_config"] = cfg.model_dump()
+
+
 class SimStartRequest(BaseModel):
     origin: dict   # {"lat": float, "lng": float}
     dest:   dict   # {"lat": float, "lng": float}
     use_network_routing: bool = False
     algorithm_config: dict = {}
+    simulation_config: Optional[dict] = None  # Stage-1 user config
 
 
 class CostWeightsRequest(BaseModel):
@@ -672,6 +817,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
             {"lat": selected_node["lat"], "lng": selected_node["lng"]},
         ],
         "highlighted_buildings": best["highlighted_buildings"],
+        "edge_stats": list(_state.get("edge_telemetry", [])),
     }
     _state["building_debug"]["sample_links"] = [
         {
@@ -700,6 +846,7 @@ def load_mock_graph(osm_file: Path) -> dict:
 
     graph_nodes: dict[str, dict] = {}
     adjacency: dict[str, list[tuple[str, float]]] = {}
+    way_names: dict[tuple[str, str], str] = {}
 
     for way in root.findall("way"):
         tags = {tag.attrib.get("k"): tag.attrib.get("v") for tag in way.findall("tag")}
@@ -711,6 +858,8 @@ def load_mock_graph(osm_file: Path) -> dict:
         if len(refs) < 2:
             continue
 
+        way_name = tags.get("name", "") or tags.get("name:ko", "") or ""
+
         for ref in refs:
             lat, lng = nodes[ref]
             graph_nodes[ref] = {"lat": lat, "lng": lng}
@@ -721,13 +870,15 @@ def load_mock_graph(osm_file: Path) -> dict:
             blat, blng = nodes[b]
             dist = haversine_m(alat, alng, blat, blng)
             adjacency[a].append((b, dist))
-            # Fallback mode favors route continuity over strict traffic legality.
             adjacency[b].append((a, dist))
+            if way_name:
+                way_names[(a, b)] = way_name
+                way_names[(b, a)] = way_name
 
     if not graph_nodes:
         raise RuntimeError("OSM fallback graph를 만들 수 없습니다. bbox를 더 작게 선택해주세요.")
 
-    graph = {"nodes": graph_nodes, "adjacency": adjacency}
+    graph = {"nodes": graph_nodes, "adjacency": adjacency, "way_names": way_names}
     stitch_mock_graph(graph)
     return graph
 
@@ -977,12 +1128,13 @@ def _run_resource_allocation(
             start_nid = raw_k_paths[0][0] if raw_k_paths[0] else None
             if start_nid and start_nid in road_nodes:
                 from app.services.routing.look_ahead_scan import look_ahead_bs_scan as _las
+                _policy = _state.get("policy_options") or {}
                 la_result = _las(
                     current_node_id=start_nid,
                     graph=graph,
                     road_nodes=road_nodes,
                     bs_nodes=bs_nodes,
-                    lookahead_hops=3,
+                    lookahead_hops=_policy.get("lookahead_k", 3),
                 )
         except Exception as _la_e:
             print(f"[ALLOC] Look-ahead failed: {_la_e}", flush=True)
@@ -1034,6 +1186,7 @@ def _store_route_cost(edge_data: list[dict], routing_mode: str) -> None:
         exec_ms = (_time.perf_counter() - _t0) * 1000.0
 
         _state["route_cost_result"] = _path_cost_to_dict(result, routing_mode)
+        _state["route_cost_version"] = _state.get("route_cost_version", 0) + 1
 
         if ROUTE_METRICS_AVAILABLE:
             try:
@@ -1600,14 +1753,34 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
                 break
             remaining -= seg_len
 
+        _progress = round(0.0 if total_dist == 0 else travelled / total_dist, 3)
         _state["vehicle_pos"] = {
             "lat": lat,
             "lng": lng,
             "speed": round(speed_mps * 3.6, 1),
-            "progress": round(0.0 if total_dist == 0 else travelled / total_dist, 3),
+            "progress": _progress,
             "step": step,
             "arrived": travelled >= total_dist,
         }
+        # Simulate edge stats from vehicle progress
+        _rc = _state.get("route_cost_result")
+        if _rc:
+            _pe = _rc.get("per_edge", [])
+            if _pe:
+                _n = len(_pe)
+                _cur = min(int(_progress * _n), _n - 1)
+                _estats = []
+                for _i, _e in enumerate(_pe):
+                    _d = abs(_i - _cur)
+                    _occ = round(max(0.0, 1.0 - _d * 0.4), 3)
+                    _spd = round(max(5.0, 32.4 * (1.0 - _occ * 0.7)), 1)
+                    _estats.append({
+                        "edge_id": _e["edge_id"],
+                        "speed_kmh": _spd,
+                        "occupancy": _occ,
+                        "vehicle_count": 1 if _d == 0 else 0,
+                    })
+                _state["edge_telemetry"] = _estats
         update_network_telemetry(_state["vehicle_pos"])
 
         if travelled >= total_dist:
@@ -1905,6 +2078,17 @@ def simulation_thread(
 
         _state["route_edges"] = edges
 
+        # Collect street names from TraCI (must be done in this thread — TraCI is not thread-safe)
+        _edge_names: dict[str, str] = {}
+        for _eid in edges:
+            try:
+                _name = traci.edge.getStreetName(_eid)
+                if _name:
+                    _edge_names[_eid] = _name
+            except Exception:
+                pass
+        _state["route_edge_names"] = _edge_names
+
         # Build route polyline — TraCI lane shape is most reliable
         route_coords = []
         for eid in edges:
@@ -2022,6 +2206,25 @@ def simulation_thread(
                 "step": step,
                 "arrived": False,
             }
+            # Collect per-edge stats from TraCI
+            _route_eids = _state.get("route_edges", [])
+            if _route_eids:
+                _estats = []
+                for _eid in _route_eids:
+                    try:
+                        _spd_ms = traci.edge.getLastStepMeanSpeed(_eid)
+                        _occ = traci.edge.getLastStepOccupancy(_eid) / 100.0
+                        _vc = traci.edge.getLastStepVehicleNumber(_eid)
+                        _estats.append({
+                            "edge_id": _eid,
+                            "speed_kmh": round(max(0.0, _spd_ms) * 3.6, 1),
+                            "occupancy": round(max(0.0, min(1.0, _occ)), 3),
+                            "vehicle_count": int(_vc),
+                        })
+                    except Exception:
+                        pass
+                if _estats:
+                    _state["edge_telemetry"] = _estats
             update_network_telemetry(_state["vehicle_pos"])
             time.sleep(0.1)  # ~10 fps
 
@@ -2075,11 +2278,16 @@ def reset_simulation_state() -> None:
     _state["building_debug"] = {"sample_links": [], "warnings": []}
     _state["simulation_run_id"] = None
     _state["route_cost_result"] = None
+    _state["route_cost_version"] = 0
+    _state["route_edge_names"] = {}
+    _state["edge_telemetry"] = []
     _state["k_path_candidates"] = None
     _state["algorithm_metrics"] = {}
     _state["simulation_summary"] = None
     _state["selected_algorithms"] = {}
     _state["last_allocation_result"] = None
+    # Stage-1: keep simulation_config across resets (user's saved config persists)
+    _state["policy_options"] = None
 
 
 def _store_simulation_summary() -> None:
@@ -2095,7 +2303,10 @@ def _store_simulation_summary() -> None:
             bs_nodes=_state.get("network_nodes") or [],
             scenario_id=scenario_id,
         )
-        _state["simulation_summary"] = summary.to_dict()
+        summary_dict = summary.to_dict()
+        summary_dict["used_config"] = _state.get("simulation_config") or SimulationConfigModel().model_dump()
+        summary_dict["policy_options"] = _state.get("policy_options")
+        _state["simulation_summary"] = summary_dict
     except Exception as _exc:
         print(f"[SUMMARY] build failed: {_exc}", flush=True)
 
@@ -2302,6 +2513,20 @@ async def start_simulation(req: SimStartRequest):
     _state["selected_algorithms"] = req.algorithm_config or {}
     _state["simulation_run_id"] = create_simulation_run(req.origin, req.dest, _state["sim_mode"])
 
+    # Stage-1: apply simulation config (per-request overrides persistent state)
+    _raw_cfg = req.simulation_config or _state.get("simulation_config")
+    _sim_cfg = merge_with_default_config(_raw_cfg)
+    _apply_simulation_config(_sim_cfg)
+    # algorithm_config (UI dropdown selections) takes final priority over config
+    if req.algorithm_config.get("latency_algorithm") and LATENCY_AVAILABLE:
+        try:
+            LATENCY_REGISTRY.set_algorithm(req.algorithm_config["latency_algorithm"])
+            _state["latency_algorithm"] = req.algorithm_config["latency_algorithm"]
+        except Exception:
+            pass
+    if req.algorithm_config.get("allocation_algorithm"):
+        _state["allocation_algorithm"] = req.algorithm_config["allocation_algorithm"]
+
     use_sumo, sumo_error = can_run_sumo()
     if use_sumo and _state["net_file"]:
         _state["sim_mode"] = "sumo"
@@ -2378,6 +2603,15 @@ async def start_simulation(req: SimStartRequest):
 
         _state["route_edges"] = path
         _state["route_coords"] = route_coords
+
+        # Collect street names from OSM way_names stored in mock graph
+        _mock_way_names = _state["mock_graph"].get("way_names", {})
+        _mock_edge_names: dict[str, str] = {}
+        for _a, _b in zip(path, path[1:]):
+            _eid = f"{_a}_{_b}"
+            _mock_edge_names[_eid] = _mock_way_names.get((_a, _b)) or _mock_way_names.get((_b, _a)) or ""
+        _state["route_edge_names"] = _mock_edge_names
+
         _state["route_buildings"], _state["building_debug"] = load_route_buildings(
             route_coords, _state.get("network_nodes")
         )
@@ -2461,6 +2695,31 @@ def get_route_evaluate():
     if not result:
         return {"available": False, "reason": "시뮬레이션을 먼저 시작하세요."}
     return result
+
+
+@app.get("/api/simulation/config")
+def get_simulation_config():
+    """Return current simulation config and effective cost weights (Stage-1)."""
+    cfg_dict = _state.get("simulation_config") or SimulationConfigModel().model_dump()
+    return {
+        "simulation_config": cfg_dict,
+        "policy_options": _state.get("policy_options"),
+        "effective_cost_weights": _weights_to_dict(),
+    }
+
+
+@app.put("/api/simulation/config")
+def update_simulation_config(req: SimulationConfigRequest):
+    """Persist simulation config and apply immediately (Stage-1)."""
+    cfg = validate_simulation_config(req.simulation_config)
+    _apply_simulation_config(cfg)
+    return {"ok": True, "applied_config": _state.get("simulation_config")}
+
+
+@app.get("/api/simulation/config/schema")
+def get_simulation_config_schema():
+    """Return JSON schema for the SimulationConfigModel (for frontend form generation)."""
+    return SimulationConfigModel.model_json_schema()
 
 
 @app.get("/api/route/cost-weights")
@@ -3138,11 +3397,13 @@ async def websocket_endpoint(ws: WebSocket):
         last_pos = None
         last_route = None
         last_telemetry = None
+        last_cost_version = 0
         while True:
             pos = _state.get("vehicle_pos")
             err = _state.get("error")
             route = _state.get("route_coords")
             telemetry = _state.get("network_telemetry")
+            cost_version = _state.get("route_cost_version", 0)
 
             if err:
                 await ws.send_json({"type": "error", "message": err})
@@ -3171,6 +3432,31 @@ async def websocket_endpoint(ws: WebSocket):
             if telemetry and telemetry != last_telemetry:
                 await ws.send_json({"type": "telemetry", **telemetry})
                 last_telemetry = telemetry
+
+            if cost_version != last_cost_version:
+                cost_result = _state.get("route_cost_result")
+                if cost_result:
+                    per_edge = [
+                        {
+                            "edge_id":        e["edge_id"],
+                            "distance_m":     e.get("distance_m", 0),
+                            "latency_ms":     e.get("latency_ms", 0),
+                            "load_ratio":     e.get("load_ratio", 0),
+                            "within_coverage": e.get("within_coverage", False),
+                            "best_node_name": e.get("best_node_name"),
+                            "total_cost":     e.get("total_cost", 0),
+                        }
+                        for e in cost_result.get("per_edge", [])
+                    ]
+                    await ws.send_json({
+                        "type": "route_cost",
+                        "per_edge": per_edge,
+                        "edge_names": _state.get("route_edge_names", {}),
+                        "routing_mode": cost_result.get("routing_mode", ""),
+                        "avg_latency_ms": cost_result.get("avg_latency_ms", 0),
+                        "total_cost": cost_result.get("total_cost", 0),
+                    })
+                last_cost_version = cost_version
 
             await asyncio.sleep(0.1)
 

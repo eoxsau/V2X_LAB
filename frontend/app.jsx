@@ -24,7 +24,36 @@ function App() {
   const [wsConnected, setWsConnected]   = useState(false);
   const [simNotice, setSimNotice]       = useState(null);
   const [networkTelemetry, setNetworkTelemetry] = useState(null);
+  const [routeEdges, setRouteEdges] = useState(null);
   const wsRef = useRef(null);
+
+  // Stage-1 simulation config (persisted to localStorage)
+  const DEFAULT_SIM_CONFIG = {
+    cost_weights: {
+      w_distance: 1.0, w_time: 2.0, w_latency: 3.0, w_load: 1.5,
+      w_resource: 1.0, w_handover: 1.0, w_blockage: 1.5, w_future: 2.5,
+    },
+    algorithm_selection: {
+      route_algorithm: 'dijkstra',
+      latency_algorithm: 'full_composite_latency',
+      base_station_selection_algorithm: 'lowest_latency_bs',
+      resource_allocation_algorithm: 'traffic_aware_allocation',
+    },
+    policy_options: {
+      lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
+      prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
+    },
+  };
+  const [simConfig, setSimConfig] = useState(() => {
+    try {
+      const saved = localStorage.getItem('v2x_sim_config');
+      return saved ? JSON.parse(saved) : DEFAULT_SIM_CONFIG;
+    } catch { return DEFAULT_SIM_CONFIG; }
+  });
+  function saveSimConfig(cfg) {
+    setSimConfig(cfg);
+    try { localStorage.setItem('v2x_sim_config', JSON.stringify(cfg)); } catch {}
+  }
 
   // Cross-tab live data
   const [simHistory, setSimHistory] = useState([]);   // {t, speed, progress, latency, bs} per tick
@@ -58,6 +87,7 @@ function App() {
         setRouteCoords([]);
         setSimNotice(null);
         setNetworkTelemetry(null);
+        setRouteEdges(null);
         setSimHistory([]);
         setSimLogs([]);
         prevBsRef.current = null;
@@ -114,6 +144,8 @@ function App() {
           console.error('[WS]', msg.message);
         } else if (msg.type === 'telemetry') {
           setNetworkTelemetry(msg);
+        } else if (msg.type === 'route_cost') {
+          setRouteEdges({ per_edge: msg.per_edge, edge_names: msg.edge_names || {}, routing_mode: msg.routing_mode, avg_latency_ms: msg.avg_latency_ms, total_cost: msg.total_cost });
         }
       };
     }
@@ -235,14 +267,15 @@ function App() {
             setSimNotice={setSimNotice}
             networkTelemetry={networkTelemetry}
             setNetworkTelemetry={setNetworkTelemetry}
+            simConfig={simConfig}
             api={API}
           />
         </div>
         {tab === 'vehicles'   && <VehiclesTab sim={sim} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
-        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} />}
+        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} routeEdges={routeEdges} />}
         {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
         {tab === 'analysis'   && <AnalysisTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
-        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} />}
+        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} />}
       </main>
     </div>
   );

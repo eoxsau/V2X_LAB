@@ -50,15 +50,12 @@ const NETWORK_ROUTING_ALGORITHMS = new Set([
   'look_ahead_routing',
   'rl_routing',
 ]);
-// Coverage-circle radius (meters) drawn around each base station per network
-// generation. Visual only — gives the user a sense of distance/scale on the map.
-const GEN_COVERAGE_RADIUS_M = { '4g': 2000, '5g': 1000, '6g': 500 };
 
 function formatAlgorithmName(name) {
   return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, api }) {
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, api }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
@@ -209,22 +206,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const g = groups.current.stations; if (!g) return;
     g.clearLayers();
     const deleteMode = mode === 'bs_delete';
-    const coverageRadiusM = GEN_COVERAGE_RADIUS_M[networkGen] || 1000;
     // latency lookup so label can include it when sim is running
     const latencyMap = {};
     (networkTelemetry?.candidate_nodes || []).forEach(n => { latencyMap[n.id] = n.predicted_latency_ms; });
     stations.forEach((st) => {
-      // coverage-radius ring (meters, scales with zoom). Non-interactive so it never
-      // swallows map clicks for create/delete or the marker's own click handler.
-      L.circle([st.lat, st.lng], {
-        radius: coverageRadiusM,
-        color: '#1E88E5',
-        weight: 1.2,
-        opacity: 0.45,
-        fillColor: '#1E88E5',
-        fillOpacity: 0.07,
-        interactive: false,
-      }).addTo(g);
       const marker = L.circleMarker([st.lat, st.lng], {
         radius: 8,
         color: '#fff',
@@ -256,7 +241,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         });
       }
     });
-  }, [stations, mode, networkTelemetry, networkGen]);
+  }, [stations, mode, networkTelemetry]);
 
   /* ── vehicle marker from WebSocket position ─────────────────── */
   useEffect(() => {
@@ -447,6 +432,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           dest,
           use_network_routing: NETWORK_ROUTING_ALGORITHMS.has(selectedAlgorithms.route),
           algorithm_config: selectedAlgorithms,
+          simulation_config: simConfig || null,
         }),
       });
       const body = await res.json();
@@ -772,9 +758,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   {lbl}
                 </button>
               ))}
-            </div>
-            <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>
-              기지국 표시 반경 {GEN_COVERAGE_RADIUS_M[networkGen].toLocaleString()} m
             </div>
           </div>
 

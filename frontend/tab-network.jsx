@@ -1,7 +1,35 @@
 /* ============================================================ Network tab */
-function NetworkTab({ networkTelemetry }) {
+function edgeCongTone(loadRatio) {
+  if (loadRatio >= 0.65) return 'bad';
+  if (loadRatio >= 0.35) return 'warn';
+  return 'good';
+}
+function edgeCongLabel(loadRatio) {
+  if (loadRatio >= 0.65) return '혼잡';
+  if (loadRatio >= 0.35) return '보통';
+  return '원활';
+}
+
+function NetworkTab({ networkTelemetry, routeEdges }) {
   const hasLive = !!networkTelemetry;
   const connNode = networkTelemetry?.connected_node ?? null;
+
+  // Merge static route edge metadata with live per-tick edge stats from networkTelemetry
+  const liveEdgeMap = {};
+  (networkTelemetry?.edge_stats || []).forEach(e => { liveEdgeMap[e.edge_id] = e; });
+  const hasLiveEdges = Object.keys(liveEdgeMap).length > 0;
+  const edgeNames = routeEdges?.edge_names || {};
+  const mergedEdges = (routeEdges?.per_edge || []).map(e => {
+    const live = liveEdgeMap[e.edge_id];
+    return {
+      ...e,
+      street_name:   edgeNames[e.edge_id] || '',
+      speed_kmh:     live?.speed_kmh     ?? null,
+      occupancy:     live?.occupancy     ?? null,
+      vehicle_count: live?.vehicle_count ?? null,
+      load_ratio:    live?.occupancy     ?? e.load_ratio ?? 0,
+    };
+  });
   const candidates = networkTelemetry?.candidate_nodes ?? [];
   const connName = networkTelemetry?.ego_vehicle?.connected_network_node_name
     ?? connNode?.name ?? null;
@@ -145,35 +173,98 @@ function NetworkTab({ networkTelemetry }) {
         </Card>
       )}
 
-      <div className="grid" style={{ gridTemplateColumns: '1.5fr 1fr' }}>
-        <Card title="엣지 혼잡도" en="Edge congestion" style={{ padding: 0 }}>
-          <div className="tbl-wrap">
-            <table className="tbl">
-              <thead>
-                <tr><th>엣지 ID<span className="en">Edge</span></th><th>도로명<span className="en">Road</span></th><th className="r">차량 수<span className="en">Count</span></th><th className="r">평균 속도<span className="en">Speed</span></th><th>혼잡도<span className="en">Level</span></th></tr>
-              </thead>
-              <tbody>
-                {DATA.edges.map(e => (
-                  <tr key={e.id}>
-                    <td><span className="chip" style={{ fontFamily: 'var(--mono)' }}>{e.id}</span></td>
-                    <td>{e.name}<div className="mono" style={{ fontSize: 9.5, color: 'var(--ink-4)' }}>{e.nameEn}</div></td>
-                    <td className="r"><span className="num" style={{ fontWeight: 600 }}>{e.vehicles}</span></td>
-                    <td className="r"><span className="num">{e.speed.toFixed(1)}</span> <span className="muted" style={{ fontSize: 10 }}>km/h</span></td>
-                    <td><Chip tone={levelTone[e.level]} dot>{levelKo[e.level]}</Chip></td>
+      {mergedEdges.length > 0 && (
+        <div className="grid" style={{ gridTemplateColumns: '1.5fr 1fr' }}>
+          <Card title="엣지 혼잡도" en="Edge congestion"
+            right={
+              <div className="row gap8">
+                {hasLiveEdges && <Chip tone="good" dot>LIVE</Chip>}
+                {routeEdges?.routing_mode && <Chip>{routeEdges.routing_mode}</Chip>}
+              </div>
+            }
+            style={{ padding: 0 }}>
+            <div className="tbl-wrap">
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>엣지 ID<span className="en">Edge</span></th>
+                    <th>도로명<span className="en">Road</span></th>
+                    <th className="r">거리<span className="en">Dist</span></th>
+                    <th className="r">{hasLiveEdges ? '속도' : '지연'}<span className="en">{hasLiveEdges ? 'Speed' : 'Lat'}</span></th>
+                    <th className="r">{hasLiveEdges ? '차량' : '부하'}<span className="en">{hasLiveEdges ? 'Veh' : 'Load'}</span></th>
+                    <th>혼잡도<span className="en">Level</span></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-        <Card title="구간별 평균 속도" en="Speed by edge">
-          <BarChart items={DATA.edges.map(e => ({
-            label: e.id.replace('edge_', ''), value: e.speed, display: e.speed.toFixed(1),
-            color: `var(--${levelTone[e.level]})`,
-          }))} max={60} />
-          <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>km/h · 낮은 속도 = 높은 혼잡</div>
-        </Card>
-      </div>
+                </thead>
+                <tbody>
+                  {mergedEdges.map((e, i) => {
+                    const tone = edgeCongTone(e.load_ratio || 0);
+                    return (
+                      <tr key={e.edge_id || i}>
+                        <td>
+                          <span className="chip" style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>{e.edge_id}</span>
+                          {!e.within_coverage && (
+                            <span className="chip" style={{ marginLeft: 4, fontSize: 9, background: 'var(--warn-tint)', color: 'var(--warn)' }}>미커버</span>
+                          )}
+                        </td>
+                        <td>
+                          {e.street_name
+                            ? <span style={{ fontSize: 12 }}>{e.street_name}</span>
+                            : <span className="muted" style={{ fontSize: 10.5 }}>—</span>}
+                        </td>
+                        <td className="r">
+                          <span className="num">{(e.distance_m || 0).toFixed(0)}</span>
+                          <span className="muted" style={{ fontSize: 10 }}> m</span>
+                        </td>
+                        <td className="r">
+                          {hasLiveEdges && e.speed_kmh !== null ? (
+                            <><span className="num" style={{ color: `var(--${edgeCongTone(1 - (e.speed_kmh / 50))})`, fontWeight: 600 }}>{e.speed_kmh.toFixed(1)}</span><span className="muted" style={{ fontSize: 10 }}> km/h</span></>
+                          ) : (
+                            <><span className="num" style={{ color: `var(--${latencyTone(e.latency_ms || 0)})`, fontWeight: 600 }}>{(e.latency_ms || 0).toFixed(1)}</span><span className="muted" style={{ fontSize: 10 }}> ms</span></>
+                          )}
+                        </td>
+                        <td className="r">
+                          {hasLiveEdges && e.vehicle_count !== null ? (
+                            <span className="num" style={{ fontWeight: 600 }}>{e.vehicle_count}</span>
+                          ) : (
+                            <div className="row gap8" style={{ justifyContent: 'flex-end' }}>
+                              <div className="pbar" style={{ width: 50 }}><i style={{ width: `${Math.min((e.load_ratio || 0) * 100, 100)}%`, background: `var(--${tone})` }} /></div>
+                              <span className="num" style={{ fontSize: 11, fontWeight: 600, color: `var(--${tone})`, width: 32, textAlign: 'right' }}>{((e.load_ratio || 0) * 100).toFixed(0)}%</span>
+                            </div>
+                          )}
+                        </td>
+                        <td><Chip tone={tone} dot>{edgeCongLabel(e.load_ratio || 0)}</Chip></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+          <Card title={hasLiveEdges ? '구간별 평균 속도' : '구간별 부하율'} en={hasLiveEdges ? 'Speed by edge' : 'Load ratio by edge'}>
+            {hasLiveEdges ? (
+              <>
+                <BarChart items={mergedEdges.map((e, i) => ({
+                  label: e.street_name || (e.edge_id || `e${i}`).slice(-8),
+                  value: e.speed_kmh ?? 0,
+                  display: e.speed_kmh !== null ? `${e.speed_kmh.toFixed(0)}` : '—',
+                  color: `var(--${edgeCongTone(e.load_ratio || 0)})`,
+                }))} max={60} />
+                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>km/h · 낮은 속도 = 혼잡</div>
+              </>
+            ) : (
+              <>
+                <BarChart items={mergedEdges.map((e, i) => ({
+                  label: e.street_name || (e.edge_id || `e${i}`).slice(-8),
+                  value: (e.load_ratio || 0) * 100,
+                  display: `${((e.load_ratio || 0) * 100).toFixed(0)}%`,
+                  color: `var(--${edgeCongTone(e.load_ratio || 0)})`,
+                }))} max={100} />
+                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>% · 높은 부하율 = 혼잡</div>
+              </>
+            )}
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
