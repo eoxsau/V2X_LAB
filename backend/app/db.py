@@ -162,7 +162,14 @@ def read_postgis_gdf(sql: str, params: dict | None = None, geom_col: str = "geom
     if engine is None:
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     try:
-        return gpd.read_postgis(sql, engine, geom_col=geom_col, params=params or {})
+        gdf = gpd.read_postgis(sql, engine, geom_col=geom_col, params=params or {})
+        # The file-based (parquet/gpkg) read paths name the active geometry column
+        # "geometry"; PostGIS reads name it after geom_col ("geom"). Normalize here so
+        # every consumer (matchers, bbox endpoints, itertuples access) is source-agnostic.
+        # Rename by geom_col (not row data) so it also applies to zero-row results.
+        if geom_col != "geometry" and geom_col in gdf.columns:
+            gdf = gdf.rename_geometry("geometry")
+        return gdf
     except Exception as exc:
         print(f"[db] read_postgis_gdf failed: {exc}", flush=True)
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")

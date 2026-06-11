@@ -50,6 +50,9 @@ const NETWORK_ROUTING_ALGORITHMS = new Set([
   'look_ahead_routing',
   'rl_routing',
 ]);
+// Coverage-circle radius (meters) drawn around each base station per network
+// generation. Visual only — gives the user a sense of distance/scale on the map.
+const GEN_COVERAGE_RADIUS_M = { '4g': 2000, '5g': 1000, '6g': 500 };
 
 function formatAlgorithmName(name) {
   return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
@@ -60,7 +63,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const mapObj  = useRef(null);
   const groups  = useRef({});
   const prevVehPos = useRef(null);
-  const algorithmMenuRef = useRef(null);
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
   const MAX_SETUP_AREA_KM2 = 25;
@@ -78,9 +80,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [simError,   setSimError]   = useState(null);
   const [stations,   setStations]   = useState([]);   // user_created base stations from DB
   const [stationsErr,setStationsErr]= useState(null);
-  const [showAlgorithmMenu, setShowAlgorithmMenu] = useState(false);
   const [openAlgorithmGroup, setOpenAlgorithmGroup] = useState(null);
   const [selectedAlgorithms, setSelectedAlgorithms] = useState(DEFAULT_ALGORITHM_SELECTION);
+  const [networkGen, setNetworkGen] = useState('5g'); // 4g · 5g · 6g — UI only, not wired to backend
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
@@ -207,10 +209,22 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const g = groups.current.stations; if (!g) return;
     g.clearLayers();
     const deleteMode = mode === 'bs_delete';
+    const coverageRadiusM = GEN_COVERAGE_RADIUS_M[networkGen] || 1000;
     // latency lookup so label can include it when sim is running
     const latencyMap = {};
     (networkTelemetry?.candidate_nodes || []).forEach(n => { latencyMap[n.id] = n.predicted_latency_ms; });
     stations.forEach((st) => {
+      // coverage-radius ring (meters, scales with zoom). Non-interactive so it never
+      // swallows map clicks for create/delete or the marker's own click handler.
+      L.circle([st.lat, st.lng], {
+        radius: coverageRadiusM,
+        color: '#1E88E5',
+        weight: 1.2,
+        opacity: 0.45,
+        fillColor: '#1E88E5',
+        fillOpacity: 0.07,
+        interactive: false,
+      }).addTo(g);
       const marker = L.circleMarker([st.lat, st.lng], {
         radius: 8,
         color: '#fff',
@@ -242,7 +256,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         });
       }
     });
-  }, [stations, mode, networkTelemetry]);
+  }, [stations, mode, networkTelemetry, networkGen]);
 
   /* ── vehicle marker from WebSocket position ─────────────────── */
   useEffect(() => {
@@ -416,10 +430,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   };
   const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
   const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
-  const tryAlgorithms = () => {
-    setShowAlgorithmMenu(v => !v);
-    if (showAlgorithmMenu) setOpenAlgorithmGroup(null);
-  };
 
   async function handleStart() {
     if (!ready) return;
@@ -516,6 +526,17 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     </div>
   );
 
+  // display-only legend row (map markers + live status; no interaction)
+  const LegendRow = ({ shape, color, label, children }) => (
+    <div className="row between" style={{ padding: '4px 0' }}>
+      <span className="row gap8" style={{ minWidth: 0 }}>
+        <span style={{ width: 10, height: 10, borderRadius: shape === 'square' ? 2 : '50%', background: color, flex: '0 0 auto' }} />
+        <span style={{ fontSize: 12, whiteSpace: 'nowrap' }}>{label}</span>
+      </span>
+      {children}
+    </div>
+  );
+
   const AlgorithmGroup = ({ groupKey, label, options }) => {
     const isOpen = openAlgorithmGroup === groupKey;
     const selected = selectedAlgorithms[groupKey];
@@ -573,36 +594,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       <div style={{ position: 'relative', overflow: 'hidden' }}>
         <div ref={mapRef} style={{ position: 'absolute', inset: 0 }} />
 
-        {/* step toolbar top-left */}
-        <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 600, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', maxWidth: 'calc(100% - 28px)' }}>
-          <div className="seg" style={{ background: '#fff', boxShadow: 'var(--sh-2)' }}>
-            <button className={mode === 'area' ? 'active' : ''} onClick={tryArea}>
-              <span className="row gap8">
-                <span style={{ width: 8, height: 8, borderRadius: 2, background: '#1E3A5F', display: 'inline-block' }} />
-                구역{area && <Icon.check size={12} style={{ color: 'var(--good)' }} />}
-              </span>
-            </button>
-            {[
-              ['origin', '출발지', '#1F9D57', originDone, tryOrigin],
-              ['dest',   '도착지', '#E0463C', destDone,   tryDest],
-              ['bs_create', '기지국 생성', '#1E88E5', false, tryBsCreate],
-              ['bs_delete', '기지국 제거', '#9AA5B1', false, tryBsDelete],
-            ].map(([k, lbl, c, done, fn]) => (
-              <button key={k} className={mode === k ? 'active' : ''}
-                disabled={!area} style={!area ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
-                onClick={fn}>
-                <span className="row gap8">
-                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: c, display: 'inline-block' }} />
-                  {lbl}{done && <Icon.check size={12} style={{ color: 'var(--good)' }} />}
-                </span>
-              </button>
-            ))}
-            <button className={showAlgorithmMenu ? 'active' : ''} onClick={tryAlgorithms}>
-              <span className="row gap8">
-                <span style={{ width: 8, height: 8, borderRadius: 2, background: '#8C6CF6', display: 'inline-block' }} />
-                알고리즘
-              </span>
-            </button>
+        {/* legend top-left — display only (controls live in the right panel) */}
+        <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 600, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start', maxWidth: 'calc(100% - 28px)' }}>
+          <div style={{ background: '#fff', borderRadius: 12, boxShadow: 'var(--sh-2)', padding: '10px 14px', minWidth: 176 }}>
+            <div className="row gap8" style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 6, whiteSpace: 'nowrap' }}>
+              <Icon.map size={13} /> 범례 <span className="en" style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--ink-4)' }}>LEGEND</span>
+            </div>
+            <LegendRow shape="square" color="#1E3A5F" label="구역">
+              {area ? <Icon.check size={13} style={{ color: 'var(--good)' }} /> : <span className="mono" style={{ fontSize: 9, color: 'var(--ink-4)' }}>대기</span>}
+            </LegendRow>
+            <LegendRow shape="circle" color="#1F9D57" label="출발지">
+              {originDone ? <Icon.check size={13} style={{ color: 'var(--good)' }} /> : <span className="mono" style={{ fontSize: 9, color: 'var(--ink-4)' }}>—</span>}
+            </LegendRow>
+            <LegendRow shape="circle" color="#E0463C" label="도착지">
+              {destDone ? <Icon.check size={13} style={{ color: 'var(--good)' }} /> : <span className="mono" style={{ fontSize: 9, color: 'var(--ink-4)' }}>—</span>}
+            </LegendRow>
+            <LegendRow shape="circle" color="#1E88E5" label="기지국">
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.length}개</span>
+            </LegendRow>
           </div>
 
           {hint && (
@@ -612,35 +621,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           )}
           {!area && !mode && (
             <div className="chip" style={{ background: '#fff', boxShadow: 'var(--sh-2)', height: 34, padding: '0 12px', color: 'var(--ink-3)' }}>
-              <Icon.layers size={13} /> '구역'을 눌러 시작하세요 · 남한 전체
+              <Icon.layers size={13} /> 오른쪽 패널에서 구역을 설정해 시작하세요
             </div>
           )}
         </div>
-
-        {showAlgorithmMenu && (
-          <div
-            ref={algorithmMenuRef}
-            style={{
-              position: 'absolute',
-              top: 64,
-              left: 14,
-              zIndex: 610,
-              width: 340,
-              background: '#fff',
-              borderRadius: 12,
-              boxShadow: 'var(--sh-2)',
-              padding: 12,
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 10,
-            }}
-          >
-            <AlgorithmGroup groupKey="route" label="경로 알고리즘" options={ROUTE_ALGORITHMS} />
-            <AlgorithmGroup groupKey="latency" label="지연시간 알고리즘" options={LATENCY_ALGORITHMS} />
-            <AlgorithmGroup groupKey="base_station_selection" label="기지국 선택 알고리즘" options={BS_SELECTION_ALGORITHMS} />
-            <AlgorithmGroup groupKey="resource_allocation" label="자원할당 알고리즘" options={RESOURCE_ALLOCATION_ALGORITHMS} />
-          </div>
-        )}
 
         {/* layer panel bottom-left */}
         <div style={{ position: 'absolute', bottom: 14, left: 14, zIndex: 600, background: '#fff', borderRadius: 12, boxShadow: 'var(--sh-2)', padding: '10px 14px', minWidth: 188 }}>
@@ -777,6 +761,54 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               <WayRow color="var(--m-dest)"   label="도착지" val={dest   ? coordStr(dest)   : '미지정'} done={destDone}   set={tryDest} />
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
+          </div>
+
+          {/* network generation — UI only (not wired to backend) */}
+          <div className="field">
+            <label>네트워크 세대 <span className="en">NETWORK GEN</span></label>
+            <div className="seg" style={{ display: 'flex', width: '100%' }}>
+              {[['4g', '4G'], ['5g', '5G'], ['6g', '6G-like']].map(([v, lbl]) => (
+                <button key={v} className={networkGen === v ? 'active' : ''} style={{ flex: 1 }} onClick={() => setNetworkGen(v)}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+            <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>
+              기지국 표시 반경 {GEN_COVERAGE_RADIUS_M[networkGen].toLocaleString()} m
+            </div>
+          </div>
+
+          {/* base stations */}
+          <div className="field">
+            <label>기지국 <span className="en">BASE STATIONS</span></label>
+            <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
+              <div className="row between" style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
+                <span className="row gap8" style={{ minWidth: 0 }}>
+                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#1E88E5', flex: '0 0 auto' }} />
+                  <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>배치됨 {stations.length}개</span>
+                </span>
+              </div>
+              <div className="row gap8">
+                <button className={'btn sm ' + (mode === 'bs_create' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area} onClick={tryBsCreate}>
+                  <Icon.antenna size={13} /> {mode === 'bs_create' ? '지도 클릭…' : '생성'}
+                </button>
+                <button className={'btn sm ' + (mode === 'bs_delete' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area || stations.length === 0} onClick={tryBsDelete}>
+                  <Icon.antenna size={13} /> {mode === 'bs_delete' ? '제거할 곳 클릭…' : '제거'}
+                </button>
+              </div>
+            </div>
+            {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
+          </div>
+
+          {/* algorithms */}
+          <div className="field">
+            <label>알고리즘 <span className="en">ALGORITHMS</span></label>
+            <div className="col gap8">
+              <AlgorithmGroup groupKey="route" label="경로 알고리즘" options={ROUTE_ALGORITHMS} />
+              <AlgorithmGroup groupKey="latency" label="지연시간 알고리즘" options={LATENCY_ALGORITHMS} />
+              <AlgorithmGroup groupKey="base_station_selection" label="기지국 선택 알고리즘" options={BS_SELECTION_ALGORITHMS} />
+              <AlgorithmGroup groupKey="resource_allocation" label="자원할당 알고리즘" options={RESOURCE_ALLOCATION_ALGORITHMS} />
+            </div>
           </div>
 
           {/* progress bar */}

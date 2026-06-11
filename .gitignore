@@ -17,6 +17,9 @@ backend/networks/*.sumocfg
 backend/tmp_building_test/
 data/processed/demo/*.dump
 
+# Logs
+*.log
+
 # Claude Code IDE
 .claude/
 
@@ -42,6 +45,7 @@ data/processed/*
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Design drafts
 design.html
