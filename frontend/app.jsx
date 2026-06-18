@@ -272,7 +272,7 @@ function App() {
           />
         </div>
         {tab === 'vehicles'   && <VehiclesTab sim={sim} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
-        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} routeEdges={routeEdges} />}
+        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} routeEdges={routeEdges} vehiclePos={vehiclePos} />}
         {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
         {tab === 'analysis'   && <AnalysisTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
         {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} />}

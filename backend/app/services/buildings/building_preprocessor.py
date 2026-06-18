@@ -39,9 +39,28 @@ def preprocess_buildings(raw_dir: Path | None = None, processed_dir: Path | None
     existing = json.loads(existing_index_path.read_text(encoding="utf-8")) if existing_index_path.exists() else {}
     region_map = {item["region_code"]: item for item in existing.get("regions", [])}
 
+    bldrgst_api_key: str = os.getenv("BLDRGST_API_KEY", "").strip()
+    vworld_api_key:  str = os.getenv("VWORLD_API_KEY",  "").strip()
+
     for dataset in datasets:
         gdf = load_building_dataset(dataset)
         gdf = gdf.to_crs(4326)
+
+        # Tier-4: footprint area in m² (EPSG:3857 기준)
+        gdf["footprint_area_m2"] = gdf.to_crs(3857).area
+
+        # Tier-5: V-World Data API 용도지역 공간조인 → zone_type 컬럼 채움
+        if vworld_api_key:
+            from .zone_enricher import enrich_zone_types
+            gdf = enrich_zone_types(gdf, vworld_api_key)
+        if "zone_type" not in gdf.columns:
+            gdf["zone_type"] = None
+
+        # Tier-1/2: 건축물대장 API → heit, grndFlrCnt, mainPurpsCdNm 등 보강
+        if bldrgst_api_key:
+            from .building_hub_enricher import enrich_gdf_with_bldrgst_api
+            gdf = enrich_gdf_with_bldrgst_api(gdf, bldrgst_api_key)
+
         heights = gdf.apply(estimate_building_height, axis=1, result_type="expand")
         heights.columns = ["height_m", "height_source", "height_confidence"]
         gdf = gdf.join(heights)
@@ -71,6 +90,7 @@ def preprocess_buildings(raw_dir: Path | None = None, processed_dir: Path | None
             "height_confidence",
             "structure_code",
             "usability_code",
+            "zone_type",
             "region_code",
             "centroid_lat",
             "centroid_lng",

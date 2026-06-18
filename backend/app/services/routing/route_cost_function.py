@@ -133,6 +133,49 @@ class CostWeights:
 DEFAULT_WEIGHTS = CostWeights()
 
 
+# ── BS Selection algorithm ─────────────────────────────────────────────────────
+_active_bs_selection: str = "lowest_latency_bs"
+
+def set_bs_selection_algorithm(algo: str) -> None:
+    global _active_bs_selection
+    _active_bs_selection = algo
+
+
+def _bs_score(
+    dist_m: float,
+    cov_r: float,
+    cong: float,
+    edge_lat: float,
+    load: float,
+    capacity: float,
+    algo: str,
+) -> float:
+    """
+    Per-algorithm BS scoring — lower score = better BS candidate.
+
+    nearest_bs:          raw Haversine distance
+    lowest_latency_bs:   propagation penalty + congestion + edge latency (legacy)
+    strongest_signal_bs: quadratic distance loss proxy (free-space path loss ∝ d²)
+    load_balanced_bs:    load ratio dominates; small distance tiebreaker
+    look_ahead_bs:       lowest-latency + hard penalty when out of coverage
+    rl_based_bs:         falls back to lowest_latency_bs (RL agent not yet trained)
+    """
+    dist_pen = dist_m / max(cov_r, 1.0) * 15.0
+    if algo == "nearest_bs":
+        return dist_m
+    if algo == "load_balanced_bs":
+        load_ratio = min(load / max(capacity, 1.0), 1.0)
+        return load_ratio * 100.0 + dist_pen * 0.05
+    if algo == "strongest_signal_bs":
+        dist_ratio = dist_m / max(cov_r, 1.0)
+        return dist_ratio * dist_ratio * 100.0 + edge_lat
+    if algo in ("look_ahead_bs_selection", "look_ahead_bs"):
+        within_cov = dist_m <= cov_r
+        return dist_pen + cong + edge_lat + (0.0 if within_cov else 10.0)
+    # lowest_latency_bs, rl_based_bs_selection, and any unknown → legacy formula
+    return dist_pen + cong + edge_lat
+
+
 # ── Result types ──────────────────────────────────────────────────────────────
 @dataclass
 class EdgeCostResult:
@@ -209,6 +252,7 @@ def _find_best_bs_light(
     best_score = float("inf")
     best_dist_m = 0.0
 
+    algo = _active_bs_selection
     for node in nodes:
         n_lat = float(node.get("lat") or 0)
         n_lng = float(node.get("lng") or 0)
@@ -216,10 +260,11 @@ def _find_best_bs_light(
             continue
         dist_m = _haversine_m(mid_lat, mid_lng, n_lat, n_lng)
         cov_r = float(node.get("coverage_radius_m") or 400.0)
-        dist_pen = dist_m / max(cov_r, 1.0) * 15.0
         cong = float(node.get("congestion_penalty") or 0.0)
         edge_lat = float(node.get("edge_latency_ms") or 5.0)
-        score = dist_pen + cong + edge_lat
+        load = float(node.get("load") or 0.0)
+        cap = float(node.get("capacity") or 100.0)
+        score = _bs_score(dist_m, cov_r, cong, edge_lat, load, cap, algo)
         if score < best_score:
             best_score = score
             best_node = node
@@ -276,10 +321,14 @@ def _find_best_bs_full(
         except Exception:
             continue
         cov_r = float(node.get("coverage_radius_m") or 400.0)
-        dist_pen = obs.distance_m / max(cov_r, 1.0) * 15.0
         cong = float(node.get("congestion_penalty") or 0.0)
         edge_lat = float(node.get("edge_latency_ms") or 5.0)
-        score = dist_pen + cong + obs.estimated_penetration_loss_db * 0.8 + edge_lat
+        load = float(node.get("load") or 0.0)
+        cap = float(node.get("capacity") or 100.0)
+        algo = _active_bs_selection
+        # For blockage-aware algorithms, add penetration loss to the score
+        base_score = _bs_score(obs.distance_m, cov_r, cong, edge_lat, load, cap, algo)
+        score = base_score + obs.estimated_penetration_loss_db * 0.8
         if score < best_score:
             best_score = score
             best_node = node

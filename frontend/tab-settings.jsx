@@ -26,7 +26,7 @@ const DEFAULT_SIM_CONFIG = {
 
 const WEIGHT_BOUNDS = { min: 0.0, max: 20.0 };
 const VALID_ROUTE_ALGORITHMS = ['dijkstra', 'astar', 'k_shortest_path', 'network_aware', 'lookahead', 'rl_routing'];
-const VALID_LATENCY_ALGORITHMS = ['full_composite_latency', 'simple_latency', 'mec_aware_latency', 'distance_based_latency', 'load_aware_latency'];
+const VALID_LATENCY_ALGORITHMS = ['full_composite_latency', 'blockage_aware_latency', 'mec_aware_latency', 'distance_based_latency', 'load_aware_latency'];
 const VALID_BS_ALGORITHMS = ['lowest_latency_bs', 'nearest_bs', 'load_balanced_bs'];
 const VALID_ALLOC_ALGORITHMS = ['traffic_aware_allocation', 'equal_allocation', 'proportional_demand_allocation', 'load_balancing_allocation', 'latency_minimizing_allocation', 'priority_based_allocation', 'lookahead_resource_allocation'];
 
@@ -108,6 +108,73 @@ function sanitizeAlgorithmSelection(config) {
   };
 }
 
+// ── Stage-2 custom policy helpers ────────────────────────────────────────────
+
+const CUSTOM_POLICY_FEATURES = {
+  custom_cost_policy:         ['distance', 'time', 'latency', 'load', 'handover', 'blockage', 'future_risk'],
+  custom_bs_selection_policy: ['distance', 'latency', 'load', 'resource_deficit', 'future_risk'],
+  custom_resource_policy:     ['demand', 'load', 'priority', 'distance'],
+};
+
+const CUSTOM_POLICY_SAMPLES = {
+  custom_cost_policy: JSON.stringify({
+    type: 'weighted_sum',
+    weights: { distance: 0.15, time: 0.20, latency: 0.30, load: 0.15, handover: 0.10, blockage: 0.05, future_risk: 0.05 },
+    constraints: { max_handover: 5, max_disconnection_ratio: 0.05 },
+  }, null, 2),
+  custom_bs_selection_policy: JSON.stringify({
+    type: 'weighted_sum',
+    weights: { distance: 0.30, latency: 0.30, load: 0.20, resource_deficit: 0.15, future_risk: 0.05 },
+    constraints: { max_disconnection_ratio: 0.05 },
+  }, null, 2),
+  custom_resource_policy: JSON.stringify({
+    type: 'weighted_sum',
+    weights: { demand: 0.40, load: 0.30, priority: 0.20, distance: 0.10 },
+  }, null, 2),
+};
+
+function parseCustomPolicy(text) {
+  return JSON.parse(text);
+}
+
+function validateCustomPolicy(policyKey, policy) {
+  const errors = [];
+  if (!policy || typeof policy !== 'object') return { valid: false, errors: ['JSON 오브젝트이어야 합니다'] };
+  if (policy.type !== 'weighted_sum') errors.push('type은 "weighted_sum"이어야 합니다');
+  const allowed = CUSTOM_POLICY_FEATURES[policyKey] || [];
+  const weights = policy.weights;
+  if (!weights || typeof weights !== 'object') {
+    errors.push('weights 필드가 필요합니다');
+  } else {
+    const entries = Object.entries(weights);
+    if (entries.length === 0) errors.push('weights에 최소 하나 이상의 항목이 필요합니다');
+    let total = 0;
+    for (const [k, v] of entries) {
+      if (!allowed.includes(k)) errors.push(`weights.${k}: 허용되지 않는 feature (허용: ${allowed.join(', ')})`);
+      else if (typeof v !== 'number' || v < 0 || !isFinite(v)) errors.push(`weights.${k}: 0 이상의 유한한 숫자이어야 합니다`);
+      else total += v;
+    }
+    if (!errors.length && total === 0) errors.push('weights 합이 0입니다');
+  }
+  const constraints = policy.constraints || {};
+  for (const [k, v] of Object.entries(constraints)) {
+    if (k === 'max_handover') { if (!Number.isInteger(v) || v < 0) errors.push('constraints.max_handover: 0 이상의 정수이어야 합니다'); }
+    else if (k === 'max_disconnection_ratio') { if (typeof v !== 'number' || v < 0 || v > 1) errors.push('constraints.max_disconnection_ratio: 0.0–1.0 범위이어야 합니다'); }
+    else errors.push(`constraints.${k}: 알 수 없는 제약 조건 키`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function runCustomWeightedPolicy(policy, features) {
+  if (!policy || policy.type !== 'weighted_sum') return 0;
+  const weights = policy.weights || {};
+  let score = 0;
+  for (const [feat, w] of Object.entries(weights)) {
+    score += w * (features[feat] ?? 0);
+  }
+  return Math.max(0, score);
+}
+
 function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
   const [tech, setTech] = useState(sim.mode === '6G' ? '6G' : '5G');
   const [vals, setVals] = useState(() => {
@@ -119,6 +186,11 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
   const [cfgDraft, setCfgDraft] = useState(() => mergeWithDefaultConfig(simConfig));
   const [cfgErrors, setCfgErrors] = useState([]);
   const [cfgSaved, setCfgSaved] = useState(false);
+  // Stage-2: custom policy state
+  const [customPolicyText, setCustomPolicyText] = useState(CUSTOM_POLICY_SAMPLES);
+  const [customPolicyErrors, setCustomPolicyErrors] = useState({});
+  const [customPolicyParsed, setCustomPolicyParsed] = useState({});
+  const [customPolicySaved, setCustomPolicySaved] = useState(false);
 
   useEffect(() => {
     let dead = false;
@@ -164,6 +236,62 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
   function resetConfig() {
     setCfgDraft(mergeWithDefaultConfig(null));
     setCfgErrors([]);
+  }
+
+  function handlePolicyText(key, text) {
+    setCustomPolicyText(t => ({ ...t, [key]: text }));
+    setCustomPolicyErrors(e => { const n = { ...e }; delete n[key]; return n; });
+    setCustomPolicyParsed(p => { const n = { ...p }; delete n[key]; return n; });
+  }
+
+  function validatePolicyLocal(key) {
+    const text = customPolicyText[key] || '';
+    try {
+      const parsed = parseCustomPolicy(text);
+      const { valid, errors } = validateCustomPolicy(key, parsed);
+      setCustomPolicyErrors(e => ({ ...e, [key]: valid ? [] : errors }));
+      setCustomPolicyParsed(p => ({ ...p, [key]: valid ? parsed : null }));
+      return valid ? parsed : null;
+    } catch (err) {
+      setCustomPolicyErrors(e => ({ ...e, [key]: [err.message] }));
+      setCustomPolicyParsed(p => ({ ...p, [key]: null }));
+      return null;
+    }
+  }
+
+  async function applyCustomPolicies() {
+    const policyKeys = Object.keys(CUSTOM_POLICY_FEATURES);
+    const allErrors = {};
+    const validPolicies = {};
+    for (const key of policyKeys) {
+      const parsed = validatePolicyLocal(key);
+      if (parsed) validPolicies[key] = parsed;
+    }
+    if (Object.keys(validPolicies).length === 0) return;
+    try {
+      const res = await fetch(`${api}/api/simulation/custom-policy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policies: validPolicies }),
+      });
+      const data = await res.json();
+      if (data.errors && Object.keys(data.errors).length > 0) {
+        setCustomPolicyErrors(e => ({ ...e, ...data.errors }));
+      }
+      setCustomPolicySaved(true);
+      setTimeout(() => setCustomPolicySaved(false), 2200);
+    } catch (err) {
+      setCustomPolicyErrors(e => ({ ...e, _network: [err.message] }));
+    }
+  }
+
+  async function removeCustomPolicy(key) {
+    try {
+      await fetch(`${api}/api/simulation/custom-policy/${key}`, { method: 'DELETE' });
+    } catch (_) {}
+    setCustomPolicyText(t => ({ ...t, [key]: CUSTOM_POLICY_SAMPLES[key] }));
+    setCustomPolicyErrors(e => { const n = { ...e }; delete n[key]; return n; });
+    setCustomPolicyParsed(p => { const n = { ...p }; delete n[key]; return n; });
   }
 
   return (
@@ -362,6 +490,65 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
             </tbody>
           </table>
         </div>
+      </Card>
+
+      {/* ── Stage-2: Custom Policy Editor ──────────────────────────────────── */}
+      <Card title="커스텀 정책" en="Custom Policy (Stage 2)"
+        right={
+          <div className="row gap8">
+            <button className={'btn ' + (customPolicySaved ? 'good' : 'primary')} onClick={applyCustomPolicies}>
+              {customPolicySaved ? <><Icon.check size={13} /> 적용됨</> : <><Icon.check size={13} /> 정책 적용</>}
+            </button>
+          </div>
+        }
+        style={{ marginTop: 18 }}
+      >
+        <div className="row gap8" style={{ marginBottom: 16, padding: '9px 12px', background: 'var(--warn-tint)', borderRadius: 8, fontSize: 11, color: 'var(--warn-ink, var(--warn))' }}>
+          <Icon.warn size={13} style={{ flex: '0 0 auto', marginTop: 1 }} />
+          <span style={{ lineHeight: 1.45 }}>JSON 형식으로 가중치를 정의합니다. <span className="mono">type: "weighted_sum"</span>만 지원. 가중치 값은 0 이상의 실수이며 feature 키는 정책별로 고정됩니다.</span>
+        </div>
+        {customPolicyErrors._network && (
+          <div style={{ fontSize: 11, color: 'var(--err,#c00)', marginBottom: 10 }}>{customPolicyErrors._network.join(' ')}</div>
+        )}
+        {[
+          ['custom_cost_policy',         '경로 비용 정책',    'distance · time · latency · load · handover · blockage · future_risk'],
+          ['custom_bs_selection_policy', '기지국 선택 정책',  'distance · latency · load · resource_deficit · future_risk'],
+          ['custom_resource_policy',     '자원 할당 정책',    'demand · load · priority · distance'],
+        ].map(([key, label, features]) => {
+          const errs = customPolicyErrors[key] || [];
+          const parsed = customPolicyParsed[key];
+          return (
+            <div key={key} style={{ marginBottom: 20 }}>
+              <div className="row between" style={{ marginBottom: 6 }}>
+                <div>
+                  <b style={{ fontWeight: 600, fontSize: 12.5 }}>{label}</b>
+                  <span className="muted mono" style={{ fontSize: 10.5, marginLeft: 8 }}>{features}</span>
+                </div>
+                <div className="row gap8">
+                  <button className="btn sm" onClick={() => validatePolicyLocal(key)}>검증</button>
+                  <button className="btn sm" onClick={() => removeCustomPolicy(key)}>초기화</button>
+                </div>
+              </div>
+              <textarea
+                style={{ width: '100%', height: 130, fontFamily: 'var(--mono)', fontSize: 11.5, lineHeight: 1.55,
+                  padding: '8px 10px', boxSizing: 'border-box', resize: 'vertical',
+                  background: 'var(--surface-2)', border: '1px solid ' + (errs.length ? 'var(--err,#c00)' : parsed ? 'var(--good,#1a9)' : 'var(--border)'),
+                  borderRadius: 8, color: 'var(--ink)', outline: 'none' }}
+                value={customPolicyText[key] || ''}
+                onChange={e => handlePolicyText(key, e.target.value)}
+                spellCheck={false}
+              />
+              {errs.length > 0 && (
+                <div style={{ fontSize: 11, color: 'var(--err,#c00)', marginTop: 4, lineHeight: 1.5 }}>
+                  {errs.map((e, i) => <div key={i}>• {e}</div>)}
+                </div>
+              )}
+              {parsed && errs.length === 0 && (
+                <div style={{ fontSize: 11, color: 'var(--good,#1a9)', marginTop: 4 }}>✓ 유효한 정책</div>
+              )}
+            </div>
+          );
+        })}
       </Card>
     </div>
   );

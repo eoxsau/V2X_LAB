@@ -10,26 +10,79 @@ function edgeCongLabel(loadRatio) {
   return '원활';
 }
 
-function NetworkTab({ networkTelemetry, routeEdges }) {
+function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
   const hasLive = !!networkTelemetry;
   const connNode = networkTelemetry?.connected_node ?? null;
 
-  // Merge static route edge metadata with live per-tick edge stats from networkTelemetry
-  const liveEdgeMap = {};
-  (networkTelemetry?.edge_stats || []).forEach(e => { liveEdgeMap[e.edge_id] = e; });
-  const hasLiveEdges = Object.keys(liveEdgeMap).length > 0;
-  const edgeNames = routeEdges?.edge_names || {};
-  const mergedEdges = (routeEdges?.per_edge || []).map(e => {
-    const live = liveEdgeMap[e.edge_id];
-    return {
-      ...e,
-      street_name:   edgeNames[e.edge_id] || '',
-      speed_kmh:     live?.speed_kmh     ?? null,
-      occupancy:     live?.occupancy     ?? null,
-      vehicle_count: live?.vehicle_count ?? null,
-      load_ratio:    live?.occupancy     ?? e.load_ratio ?? 0,
-    };
+  const edgeStats = networkTelemetry?.edge_stats || [];
+  const perEdge   = routeEdges?.per_edge || [];
+  const perEdgeMap = {};
+  perEdge.forEach(e => { perEdgeMap[e.edge_id] = e; });
+  const edgeNames = networkTelemetry?.route_edge_names || routeEdges?.edge_names || {};
+  const hasLiveEdges = edgeStats.length > 0;
+
+  // Live stats as primary; fall back to route_cost per_edge (static snapshot) if live not yet available
+  const _allEdgesRaw = hasLiveEdges
+    ? edgeStats.map(e => {
+        const meta = perEdgeMap[e.edge_id] || {};
+        return {
+          edge_id:         e.edge_id,
+          street_name:     edgeNames[e.edge_id] || '',
+          speed_kmh:       e.speed_kmh,
+          occupancy:       e.occupancy,
+          vehicle_count:   e.vehicle_count,
+          load_ratio:      e.occupancy ?? meta.load_ratio ?? 0,
+          distance_m:      meta.distance_m  ?? null,
+          latency_ms:      meta.latency_ms  ?? null,
+          within_coverage: meta.within_coverage ?? true,
+        };
+      })
+    : perEdge.map(e => ({
+        edge_id:         e.edge_id,
+        street_name:     edgeNames[e.edge_id] || '',
+        speed_kmh:       null,
+        occupancy:       e.load_ratio,
+        vehicle_count:   null,
+        load_ratio:      e.load_ratio,
+        distance_m:      e.distance_m  ?? null,
+        latency_ms:      e.latency_ms  ?? null,
+        within_coverage: e.within_coverage ?? true,
+      }));
+  // 도로명이 없는 엣지에 인접 엣지 이름 전파 (앞→뒤, 뒤→앞)
+  const allEdges = (() => {
+    const a = _allEdgesRaw.map(e => ({ ...e }));
+    for (let i = 1; i < a.length; i++)
+      if (!a[i].street_name && a[i - 1].street_name) a[i].street_name = a[i - 1].street_name;
+    for (let i = a.length - 2; i >= 0; i--)
+      if (!a[i].street_name && a[i + 1].street_name) a[i].street_name = a[i + 1].street_name;
+    return a;
+  })();
+
+  // Current edge + last 6 completed edges (from backend edge_history)
+  const edgeHistory   = networkTelemetry?.edge_history   || [];
+  const edgeAvgSpeeds = networkTelemetry?.edge_avg_speeds || {};
+  const n = allEdges.length;
+  const progress = vehiclePos?.progress ?? 0;
+  const curIdx = n > 0 ? Math.min(Math.floor(progress * n), n - 1) : 0;
+
+  const currentEdge = n > 0 ? { ...allEdges[curIdx], isCurrent: true } : null;
+
+  const allEdgeMap = {};
+  allEdges.forEach(e => { allEdgeMap[e.edge_id] = e; });
+  const completedEdges = edgeHistory.slice(-6).reverse().map((eid, i, arr) => {
+    const base = allEdgeMap[eid] || { edge_id: eid, street_name: edgeNames[eid] || '', load_ratio: 0, occupancy: 0, vehicle_count: null, distance_m: null, latency_ms: null, within_coverage: true };
+    // 이름 없으면 history 인접 엣지(allEdgeMap에 있는 것) 이름으로 보완
+    const name = base.street_name
+      || (allEdgeMap[arr[i - 1]]?.street_name)
+      || (allEdgeMap[arr[i + 1]]?.street_name)
+      || '';
+    return { ...base, street_name: name, isCurrent: false, speed_kmh: edgeAvgSpeeds[eid] ?? base.speed_kmh ?? null };
   });
+
+  const mergedEdges = [
+    ...(currentEdge ? [currentEdge] : []),
+    ...completedEdges,
+  ];
   const candidates = networkTelemetry?.candidate_nodes ?? [];
   const connName = networkTelemetry?.ego_vehicle?.connected_network_node_name
     ?? connNode?.name ?? null;
@@ -179,6 +232,7 @@ function NetworkTab({ networkTelemetry, routeEdges }) {
             right={
               <div className="row gap8">
                 {hasLiveEdges && <Chip tone="good" dot>LIVE</Chip>}
+                {n > 0 && <Chip>{curIdx + 1} / {n}</Chip>}
                 {routeEdges?.routing_mode && <Chip>{routeEdges.routing_mode}</Chip>}
               </div>
             }
@@ -187,7 +241,6 @@ function NetworkTab({ networkTelemetry, routeEdges }) {
               <table className="tbl">
                 <thead>
                   <tr>
-                    <th>엣지 ID<span className="en">Edge</span></th>
                     <th>도로명<span className="en">Road</span></th>
                     <th className="r">거리<span className="en">Dist</span></th>
                     <th className="r">{hasLiveEdges ? '속도' : '지연'}<span className="en">{hasLiveEdges ? 'Speed' : 'Lat'}</span></th>
@@ -199,21 +252,17 @@ function NetworkTab({ networkTelemetry, routeEdges }) {
                   {mergedEdges.map((e, i) => {
                     const tone = edgeCongTone(e.load_ratio || 0);
                     return (
-                      <tr key={e.edge_id || i}>
-                        <td>
-                          <span className="chip" style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>{e.edge_id}</span>
-                          {!e.within_coverage && (
-                            <span className="chip" style={{ marginLeft: 4, fontSize: 9, background: 'var(--warn-tint)', color: 'var(--warn)' }}>미커버</span>
-                          )}
-                        </td>
+                      <tr key={e.edge_id || i} style={e.isCurrent ? { background: 'var(--brand-tint)', fontWeight: 500 } : {}}>
                         <td>
                           {e.street_name
-                            ? <span style={{ fontSize: 12 }}>{e.street_name}</span>
-                            : <span className="muted" style={{ fontSize: 10.5 }}>—</span>}
+                            ? <><span style={{ fontSize: 12 }}>{e.street_name}</span>{e.isCurrent && <span className="chip" style={{ marginLeft: 6, fontSize: 9, background: 'var(--brand)', color: '#fff' }}>현재</span>}</>
+                            : <><span className="mono muted" style={{ fontSize: 10 }}>{e.edge_id}</span>{e.isCurrent && <span className="chip" style={{ marginLeft: 6, fontSize: 9, background: 'var(--brand)', color: '#fff' }}>현재</span>}</>}
+                          {!e.within_coverage && <span className="chip" style={{ marginLeft: 4, fontSize: 9, background: 'var(--warn-tint)', color: 'var(--warn)' }}>미커버</span>}
                         </td>
                         <td className="r">
-                          <span className="num">{(e.distance_m || 0).toFixed(0)}</span>
-                          <span className="muted" style={{ fontSize: 10 }}> m</span>
+                          {e.distance_m != null
+                            ? <><span className="num">{e.distance_m.toFixed(0)}</span><span className="muted" style={{ fontSize: 10 }}> m</span></>
+                            : <span className="muted">—</span>}
                         </td>
                         <td className="r">
                           {hasLiveEdges && e.speed_kmh !== null ? (
@@ -247,9 +296,9 @@ function NetworkTab({ networkTelemetry, routeEdges }) {
                   label: e.street_name || (e.edge_id || `e${i}`).slice(-8),
                   value: e.speed_kmh ?? 0,
                   display: e.speed_kmh !== null ? `${e.speed_kmh.toFixed(0)}` : '—',
-                  color: `var(--${edgeCongTone(e.load_ratio || 0)})`,
+                  color: e.isCurrent ? 'var(--brand)' : `var(--${edgeCongTone(e.load_ratio || 0)})`,
                 }))} max={60} />
-                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>km/h · 낮은 속도 = 혼잡</div>
+                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>km/h · 현재 구간 + 최근 완료 6구간</div>
               </>
             ) : (
               <>
@@ -257,9 +306,9 @@ function NetworkTab({ networkTelemetry, routeEdges }) {
                   label: e.street_name || (e.edge_id || `e${i}`).slice(-8),
                   value: (e.load_ratio || 0) * 100,
                   display: `${((e.load_ratio || 0) * 100).toFixed(0)}%`,
-                  color: `var(--${edgeCongTone(e.load_ratio || 0)})`,
+                  color: e.isCurrent ? 'var(--brand)' : `var(--${edgeCongTone(e.load_ratio || 0)})`,
                 }))} max={100} />
-                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>% · 높은 부하율 = 혼잡</div>
+                <div className="muted" style={{ fontSize: 10.5, marginTop: 14, fontFamily: 'var(--mono)' }}>% · 현재 구간 + 최근 완료 6구간</div>
               </>
             )}
           </Card>

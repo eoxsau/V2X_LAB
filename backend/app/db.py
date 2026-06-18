@@ -138,6 +138,8 @@ def ensure_postgis_schema() -> bool:
       updated_at TIMESTAMPTZ DEFAULT now()
     );
     ALTER TABLE network_nodes ADD COLUMN IF NOT EXISTS congestion_score DOUBLE PRECISION;
+    ALTER TABLE network_nodes ADD COLUMN IF NOT EXISTS antenna_height_m DOUBLE PRECISION;
+    ALTER TABLE network_nodes ADD COLUMN IF NOT EXISTS antenna_placement TEXT;
     ALTER TABLE network_nodes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
     ALTER TABLE network_nodes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
     CREATE INDEX IF NOT EXISTS idx_network_nodes_geom ON network_nodes USING GIST (geom);
@@ -467,7 +469,8 @@ def fetch_network_nodes(source: str | None = None) -> list[dict]:
     ensure_postgis_schema()
     sql = """
         SELECT id, name, node_type, lat, lng, capacity, load, congestion_score,
-               edge_latency_ms, coverage_radius_m, source
+               edge_latency_ms, coverage_radius_m, source,
+               antenna_height_m, antenna_placement
         FROM network_nodes
     """
     params: dict = {}
@@ -510,8 +513,9 @@ def insert_network_node(node: dict) -> dict | None:
             cur.execute(
                 """
                 INSERT INTO network_nodes
-                  (id, name, node_type, lat, lng, capacity, load, congestion_score, edge_latency_ms, coverage_radius_m, source, geom)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, ST_SetSRID(ST_MakePoint(%s,%s),4326))
+                  (id, name, node_type, lat, lng, capacity, load, congestion_score, edge_latency_ms,
+                   coverage_radius_m, source, antenna_height_m, antenna_placement, geom)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, ST_SetSRID(ST_MakePoint(%s,%s),4326))
                 """,
                 (
                     node["id"],
@@ -525,12 +529,43 @@ def insert_network_node(node: dict) -> dict | None:
                     float(node.get("edge_latency_ms", 5.0)),
                     float(node.get("coverage_radius_m", 500.0)),
                     node.get("source", "user_created"),
+                    float(node["antenna_height_m"]) if node.get("antenna_height_m") is not None else None,
+                    node.get("antenna_placement"),
                     float(node["lng"]),
                     float(node["lat"]),
                 ),
             )
         conn.commit()
     return node
+
+
+def update_network_node_placement(
+    node_id: str,
+    lat: float,
+    lng: float,
+    antenna_height_m: float,
+    antenna_placement: str,
+) -> bool:
+    """기지국의 좌표와 안테나 높이를 갱신한다."""
+    if not postgis_available():
+        return False
+    ensure_postgis_schema()
+    with get_psycopg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE network_nodes
+                SET lat = %s, lng = %s,
+                    antenna_height_m = %s, antenna_placement = %s,
+                    geom = ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (lat, lng, antenna_height_m, antenna_placement, lng, lat, node_id),
+            )
+            updated = cur.rowcount > 0
+        conn.commit()
+    return updated
 
 
 def delete_network_node(node_id: str) -> bool:

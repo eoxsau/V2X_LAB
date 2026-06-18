@@ -13,6 +13,8 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [revealed, setRevealed] = useState(0);
   const [exported, setExported] = useState(false);
+  const [llmResult, setLlmResult] = useState([]);
+  const [llmError, setLlmError] = useState(null);
 
   const hasLiveLogs = simLogs && simLogs.length > 0;
   const logs = hasLiveLogs ? [...simLogs].reverse() : DATA.logs;
@@ -22,12 +24,41 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
   const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
     ?? networkTelemetry?.latency_ms ?? null;
 
-  function runAI() {
-    setAnalyzing(true); setRevealed(0);
-    setTimeout(() => {
+  async function runAI() {
+    setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]);
+    try {
+      const payload = {
+        sim_elapsed: sim?.elapsed ?? 0,
+        vehicle_pos: vehiclePos ?? null,
+        edge_history: networkTelemetry?.edge_history ?? [],
+        edge_avg_speeds: networkTelemetry?.edge_avg_speeds ?? {},
+        route_edge_names: networkTelemetry?.route_edge_names ?? {},
+        sim_logs: simLogs ?? [],
+        algorithm: networkTelemetry?.routing_mode ?? null,
+        handover_count: (simLogs ?? []).filter(l => l.kind === 'handover').length,
+        latency_ms: networkTelemetry?.ego_vehicle?.current_latency_ms
+          ?? networkTelemetry?.latency_ms ?? null,
+        connected_node: networkTelemetry?.ego_vehicle?.connected_network_node_name
+          ?? networkTelemetry?.connected_node?.name ?? null,
+      };
+      const res = await fetch('http://127.0.0.1:8001/api/analysis/llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || res.statusText);
+      }
+      const data = await res.json();
+      const sections = data.sections || [];
+      setLlmResult(sections);
       setAnalyzing(false);
-      DATA.llmSummary.forEach((_, i) => setTimeout(() => setRevealed(i + 1), i * 450));
-    }, 1300);
+      sections.forEach((_, i) => setTimeout(() => setRevealed(i + 1), i * 450));
+    } catch (e) {
+      setAnalyzing(false);
+      setLlmError(e.message || 'AI 분석 중 오류가 발생했습니다.');
+    }
   }
 
   function exportCSV() {
@@ -117,7 +148,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
         </Card>
 
         {/* LLM panel */}
-        <Card title="AI 자연어 분석" en="LLM summary" right={<Chip tone="brand"><Icon.spark size={11} /> GPT</Chip>}>
+        <Card title="AI 자연어 분석" en="LLM summary" right={<Chip tone="brand"><Icon.spark size={11} /> Claude</Chip>}>
           {revealed === 0 && !analyzing && (
             <div style={{ textAlign: 'center', padding: '26px 16px' }}>
               <div style={{ width: 52, height: 52, borderRadius: 14, background: 'var(--brand-tint)', display: 'grid', placeItems: 'center', margin: '0 auto 14px', color: 'var(--brand-2)' }}><Icon.spark size={26} /></div>
@@ -125,24 +156,27 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
               <div className="muted" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.5 }}>
                 로그 {logs.length}건을 분석해<br />자연어 요약을 생성합니다
               </div>
+              {llmError && (
+                <div style={{ fontSize: 11.5, color: 'var(--bad)', marginBottom: 12, lineHeight: 1.5, textAlign: 'left', background: 'var(--bad-tint)', padding: '8px 10px', borderRadius: 8 }}>{llmError}</div>
+              )}
               <button className="btn primary" onClick={runAI}><Icon.spark size={15} /> AI 분석 시작</button>
             </div>
           )}
           {analyzing && (
             <div style={{ textAlign: 'center', padding: '34px 16px' }}>
               <div className="spin" style={{ width: 30, height: 30, border: '3px solid var(--brand-tint2)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 14px' }} />
-              <div className="muted" style={{ fontSize: 12 }}>로그 분석 중…</div>
+              <div className="muted" style={{ fontSize: 12 }}>Claude AI 분석 중…</div>
             </div>
           )}
           {revealed > 0 && (
             <div className="col gap12">
-              {DATA.llmSummary.slice(0, revealed).map((t, i) => (
-                <div key={i} className="fade row gap12" style={{ padding: '12px 13px', background: i === 1 ? 'var(--bad-tint)' : i === 2 ? 'var(--good-tint)' : 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
+              {llmResult.slice(0, revealed).map((t, i) => (
+                <div key={i} className="fade row gap12" style={{ padding: '12px 13px', background: i === 6 ? 'var(--bad-tint)' : i === 7 ? 'var(--good-tint)' : 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
                   <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flex: '0 0 auto', marginTop: 1 }}>{String(i + 1).padStart(2, '0')}</span>
                   <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
                 </div>
               ))}
-              {revealed === DATA.llmSummary.length && (
+              {revealed === llmResult.length && llmResult.length > 0 && (
                 <button className="btn sm" onClick={runAI} style={{ alignSelf: 'flex-start' }}><Icon.reset size={13} /> 다시 분석</button>
               )}
             </div>

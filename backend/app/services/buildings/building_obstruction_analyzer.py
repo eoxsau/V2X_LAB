@@ -7,6 +7,9 @@ from shapely.geometry import LineString
 
 from .building_schema import BuildingObstructionResult
 
+_DEFAULT_ANTENNA_HEIGHT_M = 25.0  # 높이 정보 없는 기지국 기본값
+_VEHICLE_HEIGHT_M = 1.5           # 차량 OBU 안테나 높이 (지상 기준)
+
 
 def _loss_from_intersections(count: int, max_height: float, crossed_length_m: float) -> tuple[float, str]:
     if count <= 0:
@@ -16,6 +19,29 @@ def _loss_from_intersections(count: int, max_height: float, crossed_length_m: fl
     if max_height >= 15 or crossed_length_m >= 20:
         return min(20.0, 8.0 + count * 2.0 + max_height * 0.12), "medium"
     return min(10.0, 4.0 + count * 1.5 + max_height * 0.06), "low"
+
+
+def _is_blocked_3d(
+    line_3857: LineString,
+    bldg_geom_3857,
+    bldg_height: float,
+    h_vehicle: float,
+    h_antenna: float,
+) -> bool:
+    """3D LOS 판단: 기지국-차량 빔이 건물 상단을 통과하지 못하면 True.
+
+    빔을 직선으로 모델링한다:
+      t=0 (차량 위치) → 높이 h_vehicle
+      t=1 (기지국 위치) → 높이 h_antenna
+
+    건물 중심의 t 값을 구해 해당 위치의 빔 높이와 건물 높이를 비교한다.
+    빔 높이 < 건물 높이이면 차단(True).
+    """
+    centroid = bldg_geom_3857.centroid
+    t = line_3857.project(centroid, normalized=True)
+    t = max(0.0, min(1.0, t))
+    h_beam = h_vehicle + t * (h_antenna - h_vehicle)
+    return h_beam < bldg_height
 
 
 def analyze_vehicle_to_node(
@@ -29,9 +55,10 @@ def analyze_vehicle_to_node(
 ) -> BuildingObstructionResult:
     line = LineString([(vehicle_lng, vehicle_lat), (network_node["lng"], network_node["lat"])])
     line_gdf = gpd.GeoDataFrame({"geometry": [line]}, crs="EPSG:4326").to_crs(3857)
+    line_3857 = line_gdf.geometry.iloc[0]
+    distance_m = float(line_gdf.length.iloc[0])
 
     if buildings_gdf.empty:
-        distance_m = float(line_gdf.length.iloc[0])
         return BuildingObstructionResult(
             vehicle_id=vehicle_id,
             network_node_id=network_node["id"],
@@ -45,23 +72,44 @@ def analyze_vehicle_to_node(
             highlighted_buildings=[],
         )
 
-    search = buildings_gdf[buildings_gdf.geometry.intersects(line)].copy()
-    search_3857 = search.to_crs(3857) if not search.empty else search
-    distance_m = float(line_gdf.length.iloc[0])
+    # 2D 경로와 교차하는 건물 후보
+    search = buildings_gdf[buildings_gdf.geometry.intersects(line)].copy().reset_index(drop=True)
+    search_3857 = search.to_crs(3857).copy().reset_index(drop=True) if not search.empty else search
+
+    h_antenna = float(network_node.get("antenna_height_m") or _DEFAULT_ANTENNA_HEIGHT_M)
+
+    # ── 3D LOS 필터 ────────────────────────────────────────────────────────────
+    # 높이 정보가 없는 건물은 보수적으로 차단 처리
+    is_blocking: list[bool] = []
+    for i in range(len(search_3857)):
+        bldg_h = float(search["height_m"].iloc[i] or 0.0) if "height_m" in search.columns else 0.0
+        if bldg_h <= 0:
+            is_blocking.append(True)
+        else:
+            blocked = _is_blocked_3d(
+                line_3857, search_3857.geometry.iloc[i], bldg_h,
+                _VEHICLE_HEIGHT_M, h_antenna,
+            )
+            is_blocking.append(blocked)
+
+    mask = [bool(v) for v in is_blocking]
+    search_bl    = search[mask].copy()
+    search_bl_3857 = search_3857[mask].copy()
+
+    count = int(len(search_bl))
+    max_height = float(search_bl["height_m"].fillna(0).max()) if count and "height_m" in search_bl.columns else 0.0
     crossed_length_m = 0.0
-    if not search_3857.empty:
-        crossed_length_m = float(search_3857.geometry.intersection(line_gdf.iloc[0].geometry).length.sum())
-    count = int(len(search))
-    max_height = float(search["height_m"].fillna(0).max()) if count else 0.0
+    if not search_bl_3857.empty:
+        crossed_length_m = float(
+            search_bl_3857.geometry.intersection(line_3857).length.sum()
+        )
+
     loss_db, confidence = _loss_from_intersections(count, max_height, crossed_length_m)
     latency_penalty_ms = round(loss_db * 0.45 + vehicle_density_penalty, 2)
     stability_score = round(max(0.0, exp(-(loss_db / 18.0)) - vehicle_density_penalty / 100.0), 3)
 
     highlighted_buildings = []
-    top = search.head(5)
-    # Use positional access via the GeoDataFrame's active geometry column rather than
-    # itertuples — when buildings come from PostGIS the geometry column is named "geom"
-    # (not "geometry"), so `row.geometry` raises AttributeError on the namedtuple.
+    top = search_bl.head(5)
     for pos in range(len(top)):
         row = top.iloc[pos]
         geom = top.geometry.iloc[pos]
@@ -136,5 +184,5 @@ def analyze_candidates(
             "node_score": node_score,
             "highlighted_buildings": obs.highlighted_buildings,
         })
-    results.sort(key=lambda item: (item["node_score"], item["predicted_latency_ms"]))
+    results.sort(key=lambda item: (item["predicted_latency_ms"], item["node_score"]))
     return results

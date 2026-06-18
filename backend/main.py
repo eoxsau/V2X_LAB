@@ -36,6 +36,7 @@ from app.db import (
     insert_network_node,
     max_user_station_number,
     postgis_available,
+    update_network_node_placement,
     upsert_network_nodes,
 )
 from app.services.standard_link.standard_link_preprocessor import preprocess_standard_links
@@ -95,6 +96,20 @@ except ImportError:
     LATENCY_AVAILABLE = False
 
 try:
+    from app.services.custom_policy.engine import (
+        parse_custom_policy,
+        validate_custom_policy,
+        run_custom_weighted_policy,
+        POLICY_KEYS as _CUSTOM_POLICY_KEYS,
+        COST_FEATURES as _CUSTOM_COST_FEATURES,
+        BS_FEATURES as _CUSTOM_BS_FEATURES,
+        RESOURCE_FEATURES as _CUSTOM_RESOURCE_FEATURES,
+    )
+    CUSTOM_POLICY_AVAILABLE = True
+except ImportError:
+    CUSTOM_POLICY_AVAILABLE = False
+
+try:
     from app.services.resources import (
         build_resource_demand_map,
         ALLOCATION_REGISTRY,
@@ -102,6 +117,7 @@ try:
         AllocationConfig,
         apply_allocation_to_network_nodes,
     )
+    from app.services.resources.demand_calculator import BSResourceDemand as _BSResourceDemand
     RESOURCE_DEMAND_AVAILABLE = True
 except ImportError:
     RESOURCE_DEMAND_AVAILABLE = False
@@ -214,6 +230,98 @@ DEFAULT_OVERPASS_URLS = [
 ]
 OSM_MAP_API_URL = "https://api.openstreetmap.org/api/0.6/map"
 
+VWORLD_API_KEY = os.getenv("VWORLD_API_KEY", "")
+_ROAD_NAME_CACHE_FILE = Path(__file__).parent.parent / "data" / "road_name_cache.json"
+_road_name_cache: dict[str, str] = {}
+
+
+def _load_road_name_cache() -> None:
+    global _road_name_cache
+    try:
+        if _ROAD_NAME_CACHE_FILE.exists():
+            _road_name_cache = json.loads(_ROAD_NAME_CACHE_FILE.read_text(encoding="utf-8"))
+            print(f"[VWORLD] Loaded {len(_road_name_cache)} cached road names", flush=True)
+    except Exception:
+        _road_name_cache = {}
+
+
+def _save_road_name_cache() -> None:
+    try:
+        _ROAD_NAME_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _ROAD_NAME_CACHE_FILE.write_text(
+            json.dumps(_road_name_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        print(f"[VWORLD] Cache save failed: {exc}", flush=True)
+
+
+_ROAD_NAME_RE = __import__("re").compile(r"[가-힣][가-힣0-9]*(?:대로|로|길)[0-9가-힣\-]*")
+
+
+def _vworld_road_name(lat: float, lng: float) -> str:
+    """Reverse-geocode a coordinate to a Korean road name via V-World API."""
+    if not VWORLD_API_KEY:
+        return ""
+    for qtype in ("road", "both"):
+        try:
+            url = (
+                "https://api.vworld.kr/req/address"
+                f"?service=address&request=getAddress&version=2.0"
+                f"&crs=epsg:4326&point={lng},{lat}"
+                f"&format=json&type={qtype}&key={VWORLD_API_KEY}"
+            )
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            for item in data.get("response", {}).get("result", []):
+                # Primary: level3 field
+                road = item.get("structure", {}).get("level3", "")
+                if road:
+                    return road
+                # Fallback: extract road name pattern from full text address
+                text = item.get("text", "")
+                m = _ROAD_NAME_RE.search(text)
+                if m:
+                    return m.group(0)
+        except Exception as exc:
+            print(f"[VWORLD] API error ({lat:.5f},{lng:.5f}): {exc}", flush=True)
+            break
+    return ""
+
+
+def _enrich_edge_names_vworld(
+    edge_midpoints: dict[str, tuple[float, float]],
+    existing: dict[str, str],
+) -> None:
+    """
+    Background: query V-World for edges still missing a road name,
+    update _state['route_edge_names'] and global cache in place.
+    edge_midpoints: {edge_id: (lat, lng)}
+    existing: the same dict object as _state['route_edge_names']
+    """
+    # Edges without a name: includes those never queried AND those previously cached as ""
+    missing = [eid for eid in edge_midpoints if not existing.get(eid) and not _road_name_cache.get(eid)]
+    if not missing:
+        # Apply any cached names not yet in existing
+        for eid in edge_midpoints:
+            if not existing.get(eid) and _road_name_cache.get(eid):
+                existing[eid] = _road_name_cache[eid]
+        return
+    print(f"[VWORLD] Fetching road names for {len(missing)} edges …", flush=True)
+    fetched = 0
+    for eid in missing:
+        lat, lng = edge_midpoints[eid]
+        name = _vworld_road_name(lat, lng)
+        if name:
+            _road_name_cache[eid] = name
+            existing[eid] = name
+            fetched += 1
+        time.sleep(0.05)  # ~20 req/s max
+    _save_road_name_cache()
+    print(f"[VWORLD] Road name enrichment done: {fetched}/{len(missing)} matched", flush=True)
+
+
+_load_road_name_cache()
+
 # Serve frontend static files
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 if FRONTEND_DIR.exists():
@@ -245,6 +353,8 @@ _state = {
     "route_cost_version": 0,
     "route_edge_names": {},
     "edge_telemetry": [],
+    "edge_avg_speeds": {},   # {edge_id: avg_speed_kmh} measured while vehicle traversed
+    "edge_history": [],      # completed edge_ids in traversal order
     "k_path_candidates": None,
     "algorithm_metrics": {},
     "simulation_summary": None,
@@ -254,6 +364,8 @@ _state = {
     "last_allocation_result": None,
     "simulation_config": None,   # Stage-1: persisted user config
     "policy_options": None,      # Stage-1: policy options from last applied config
+    "custom_policies": {},       # Stage-2: active custom policies keyed by policy_key
+    "custom_policy_debug": {},   # Stage-2: debug info from last registration
 }
 _ws_clients: list[WebSocket] = []
 _sim_thread: Optional[threading.Thread] = None
@@ -309,6 +421,8 @@ class SimulationConfigRequest(BaseModel):
 _VALID_ROUTE_ALGORITHMS = frozenset({
     "dijkstra", "astar", "k_shortest_path",
     "network_aware", "lookahead", "rl_routing",
+    # frontend aliases
+    "network_aware_routing", "look_ahead_routing",
 })
 
 def validate_simulation_config(raw: dict) -> SimulationConfigModel:
@@ -327,6 +441,9 @@ def validate_simulation_config(raw: dict) -> SimulationConfigModel:
                 raw_val = raw[key].get(fname, getattr(defaults, fname))
                 try:
                     cls.model_validate({fname: raw_val})
+                    # clamp float weight fields to a safe upper bound
+                    if key == "cost_weights" and isinstance(raw_val, (int, float)):
+                        raw_val = min(float(raw_val), 20.0)
                     field_data[fname] = raw_val
                 except Exception:
                     field_data[fname] = getattr(defaults, fname)
@@ -399,6 +516,13 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         except Exception:
             pass
     _state["allocation_algorithm"] = algo.resource_allocation_algorithm
+    if ROUTE_COST_AVAILABLE:
+        try:
+            from app.services.routing.route_cost_function import set_bs_selection_algorithm
+            set_bs_selection_algorithm(algo.base_station_selection_algorithm)
+        except Exception:
+            pass
+    _state["bs_selection_algorithm"] = algo.base_station_selection_algorithm
     pol = cfg.policy_options
     _state["policy_options"] = {
         "lookahead_k":          max(1, min(pol.lookahead_k, 10)),
@@ -670,6 +794,8 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "capacity": 120.0,
             "load": 42.0,
             "source": "synthetic",
+            "antenna_height_m": 25.0,   # 도심 건물 옥상 기준
+            "antenna_placement": "rooftop",
         },
         {
             "id": "RSU-01",
@@ -683,6 +809,8 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "capacity": 80.0,
             "load": 28.0,
             "source": "synthetic",
+            "antenna_height_m": 8.0,    # 도로변 폴대
+            "antenna_placement": "pole",
         },
         {
             "id": "EDGE-01",
@@ -696,6 +824,8 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "capacity": 150.0,
             "load": 18.0,
             "source": "synthetic",
+            "antenna_height_m": 15.0,   # 중간 높이 철탑
+            "antenna_placement": "pole",
         },
     ]
 
@@ -716,6 +846,8 @@ def db_node_to_candidate(row: dict) -> dict:
         "edge_latency_ms": float(row.get("edge_latency_ms") or 5.0),
         "coverage_radius_m": float(row.get("coverage_radius_m") or 500.0),
         "source": row.get("source", "user_created"),
+        "antenna_height_m": float(row["antenna_height_m"]) if row.get("antenna_height_m") is not None else None,
+        "antenna_placement": row.get("antenna_placement"),
     }
 
 
@@ -725,6 +857,35 @@ def merged_network_nodes() -> list[dict]:
     if user_nodes:
         return user_nodes
     return list(_state.get("synthetic_network_nodes") or [])
+
+
+def _get_ego_allocated_rb(connected_node: Optional[dict]) -> Optional[float]:
+    """
+    Return the RBs allocated to the EGO vehicle's connected BS from the last
+    allocation result, or None if allocation data is not available.
+    """
+    if not connected_node:
+        return None
+    alloc = _state.get("last_allocation_result")
+    if not alloc:
+        return None
+    bs_id = str(connected_node.get("id") or connected_node.get("name") or "")
+    for a in alloc.get("base_station_allocations", []):
+        if str(a.get("bs_id", "")) == bs_id:
+            demand = float(a.get("demand_rb", 0.0))
+            bg_load = 0.0
+            for node in (_state.get("network_nodes") or []):
+                if str(node.get("id") or node.get("name") or "") == bs_id:
+                    bg_load = float(node.get("load", 0.0))
+                    break
+            # EGO vehicle's share = total demand − background load
+            ego_demand = max(0.0, demand - bg_load)
+            allocated = float(a.get("allocated_rb", 0.0))
+            # Apportion EGO's share by demand fraction
+            if demand > 0:
+                return round(allocated * (ego_demand / demand), 2)
+            return round(min(5.0, allocated), 2)  # default: 5 RB minimum
+    return None
 
 
 def update_network_telemetry(vehicle_pos: dict | None) -> None:
@@ -771,6 +932,8 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
                 "source": node.get("source", "synthetic"),
                 "congestion_score": node.get("congestion_score", node.get("congestion_penalty", 0.0)),
                 "load": node.get("load", 0.0),
+                "antenna_height_m": node.get("antenna_height_m"),
+                "antenna_placement": node.get("antenna_placement"),
             }
             for node in nodes
         ],
@@ -818,6 +981,12 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         ],
         "highlighted_buildings": best["highlighted_buildings"],
         "edge_stats": list(_state.get("edge_telemetry", [])),
+        "route_edge_names": _state.get("route_edge_names", {}),
+        "edge_avg_speeds": dict(_state.get("edge_avg_speeds", {})),
+        "edge_history": list(_state.get("edge_history", [])),
+        "custom_policy_debug": dict(_state.get("custom_policy_debug") or {}),
+        "routing_mode": (_state.get("route_cost_result") or {}).get("routing_mode", ""),
+        "ego_allocated_rb": _get_ego_allocated_rb(selected_node),
     }
     _state["building_debug"]["sample_links"] = [
         {
@@ -830,6 +999,32 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         }
         for item in candidates[:3]
     ]
+
+
+def load_osm_way_names(osm_file: Path) -> dict[str, str]:
+    """Parse OSM XML and return {way_id_str: road_name} for named highway ways."""
+    import re as _re
+    way_names: dict[str, str] = {}
+    try:
+        tree = ET.parse(osm_file)
+        root = tree.getroot()
+        for way in root.findall("way"):
+            tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+            if "highway" not in tags:
+                continue
+            name = tags.get("name:ko") or tags.get("name") or ""
+            if name:
+                way_names[way.get("id", "")] = name
+    except Exception as exc:
+        print(f"[OSM] Failed to load way names: {exc}", flush=True)
+    return way_names
+
+
+def sumo_edge_to_way_id(edge_id: str) -> str:
+    """Extract OSM way ID from a SUMO edge ID (e.g. '-123456789#2' → '123456789')."""
+    import re as _re
+    m = _re.match(r"^-?(\d+)(?:#\d+)?$", edge_id.strip())
+    return m.group(1) if m else ""
 
 
 def load_mock_graph(osm_file: Path) -> dict:
@@ -967,6 +1162,52 @@ def shortest_mock_path(graph: dict, start_id: str, end_id: str) -> list[str]:
         raise RuntimeError("OSM fallback graph에서 경로를 찾을 수 없습니다. bbox를 더 작게 선택해주세요.")
 
     path = []
+    cur: str | None = end_id
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+    return path
+
+
+def astar_mock_path(graph: dict, start_id: str, end_id: str) -> list[str]:
+    """
+    A* search on mock OSM graph using Haversine heuristic.
+    h(n) = straight-line distance from n to goal (admissible: never overestimates road distance).
+    """
+    end_nd = graph["nodes"].get(end_id)
+    if end_nd is None:
+        raise RuntimeError("A*: 도착 노드를 찾을 수 없습니다.")
+    end_lat, end_lng = end_nd["lat"], end_nd["lng"]
+
+    def h(node_id: str) -> float:
+        nd = graph["nodes"].get(node_id, {})
+        return haversine_m(nd.get("lat", 0.0), nd.get("lng", 0.0), end_lat, end_lng)
+
+    # (f=g+h, g, node_id)
+    open_set: list[tuple[float, float, str]] = [(h(start_id), 0.0, start_id)]
+    g_score: dict[str, float] = {start_id: 0.0}
+    prev: dict[str, str | None] = {start_id: None}
+    seen: set[str] = set()
+
+    while open_set:
+        _, g, current = heappop(open_set)
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == end_id:
+            break
+        for neighbor, weight in graph["adjacency"].get(current, []):
+            ng = g + weight
+            if ng < g_score.get(neighbor, float("inf")):
+                g_score[neighbor] = ng
+                prev[neighbor] = current
+                heappush(open_set, (ng + h(neighbor), ng, neighbor))
+
+    if end_id not in prev:
+        raise RuntimeError("A*: 경로를 찾을 수 없습니다. bbox를 더 작게 선택해주세요.")
+
+    path: list[str] = []
     cur: str | None = end_id
     while cur is not None:
         path.append(cur)
@@ -1147,6 +1388,34 @@ def _run_resource_allocation(
             lookahead_results=la_result,
             route_candidates=simple_candidates,
         )
+
+        # Merge background load: each BS's current load represents background
+        # traffic that is independent of the EGO vehicle.  Without this step,
+        # demand_rb ≈ 0 (single-vehicle) and every allocation algorithm sees
+        # an empty network, producing identical meaningless results.
+        _DEFAULT_RB = 100.0
+        bs_load_map = {
+            str(bs.get("id") or bs.get("name") or ""): (
+                float(bs.get("load", 0.0)),
+                float(bs.get("capacity") or _DEFAULT_RB),
+            )
+            for bs in bs_nodes
+        }
+        for bs_id, d in demand_map.items():
+            bg_load, cap = bs_load_map.get(bs_id, (0.0, 100.0))
+            if bg_load > 0:
+                combined = d.estimated_resource_demand + bg_load
+                demand_map[bs_id] = _BSResourceDemand(
+                    base_station_id=d.base_station_id,
+                    nearby_vehicle_count=d.nearby_vehicle_count,
+                    expected_connected_vehicle_count=d.expected_connected_vehicle_count,
+                    nearby_traffic_density=d.nearby_traffic_density,
+                    average_speed=d.average_speed,
+                    estimated_resource_demand=round(combined, 4),
+                    capacity=cap,
+                    demand_capacity_ratio=round(min(combined / max(cap, 1.0), 9.99), 4),
+                )
+
         alloc_inp = AllocationInput(
             base_stations=bs_nodes,
             vehicles=vehicles,
@@ -1734,6 +2003,8 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
     speed_mps = 9.0
     travelled = 0.0
     step = 0
+    _mock_spd_acc: dict[str, list] = {}
+    _mock_prev_cur = -1
 
     while not stop_evt.is_set():
         travelled = min(total_dist, travelled + speed_mps * 0.2)
@@ -1766,21 +2037,36 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
         _rc = _state.get("route_cost_result")
         if _rc:
             _pe = _rc.get("per_edge", [])
-            if _pe:
-                _n = len(_pe)
-                _cur = min(int(_progress * _n), _n - 1)
-                _estats = []
-                for _i, _e in enumerate(_pe):
-                    _d = abs(_i - _cur)
-                    _occ = round(max(0.0, 1.0 - _d * 0.4), 3)
-                    _spd = round(max(5.0, 32.4 * (1.0 - _occ * 0.7)), 1)
-                    _estats.append({
-                        "edge_id": _e["edge_id"],
-                        "speed_kmh": _spd,
-                        "occupancy": _occ,
-                        "vehicle_count": 1 if _d == 0 else 0,
-                    })
-                _state["edge_telemetry"] = _estats
+        else:
+            # Fallback: build edge list directly from route path (no cost module needed)
+            _path_nodes = _state.get("route_edges", [])
+            _pe = [{"edge_id": f"{_a}_{_b}"} for _a, _b in zip(_path_nodes, _path_nodes[1:])] if len(_path_nodes) >= 2 else []
+        if _pe:
+            _n = len(_pe)
+            _cur = min(int(_progress * _n), _n - 1)
+            _estats = []
+            for _i, _e in enumerate(_pe):
+                _d = abs(_i - _cur)
+                _occ = round(max(0.0, 1.0 - _d * 0.4), 3)
+                _spd = round(max(5.0, 32.4 * (1.0 - _occ * 0.7)), 1)
+                _estats.append({
+                    "edge_id": _e["edge_id"],
+                    "speed_kmh": _spd,
+                    "occupancy": _occ,
+                    "vehicle_count": 1 if _d == 0 else 0,
+                })
+            _state["edge_telemetry"] = _estats
+            if 0 <= _cur < len(_pe):
+                _mock_eid = _pe[_cur]["edge_id"]
+                _mock_spd_acc.setdefault(_mock_eid, []).append(round(speed_mps * 3.6, 1))
+                if _cur != _mock_prev_cur and _mock_prev_cur >= 0 and _mock_prev_cur < len(_pe):
+                    _prev_mock_eid = _pe[_mock_prev_cur]["edge_id"]
+                    _samples = _mock_spd_acc.get(_prev_mock_eid, [])
+                    if _samples:
+                        _state["edge_avg_speeds"][_prev_mock_eid] = round(sum(_samples) / len(_samples), 1)
+                    if _prev_mock_eid not in _state["edge_history"]:
+                        _state["edge_history"].append(_prev_mock_eid)
+                _mock_prev_cur = _cur
         update_network_telemetry(_state["vehicle_pos"])
 
         if travelled >= total_dist:
@@ -1921,22 +2207,26 @@ def netconvert(osm_file: Path, net_file: Path):
 
 def nearest_edge(net, lat: float, lng: float) -> str:
     """Find the nearest drivable edge to a geo coordinate."""
-    # sumolib.net works in projected XY (metres), NOT lat/lon degrees
+    return nearest_edge_candidates(net, lat, lng, k=1)[0]
+
+
+def nearest_edge_candidates(net, lat: float, lng: float, k: int = 8) -> list[str]:
+    """Return up to k nearest drivable edge IDs ordered by distance from the point."""
     x, y = net.convertLonLat2XY(lng, lat)
-    edges = net.getNeighboringEdges(x, y, r=300, includeJunctions=False)
+    edges: list = []
+    for radius in (300, 800, 1500, 3000):
+        edges = net.getNeighboringEdges(x, y, r=radius, includeJunctions=False)
+        if edges:
+            break
     if not edges:
-        edges = net.getNeighboringEdges(x, y, r=800, includeJunctions=False)
-    if not edges:
-        raise RuntimeError(f"주변 300m 내 도로를 찾을 수 없습니다 (lat={lat:.5f}, lng={lng:.5f}). 도로 위를 클릭해주세요.")
-    drivable = [e for e, _ in edges if e.allows("passenger")]
+        raise RuntimeError(
+            f"주변 도로를 찾을 수 없습니다 (lat={lat:.5f}, lng={lng:.5f}). 도로 위를 클릭해주세요."
+        )
+    drivable = [(e, d) for e, d in edges if e.allows("passenger")]
     if not drivable:
-        drivable = [e for e, _ in edges]
-    # pick closest by XY distance
-    best = min(drivable, key=lambda e: min(
-        ((e.getFromNode().getCoord()[0] - x)**2 + (e.getFromNode().getCoord()[1] - y)**2)**0.5,
-        ((e.getToNode().getCoord()[0]   - x)**2 + (e.getToNode().getCoord()[1]   - y)**2)**0.5,
-    ))
-    return best.getID()
+        drivable = list(edges)
+    drivable.sort(key=lambda ed: ed[1])
+    return [e.getID() for e, _ in drivable[:k]]
 
 
 def edge_coords_geo(net, edge_id: str) -> list[list[float]]:
@@ -1987,9 +2277,9 @@ def simulation_thread(
     try:
         # Load network with sumolib for edge lookup + route coords
         net = sumolib.net.readNet(net_file, withInternal=False)
-        from_edge = nearest_edge(net, origin["lat"], origin["lng"])
-        to_edge   = nearest_edge(net, dest["lat"],   dest["lng"])
-        print(f"[SIM] from_edge={from_edge}  to_edge={to_edge}", flush=True)
+        from_candidates = nearest_edge_candidates(net, origin["lat"], origin["lng"], k=8)
+        to_candidates   = nearest_edge_candidates(net, dest["lat"],   dest["lng"],   k=8)
+        print(f"[SIM] from_candidates={from_candidates[:3]}…  to_candidates={to_candidates[:3]}…", flush=True)
 
         # Close any stale TraCI connection before starting a fresh one
         try:
@@ -2028,10 +2318,28 @@ def simulation_thread(
             except Exception:
                 pass
 
-        # Dijkstra route (vType="" = default, avoids missing-type errors)
-        result = traci.simulation.findRoute(from_edge, to_edge, vType="")
-        if not result.edges:
-            raise RuntimeError(f"다익스트라 경로를 찾을 수 없습니다: {from_edge} → {to_edge}")
+        # Try candidate edge pairs until findRoute succeeds
+        result = None
+        from_edge, to_edge = from_candidates[0], to_candidates[0]
+        for _fc in from_candidates:
+            for _tc in to_candidates:
+                if _fc == _tc:
+                    continue
+                _r = traci.simulation.findRoute(_fc, _tc, vType="")
+                if _r.edges:
+                    result = _r
+                    from_edge, to_edge = _fc, _tc
+                    break
+            if result and result.edges:
+                break
+
+        print(f"[SIM] from_edge={from_edge}  to_edge={to_edge}", flush=True)
+        if not result or not result.edges:
+            tried = len(from_candidates) * len(to_candidates)
+            raise RuntimeError(
+                f"SUMO 경로 탐색 실패: 주변 엣지 {tried}개 조합을 모두 시도했으나 연결 가능한 경로가 없습니다. "
+                f"출발지/목적지를 더 큰 도로 위로 이동해 주세요."
+            )
 
         dijkstra_edges = list(result.edges)
         edges = dijkstra_edges
@@ -2078,16 +2386,37 @@ def simulation_thread(
 
         _state["route_edges"] = edges
 
-        # Collect street names from TraCI (must be done in this thread — TraCI is not thread-safe)
+        # Collect street names: TraCI → OSM way_id fallback (must run in SUMO thread)
+        _osm_way_names = load_osm_way_names(Path(_state["osm_file"])) if _state.get("osm_file") else {}
         _edge_names: dict[str, str] = {}
+        _sumo_edge_midpoints: dict[str, tuple[float, float]] = {}
         for _eid in edges:
+            # TraCI name
             try:
                 _name = traci.edge.getStreetName(_eid)
-                if _name:
-                    _edge_names[_eid] = _name
+            except Exception:
+                _name = ""
+            # OSM way_id fallback
+            if not _name:
+                _name = _osm_way_names.get(sumo_edge_to_way_id(_eid), "")
+            if _name:
+                _edge_names[_eid] = _name
+            # Collect midpoint for V-World enrichment
+            try:
+                _shape = net.getEdge(_eid).getShape()
+                _mx, _my = _shape[len(_shape) // 2]
+                _mlon, _mlat = net.convertXY2LonLat(_mx, _my)
+                _sumo_edge_midpoints[_eid] = (_mlat, _mlon)
             except Exception:
                 pass
         _state["route_edge_names"] = _edge_names
+        # V-World enrichment for edges still missing names (background)
+        if VWORLD_API_KEY:
+            threading.Thread(
+                target=_enrich_edge_names_vworld,
+                args=(_sumo_edge_midpoints, _state["route_edge_names"]),
+                daemon=True,
+            ).start()
 
         # Build route polyline — TraCI lane shape is most reliable
         route_coords = []
@@ -2175,6 +2504,8 @@ def simulation_thread(
         step = 0
         arrived = False
         max_steps = 100_000  # safety limit
+        _spd_acc: dict[str, list] = {}   # edge_id -> [speed_kmh, ...]
+        _prev_ridx = -1
 
         while not stop_evt.is_set() and not arrived and step < max_steps:
             traci.simulationStep()
@@ -2198,14 +2529,29 @@ def simulation_thread(
             route_idx = traci.vehicle.getRouteIndex("veh0")
             progress = max(0.0, min(1.0, (route_idx + 1) / max(len(edges), 1)))
 
+            _spd_kmh = round(speed * 3.6, 1)
             _state["vehicle_pos"] = {
                 "lat": lat,
                 "lng": lon,
-                "speed": round(speed * 3.6, 1),  # m/s → km/h
+                "speed": _spd_kmh,
                 "progress": round(progress, 3),
                 "step": step,
                 "arrived": False,
             }
+
+            # Track per-edge average speed (actual vehicle speed while traversing)
+            if 0 <= route_idx < len(edges):
+                _cur_eid = edges[route_idx]
+                _spd_acc.setdefault(_cur_eid, []).append(_spd_kmh)
+                if route_idx != _prev_ridx and _prev_ridx >= 0 and _prev_ridx < len(edges):
+                    _prev_eid = edges[_prev_ridx]
+                    _samples = _spd_acc.get(_prev_eid, [])
+                    if _samples:
+                        _state["edge_avg_speeds"][_prev_eid] = round(sum(_samples) / len(_samples), 1)
+                    if _prev_eid not in _state["edge_history"]:
+                        _state["edge_history"].append(_prev_eid)
+                _prev_ridx = route_idx
+
             # Collect per-edge stats from TraCI
             _route_eids = _state.get("route_edges", [])
             if _route_eids:
@@ -2281,6 +2627,8 @@ def reset_simulation_state() -> None:
     _state["route_cost_version"] = 0
     _state["route_edge_names"] = {}
     _state["edge_telemetry"] = []
+    _state["edge_avg_speeds"] = {}
+    _state["edge_history"] = []
     _state["k_path_candidates"] = None
     _state["algorithm_metrics"] = {}
     _state["simulation_summary"] = None
@@ -2306,6 +2654,8 @@ def _store_simulation_summary() -> None:
         summary_dict = summary.to_dict()
         summary_dict["used_config"] = _state.get("simulation_config") or SimulationConfigModel().model_dump()
         summary_dict["policy_options"] = _state.get("policy_options")
+        summary_dict["custom_policies"] = dict(_state.get("custom_policies") or {})
+        summary_dict["custom_policy_debug"] = dict(_state.get("custom_policy_debug") or {})
         _state["simulation_summary"] = summary_dict
     except Exception as _exc:
         print(f"[SUMMARY] build failed: {_exc}", flush=True)
@@ -2517,15 +2867,34 @@ async def start_simulation(req: SimStartRequest):
     _raw_cfg = req.simulation_config or _state.get("simulation_config")
     _sim_cfg = merge_with_default_config(_raw_cfg)
     _apply_simulation_config(_sim_cfg)
-    # algorithm_config (UI dropdown selections) takes final priority over config
-    if req.algorithm_config.get("latency_algorithm") and LATENCY_AVAILABLE:
+    # algorithm_config uses frontend key names (latency, resource_allocation) and
+    # backend key names (latency_algorithm, allocation_algorithm) — accept both.
+    _lat_alg = (
+        req.algorithm_config.get("latency_algorithm")
+        or req.algorithm_config.get("latency")
+    )
+    _alloc_alg_cfg = (
+        req.algorithm_config.get("allocation_algorithm")
+        or req.algorithm_config.get("resource_allocation")
+    )
+    if _lat_alg and LATENCY_AVAILABLE:
         try:
-            LATENCY_REGISTRY.set_algorithm(req.algorithm_config["latency_algorithm"])
-            _state["latency_algorithm"] = req.algorithm_config["latency_algorithm"]
+            LATENCY_REGISTRY.set_algorithm(_lat_alg)
+            _state["latency_algorithm"] = _lat_alg
         except Exception:
             pass
-    if req.algorithm_config.get("allocation_algorithm"):
-        _state["allocation_algorithm"] = req.algorithm_config["allocation_algorithm"]
+    if _alloc_alg_cfg:
+        _state["allocation_algorithm"] = _alloc_alg_cfg
+    _bs_alg_cfg = req.algorithm_config.get("base_station_selection")
+    if _bs_alg_cfg and ROUTE_COST_AVAILABLE:
+        try:
+            from app.services.routing.route_cost_function import set_bs_selection_algorithm
+            set_bs_selection_algorithm(_bs_alg_cfg)
+            _state["bs_selection_algorithm"] = _bs_alg_cfg
+        except Exception:
+            pass
+
+    _route_algo = req.algorithm_config.get("route", "dijkstra")
 
     use_sumo, sumo_error = can_run_sumo()
     if use_sumo and _state["net_file"]:
@@ -2542,7 +2911,10 @@ async def start_simulation(req: SimStartRequest):
         try:
             start_node = nearest_mock_node(_state["mock_graph"], req.origin["lat"], req.origin["lng"])
             end_node = nearest_mock_node(_state["mock_graph"], req.dest["lat"], req.dest["lng"])
-            path = shortest_mock_path(_state["mock_graph"], start_node, end_node)
+            if _route_algo == "astar":
+                path = astar_mock_path(_state["mock_graph"], start_node, end_node)
+            else:
+                path = shortest_mock_path(_state["mock_graph"], start_node, end_node)
             route_coords = mock_route_coords(_state["mock_graph"], path)
         except RuntimeError as exc:
             _state["sim_running"] = False
@@ -2567,6 +2939,7 @@ async def start_simulation(req: SimStartRequest):
         if RESOURCE_DEMAND_AVAILABLE and _state.get("network_nodes"):
             _alloc_algo = (
                 req.algorithm_config.get("allocation_algorithm")
+                or req.algorithm_config.get("resource_allocation")
                 or _state.get("allocation_algorithm")
                 or "traffic_aware_allocation"
             )
@@ -2606,11 +2979,28 @@ async def start_simulation(req: SimStartRequest):
 
         # Collect street names from OSM way_names stored in mock graph
         _mock_way_names = _state["mock_graph"].get("way_names", {})
+        _mock_graph_nodes = _state["mock_graph"].get("nodes", {})
         _mock_edge_names: dict[str, str] = {}
+        _mock_edge_midpoints: dict[str, tuple[float, float]] = {}
         for _a, _b in zip(path, path[1:]):
             _eid = f"{_a}_{_b}"
             _mock_edge_names[_eid] = _mock_way_names.get((_a, _b)) or _mock_way_names.get((_b, _a)) or ""
+            # Collect midpoint for V-World enrichment
+            _na = _mock_graph_nodes.get(_a)
+            _nb = _mock_graph_nodes.get(_b)
+            if _na and _nb:
+                _mock_edge_midpoints[_eid] = (
+                    (_na["lat"] + _nb["lat"]) / 2,
+                    (_na["lng"] + _nb["lng"]) / 2,
+                )
         _state["route_edge_names"] = _mock_edge_names
+        # V-World enrichment for edges still missing names (background)
+        if VWORLD_API_KEY:
+            threading.Thread(
+                target=_enrich_edge_names_vworld,
+                args=(_mock_edge_midpoints, _state["route_edge_names"]),
+                daemon=True,
+            ).start()
 
         _state["route_buildings"], _state["building_debug"] = load_route_buildings(
             route_coords, _state.get("network_nodes")
@@ -3281,6 +3671,8 @@ def _network_node_response(row: dict) -> dict:
         "edge_latency_ms": row.get("edge_latency_ms"),
         "coverage_radius_m": row.get("coverage_radius_m"),
         "source": row.get("source"),
+        "antenna_height_m": row.get("antenna_height_m"),
+        "antenna_placement": row.get("antenna_placement"),
     }
 
 
@@ -3299,19 +3691,25 @@ async def create_network_node(req: NetworkNodeCreateRequest):
     if not postgis_available():
         raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 기지국을 저장할 수 없습니다.")
 
+    # 클릭 위치 근처 건물을 탐색해 설치 위치(좌표 이동 포함)와 안테나 높이 결정
+    from app.services.buildings.bs_placement import resolve_placement
+    placement = resolve_placement(req.lat, req.lng, BUILDING_REPOSITORY, search_radius_m=100.0)
+
     name = f"기지국 {max_user_station_number() + 1}"
     node = {
         "id": f"user-bs-{uuid4().hex[:10]}",
         "name": name,
         "node_type": req.node_type,
-        "lat": req.lat,
-        "lng": req.lng,
+        "lat": placement.lat,
+        "lng": placement.lng,
         "capacity": 100.0,
         "load": 0.0,
         "congestion_score": 0.0,
         "edge_latency_ms": 5.0,
         "coverage_radius_m": 500.0,
         "source": "user_created",
+        "antenna_height_m": placement.antenna_height_m,
+        "antenna_placement": placement.placement_type,
     }
     saved = insert_network_node(node)
     if saved is None:
@@ -3334,6 +3732,45 @@ async def reset_user_created_nodes():
     deleted = delete_user_created_network_nodes()
     _refresh_active_network_nodes()
     return {"ok": True, "deleted": deleted}
+
+
+@app.post("/network-nodes/reapply-placement")
+async def reapply_placement_to_existing_nodes():
+    """기존 user_created 기지국 전체에 건물 탐색 재배치를 적용한다.
+
+    생성 당시 건물 데이터가 없었거나 fix 이전에 만들어진 노드의
+    좌표와 안테나 높이를 현재 로직으로 재계산한다.
+    """
+    from app.services.buildings.bs_placement import resolve_placement
+    rows = fetch_network_nodes(source="user_created")
+    updated, skipped = 0, 0
+    results = []
+    for row in rows:
+        orig_lat = float(row["lat"])
+        orig_lng = float(row["lng"])
+        p = resolve_placement(orig_lat, orig_lng, BUILDING_REPOSITORY, search_radius_m=100.0)
+        ok = update_network_node_placement(
+            node_id=row["id"],
+            lat=p.lat,
+            lng=p.lng,
+            antenna_height_m=p.antenna_height_m,
+            antenna_placement=p.placement_type,
+        )
+        if ok:
+            updated += 1
+            results.append({
+                "id": row["id"],
+                "name": row.get("name"),
+                "placement_type": p.placement_type,
+                "antenna_height_m": p.antenna_height_m,
+                "moved": (p.lat != orig_lat or p.lng != orig_lng),
+                "lat": p.lat,
+                "lng": p.lng,
+            })
+        else:
+            skipped += 1
+    _refresh_active_network_nodes()
+    return {"ok": True, "updated": updated, "skipped": skipped, "nodes": results}
 
 
 @app.post("/traffic/sync-its")
@@ -3386,6 +3823,448 @@ def debug_building_obstruction():
         "sample_links": [],
         "warnings": [],
     }
+
+
+# ── Stage-2: Custom Policy Engine ────────────────────────────────────────────
+
+class CustomPoliciesRequest(BaseModel):
+    policies: dict  # {policy_key: policy_dict}
+
+
+def _build_custom_latency_fn(policy: dict):
+    """Return a LatencyInput→LatencyOutput function driven by a custom_bs_selection_policy."""
+    _p = policy
+
+    def _fn(inp):
+        from app.services.latency.registry import LatencyOutput
+        cap = max(inp.base_station.capacity, 1.0)
+        cov_r = max(inp.base_station.coverage_radius_m, 1.0)
+        features = {
+            "distance":         min(inp.dist_m / cov_r, 1.0),
+            "latency":          min(inp.base_station.edge_latency_ms / 20.0, 1.0),
+            "load":             min(inp.base_station.load / cap, 1.0),
+            "resource_deficit": min(
+                getattr(inp.resource_state, "resource_deficit", 0.0), 1.0
+            ),
+            "future_risk": (
+                1.0 if inp.dist_m >= cov_r
+                else round(inp.dist_m / cov_r, 4)
+            ),
+        }
+        score = run_custom_weighted_policy(_p, features)
+        # Physics-based component decomposition (each component from its own feature)
+        prop_ms  = round(4.0 + features["distance"] * 10.0, 4)   # free-space propagation: 4–14 ms
+        queue_ms = round(features["load"] * 30.0, 4)              # queueing delay: 0–30 ms
+        res_ms   = round(features["resource_deficit"] * 15.0, 4)  # resource contention: 0–15 ms
+        tx_ms    = round(features["latency"] * 5.0, 4)            # transmission component: 0–5 ms
+        mec_ms   = 2.0                                             # fixed MEC processing
+        latency_ms = min(round(prop_ms + queue_ms + res_ms + tx_ms + mec_ms, 4), 150.0)
+        return LatencyOutput(
+            latency=latency_ms,
+            propagation_delay=prop_ms,
+            transmission_delay=tx_ms,
+            queueing_delay=queue_ms,
+            mec_processing_delay=mec_ms,
+            handover_delay=0.0,
+            blockage_delay=0.0,
+            algorithm_id="custom_bs_selection",
+            debug_info={
+                "score": round(score, 4),
+                "features": {k: round(v, 4) for k, v in features.items()},
+            },
+        )
+
+    return _fn
+
+
+def _build_custom_resource_fn(policy: dict):
+    """Return an AllocationInput→AllocationOutput function driven by a custom_resource_policy."""
+    _p = policy
+
+    def _fn(inp):
+        from app.services.resources.allocation_registry import (
+            AllocationOutput, BSAllocation,
+        )
+        bs_allocs: list = []
+        deficit_map: dict = {}
+        load_after: dict = {}
+        latency_impact: dict = {}
+
+        for bs in inp.base_stations:
+            bs_id = str(bs.get("id") or bs.get("name") or "")
+            cap = max(float(bs.get("capacity") or inp.config.total_rb_per_bs), 1.0)
+            load_ratio = float(bs.get("load", bs.get("current_load", 0.0)))
+
+            demand_rb = load_ratio * cap
+            if inp.resource_demand_map and bs_id in inp.resource_demand_map:
+                dm = inp.resource_demand_map[bs_id]
+                if isinstance(dm, dict):
+                    demand_rb = float(dm.get("demand_rb", demand_rb))
+                elif hasattr(dm, "demand_rb"):
+                    demand_rb = float(dm.demand_rb)
+
+            cov_r = max(float(bs.get("coverage_radius_m", 400.0)), 1.0)
+            dist_m = float(bs.get("dist_m", cov_r * 0.5))
+            features = {
+                "demand":   min(demand_rb / cap, 1.0),
+                "load":     min(load_ratio, 1.0),
+                # demand urgency: how critically over-loaded this BS is relative to 80% target
+                "priority": min(demand_rb / max(cap * 0.8, 1.0), 1.0),
+                # normalized distance of vehicles served by this BS
+                "distance": min(dist_m / cov_r, 1.0),
+            }
+            score = run_custom_weighted_policy(_p, features)
+            util_target = max(0.0, 1.0 - min(score, 1.0))
+            allocated_rb = cap * util_target
+            deficit = max(0.0, demand_rb - allocated_rb)
+            updated_load = min(allocated_rb / cap, 1.0)
+            # 20ms per full RB deficit (realistic queueing overhead per resource unit)
+            lat_delta = (deficit / cap) * 20.0
+
+            bs_allocs.append(BSAllocation(
+                bs_id=bs_id,
+                total_capacity_rb=round(cap, 2),
+                allocated_rb=round(allocated_rb, 2),
+                utilization_ratio=round(util_target, 4),
+                updated_load=round(updated_load, 4),
+                demand_rb=round(demand_rb, 2),
+                deficit_rb=round(deficit, 2),
+            ))
+            if deficit > 0:
+                deficit_map[bs_id] = round(deficit, 2)
+            load_after[bs_id] = round(updated_load, 4)
+            latency_impact[bs_id] = round(lat_delta, 2)
+
+        total_cap = sum(a.total_capacity_rb for a in bs_allocs)
+        total_alloc = sum(a.allocated_rb for a in bs_allocs)
+        avg_util = total_alloc / total_cap if total_cap > 0 else 0.0
+
+        return AllocationOutput(
+            algorithm_id="custom_resource_allocation",
+            allocation_result={
+                "total_capacity_rb": round(total_cap, 2),
+                "total_allocated_rb": round(total_alloc, 2),
+                "avg_utilization": round(avg_util, 4),
+                "overloaded_bs_count": sum(1 for a in bs_allocs if a.deficit_rb > 0),
+            },
+            base_station_allocations=bs_allocs,
+            vehicle_allocations=[],
+            resource_deficit_by_bs=deficit_map,
+            expected_latency_impact=latency_impact,
+            bs_load_after_allocation=load_after,
+            debug_info={"policy": "custom_resource_allocation", "bs_count": len(bs_allocs)},
+        )
+
+    return _fn
+
+
+def _register_custom_cost_weights(policy: dict) -> dict:
+    """Apply custom_cost_policy weights as scaled CostWeights and return debug info."""
+    if not ROUTE_COST_AVAILABLE or not CUSTOM_POLICY_AVAILABLE:
+        return {}
+    global _route_cost_weights
+    w = policy.get("weights", {})
+    # User inputs fractions (e.g. 0.15+0.40+…=1.0); scale so their sum matches the
+    # default CostWeights magnitude (12.5), preserving relative proportions exactly.
+    _DEFAULTS_SUM = 12.5
+    raw = {k: max(0.0, float(v)) for k, v in w.items()}
+    scale = _DEFAULTS_SUM / max(sum(raw.values()), 1e-9)
+    def _sw(key, default):
+        return raw[key] * scale if key in raw else default
+    _route_cost_weights = CostWeights(
+        w_distance=      _sw("distance",    1.0),
+        w_time=          _sw("time",        2.0),
+        w_latency=       _sw("latency",     3.0),
+        w_load=          _sw("load",        1.5),
+        w_handover=      _sw("handover",    1.0),
+        w_blockage=      _sw("blockage",    1.5),
+        w_coverage_risk= _sw("future_risk", 2.5),
+        w_resource_deficit=_route_cost_weights.w_resource_deficit,
+    )
+    return {
+        k: round(getattr(_route_cost_weights, k), 4)
+        for k in (
+            "w_distance", "w_time", "w_latency", "w_load",
+            "w_handover", "w_blockage", "w_coverage_risk",
+        )
+    }
+
+
+def _apply_custom_policy_set(policies: dict) -> None:
+    """Validate, register, and persist a set of custom policies."""
+    existing = dict(_state.get("custom_policies") or {})
+    debug = dict(_state.get("custom_policy_debug") or {})
+
+    for key, policy in policies.items():
+        existing[key] = policy
+        if key == "custom_cost_policy":
+            applied_weights = _register_custom_cost_weights(policy)
+            debug[key] = {"status": "applied", "applied_cost_weights": applied_weights}
+
+        elif key == "custom_bs_selection_policy":
+            if not LATENCY_AVAILABLE:
+                debug[key] = {"status": "unavailable", "reason": "Latency service not loaded"}
+            else:
+                try:
+                    fn = _build_custom_latency_fn(policy)
+                    LATENCY_REGISTRY.register(
+                        "custom_bs_selection", fn,
+                        description="User-defined weighted-sum BS selection policy (Stage 2)",
+                    )
+                    LATENCY_REGISTRY.set_algorithm("custom_bs_selection")
+                    _state["latency_algorithm"] = "custom_bs_selection"
+                    debug[key] = {"status": "applied", "algorithm": "custom_bs_selection"}
+                except Exception as exc:
+                    debug[key] = {"status": "error", "error": str(exc)}
+
+        elif key == "custom_resource_policy":
+            if not RESOURCE_DEMAND_AVAILABLE:
+                debug[key] = {"status": "unavailable", "reason": "Resource demand service not loaded"}
+            else:
+                try:
+                    fn = _build_custom_resource_fn(policy)
+                    ALLOCATION_REGISTRY.register(
+                        "custom_resource_allocation", fn,
+                        description="User-defined weighted-sum resource allocation policy (Stage 2)",
+                    )
+                    ALLOCATION_REGISTRY.set_algorithm("custom_resource_allocation")
+                    _state["allocation_algorithm"] = "custom_resource_allocation"
+                    debug[key] = {"status": "applied", "algorithm": "custom_resource_allocation"}
+                except Exception as exc:
+                    debug[key] = {"status": "error", "error": str(exc)}
+
+    _state["custom_policies"] = existing
+    _state["custom_policy_debug"] = debug
+
+
+def _revert_custom_policy(policy_key: str) -> None:
+    """Revert a removed policy to the Stage-1 / default algorithm."""
+    defaults = SimConfigAlgorithmSelection()
+    if policy_key == "custom_bs_selection_policy" and LATENCY_AVAILABLE:
+        try:
+            LATENCY_REGISTRY.set_algorithm(defaults.latency_algorithm)
+            _state["latency_algorithm"] = defaults.latency_algorithm
+        except Exception:
+            pass
+    elif policy_key == "custom_resource_policy" and RESOURCE_DEMAND_AVAILABLE:
+        try:
+            ALLOCATION_REGISTRY.set_algorithm(defaults.resource_allocation_algorithm)
+            _state["allocation_algorithm"] = defaults.resource_allocation_algorithm
+        except Exception:
+            pass
+
+
+@app.post("/api/simulation/custom-policy")
+def set_custom_policies(req: CustomPoliciesRequest):
+    """Validate, register, and persist custom scoring policies (Stage 2)."""
+    if not CUSTOM_POLICY_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Custom policy engine 사용 불가")
+
+    validation_errors: dict[str, list[str]] = {}
+    valid_policies: dict[str, dict] = {}
+
+    for key, raw in req.policies.items():
+        if key not in _CUSTOM_POLICY_KEYS:
+            validation_errors[key] = [f"알 수 없는 policy key: '{key}'"]
+            continue
+        try:
+            policy = parse_custom_policy(raw) if isinstance(raw, str) else dict(raw)
+        except (ValueError, TypeError) as exc:
+            validation_errors[key] = [str(exc)]
+            continue
+        ok, errs = validate_custom_policy(key, policy)
+        if not ok:
+            validation_errors[key] = errs
+        else:
+            valid_policies[key] = policy
+
+    if valid_policies:
+        _apply_custom_policy_set(valid_policies)
+
+    return {
+        "ok": bool(valid_policies),
+        "applied": list(valid_policies.keys()),
+        "errors": validation_errors,
+        "active_custom_policies": {
+            k: {"type": v.get("type"), "weights": v.get("weights")}
+            for k, v in (_state.get("custom_policies") or {}).items()
+        },
+        "debug": _state.get("custom_policy_debug") or {},
+    }
+
+
+@app.get("/api/simulation/custom-policy")
+def get_custom_policies():
+    """Return active custom policies and available feature sets (Stage 2)."""
+    active = _state.get("custom_policies") or {}
+    return {
+        "active_custom_policies": {
+            k: {"type": v.get("type"), "weights": v.get("weights"),
+                "constraints": v.get("constraints", {})}
+            for k, v in active.items()
+        },
+        "custom_policy_debug": _state.get("custom_policy_debug") or {},
+        "available_features": {
+            "custom_cost_policy":         sorted(_CUSTOM_COST_FEATURES),
+            "custom_bs_selection_policy": sorted(_CUSTOM_BS_FEATURES),
+            "custom_resource_policy":     sorted(_CUSTOM_RESOURCE_FEATURES),
+        } if CUSTOM_POLICY_AVAILABLE else {},
+    }
+
+
+@app.delete("/api/simulation/custom-policy/{policy_key}")
+def remove_custom_policy(policy_key: str):
+    """Remove a single custom policy and revert to its default algorithm (Stage 2)."""
+    if CUSTOM_POLICY_AVAILABLE and policy_key not in _CUSTOM_POLICY_KEYS:
+        raise HTTPException(status_code=400, detail=f"알 수 없는 policy key: '{policy_key}'")
+    policies = dict(_state.get("custom_policies") or {})
+    removed = policy_key in policies
+    policies.pop(policy_key, None)
+    debug = dict(_state.get("custom_policy_debug") or {})
+    debug.pop(policy_key, None)
+    _state["custom_policies"] = policies
+    _state["custom_policy_debug"] = debug
+    if removed:
+        _revert_custom_policy(policy_key)
+    return {"ok": True, "removed": removed, "remaining": list(policies.keys())}
+
+
+class LLMAnalysisRequest(BaseModel):
+    sim_elapsed: float = 0
+    vehicle_pos: Optional[dict] = None
+    edge_history: list = []
+    edge_avg_speeds: dict = {}
+    route_edge_names: dict = {}
+    sim_logs: list = []
+    algorithm: Optional[str] = None
+    handover_count: int = 0
+    latency_ms: Optional[float] = None
+    connected_node: Optional[str] = None
+
+
+@app.post("/api/analysis/llm")
+def run_llm_analysis(req: LLMAnalysisRequest):
+    bedrock_key = os.environ.get("BEDROCK_API_KEY", "")
+    if not bedrock_key:
+        raise HTTPException(status_code=503, detail="BEDROCK_API_KEY가 설정되지 않았습니다.")
+
+    elapsed_min = req.sim_elapsed / 60 if req.sim_elapsed > 0 else 0
+    arrived = req.vehicle_pos.get("arrived", False) if req.vehicle_pos else False
+    progress_pct = (req.vehicle_pos.get("progress", 0) * 100) if req.vehicle_pos else 0
+    current_speed = req.vehicle_pos.get("speed", 0) if req.vehicle_pos else 0
+
+    speeds = list(req.edge_avg_speeds.values())
+    avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else 0
+    max_speed = round(max(speeds), 1) if speeds else 0
+    min_speed = round(min(speeds), 1) if speeds else 0
+
+    sorted_edges = sorted(req.edge_avg_speeds.items(), key=lambda x: x[1])
+    slowest = [(req.route_edge_names.get(e, e), round(v, 1)) for e, v in sorted_edges[:3]] if sorted_edges else []
+    fastest = [(req.route_edge_names.get(e, e), round(v, 1)) for e, v in sorted_edges[-3:]] if sorted_edges else []
+
+    log_kinds: dict = {}
+    for lg in req.sim_logs:
+        kind = lg.get("kind", "info")
+        log_kinds[kind] = log_kinds.get(kind, 0) + 1
+
+    warn_logs = [lg.get("ko", "") for lg in req.sim_logs if lg.get("kind") in ("warn", "risk")]
+    handover_freq = round(req.handover_count / elapsed_min, 2) if elapsed_min > 0 else 0
+    lat = req.latency_ms
+    lat_quality = (
+        "우수 (20ms 미만)" if lat is not None and lat < 20
+        else "양호 (50ms 미만)" if lat is not None and lat < 50
+        else "보통 (100ms 미만)" if lat is not None and lat < 100
+        else "불량 (100ms 이상)" if lat is not None
+        else "측정값 없음"
+    )
+
+    slowest_str = ", ".join(f"{n}: {v}km/h" for n, v in slowest) or "데이터 없음"
+    fastest_str = ", ".join(f"{n}: {v}km/h" for n, v in fastest) or "데이터 없음"
+    warn_str = "; ".join(warn_logs[:5]) if warn_logs else "없음"
+
+    prompt = f"""당신은 V2X(Vehicle-to-Everything) 자율주행 네트워크 시뮬레이션 전문 분석가입니다.
+아래 시뮬레이션 실측 데이터를 바탕으로 8개 항목의 정밀 분석 리포트를 작성하세요.
+
+=== 시뮬레이션 실측 데이터 ===
+- 경과 시간: {elapsed_min:.1f}분 ({req.sim_elapsed:.0f}초)
+- 완료 여부: {"완료 (도착)" if arrived else f"진행 중 ({progress_pct:.1f}% 완료)"}
+- 현재 속도: {current_speed:.1f} km/h
+- 라우팅 알고리즘: {req.algorithm or "기본(다익스트라)"}
+- 연결 기지국: {req.connected_node or "미연결"}
+- 현재 지연 시간: {f"{lat:.1f}ms — {lat_quality}" if lat is not None else "측정값 없음"}
+- 핸드오버 횟수: {req.handover_count}회 (분당 {handover_freq}회)
+- 통과 완료 엣지 수: {len(req.edge_history)}개
+- 이벤트 로그 수: {len(req.sim_logs)}건 (종류별: {json.dumps(log_kinds, ensure_ascii=False)})
+
+속도 실측 통계 (km/h):
+- 평균 {avg_speed} / 최고 {max_speed} / 최저 {min_speed}
+- 가장 느린 구간: {slowest_str}
+- 가장 빠른 구간: {fastest_str}
+
+경고·위험 이벤트: {warn_str}
+
+=== 분석 요구사항 ===
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 출력하지 마세요.
+각 section은 한 문단(2~4문장)으로, 실측 수치를 반드시 포함해 구체적으로 작성하세요.
+
+{{
+  "sections": [
+    "[01 시뮬레이션 개요] 경로 완료 여부, 총 소요 시간, 통과 구간 수, 전체 수행 평가를 요약하세요.",
+    "[02 경로·속도 성능] 평균·최고·최저 속도 분석, 실측 기반 이동 효율을 평가하세요.",
+    "[03 혼잡 구간 분석] 속도 저하 최하위 구간을 구체적으로 짚고 혼잡 원인을 진단하세요.",
+    "[04 핸드오버 품질] 핸드오버 횟수·빈도 평가, V2X 연결 안정성 수준을 판단하세요.",
+    "[05 지연 시간 분석] latency 수치 기반 실시간 통신 품질, 자율주행 적합성을 평가하세요.",
+    "[06 알고리즘 성능] 사용된 라우팅 알고리즘의 효율·최적화 수준을 평가하세요.",
+    "[07 위험 요소·이슈] 경고·위험 이벤트 내용을 구체적으로 진단하고 영향을 서술하세요.",
+    "[08 개선 권고사항] 데이터 근거 기반으로 실행 가능한 최적화 방안 3가지를 제시하세요."
+  ]
+}}"""
+
+    bedrock_url = (
+        "https://bedrock-runtime.us-east-1.amazonaws.com"
+        "/model/us.anthropic.claude-sonnet-4-6/converse"
+    )
+    payload = {
+        "messages": [{"role": "user", "content": [{"text": prompt}]}],
+        "inferenceConfig": {"maxTokens": 4096, "temperature": 0.3},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {bedrock_key}",
+    }
+
+    try:
+        resp = requests.post(bedrock_url, json=payload, headers=headers, timeout=90)
+        resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Bedrock API 응답 시간 초과 (90초)")
+    except requests.exceptions.RequestException as exc:
+        detail = str(exc)
+        if hasattr(exc, "response") and exc.response is not None:
+            detail = f"HTTP {exc.response.status_code}: {exc.response.text[:300]}"
+        raise HTTPException(status_code=502, detail=f"Bedrock API 오류: {detail}")
+
+    raw = resp.json()
+    try:
+        text = raw["output"]["message"]["content"][0]["text"]
+    except (KeyError, IndexError) as exc:
+        raise HTTPException(status_code=502, detail=f"Bedrock 응답 파싱 실패: {exc} — {str(raw)[:200]}")
+
+    # Parse the JSON sections the model was asked to return
+    sections: list = []
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            parsed = json.loads(text[start:end])
+            sections = parsed.get("sections", [])
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    if not sections:
+        sections = [line.strip() for line in text.splitlines() if line.strip()]
+
+    return {"sections": sections}
 
 
 @app.websocket("/ws")

@@ -296,16 +296,30 @@ def latency_minimizing_allocation(inp: AllocationInput) -> AllocationOutput:
         marginal_benefit = load_ratio * cfg.load_penalty_scale / max(cap, 1.0)
         entries.append((bid, cap, demand, load_ratio, marginal_benefit))
 
-    # Allocate demand first (baseline), then record benefit order
+    # Greedy allocation: total budget = min(total_demand, total_capacity)
+    # Distribute budget to BSes ordered by marginal_benefit (highest load → highest priority).
+    # This maximises latency reduction per RB allocated.
+    total_demand = sum(e[2] for e in entries)
+    total_sys_cap = sum(e[1] for e in entries)
+    budget = min(total_demand, total_sys_cap)
+
+    sorted_by_benefit = sorted(entries, key=lambda x: x[4], reverse=True)
+    allocated_map: dict[str, float] = {}
+    remaining = budget
+    for bid, cap, demand, _lr, _mb in sorted_by_benefit:
+        alloc = min(demand, cap, max(remaining, 0.0))
+        allocated_map[bid] = alloc
+        remaining = max(remaining - alloc, 0.0)
+
     bs_allocs: list[BSAllocation] = []
     for bid, cap, demand, _lr, _mb in entries:
-        allocated = min(demand, cap)  # satisfy demand up to capacity
-        bs_allocs.append(_make_bs_alloc(bid, cap, allocated, demand))
+        bs_allocs.append(_make_bs_alloc(bid, cap, allocated_map.get(bid, 0.0), demand))
 
     return _build_output("latency_minimizing_allocation", bs_allocs, inp, {
+        "budget_rb": round(budget, 4),
         "marginal_benefit_order": [
             {"bs_id": e[0], "marginal_benefit": round(e[4], 6), "load_ratio": round(e[3], 4)}
-            for e in sorted(entries, key=lambda x: x[4], reverse=True)
+            for e in sorted_by_benefit
         ],
     })
 
@@ -430,4 +444,16 @@ ALLOCATION_REGISTRY.register(
     "lookahead_resource_allocation",
     lookahead_resource_allocation,
     description="미래 연결 예측(look-ahead)을 반영한 사전 자원 예약",
+)
+# Frontend alias: 'proportional_allocation' → proportional_demand_allocation
+ALLOCATION_REGISTRY.register(
+    "proportional_allocation",
+    proportional_demand_allocation,
+    description="수요 비례 배분 (proportional_demand_allocation 별칭)",
+)
+# Frontend alias: 'custom_allocation_algorithm' → traffic_aware (graceful fallback)
+ALLOCATION_REGISTRY.register(
+    "custom_allocation_algorithm",
+    traffic_aware_allocation,
+    description="사용자 지정 알고리즘 플레이스홀더 (traffic_aware_allocation 폴백)",
 )
