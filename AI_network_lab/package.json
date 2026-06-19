@@ -1,0 +1,19 @@
+{
+  "name": "ai-network-lab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Base platform for an AI Network Digital Twin Lab.",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "build:web": "pnpm --filter web build",
+    "lint:web": "pnpm --filter web lint",
+    "db:generate": "pnpm --filter @ai-network-lab/db generate",
+    "db:migrate": "pnpm --filter @ai-network-lab/db migrate",
+    "db:studio": "pnpm --filter @ai-network-lab/db studio"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}
