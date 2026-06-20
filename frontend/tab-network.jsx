@@ -14,6 +14,21 @@ function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
   const hasLive = !!networkTelemetry;
   const connNode = networkTelemetry?.connected_node ?? null;
 
+  // 자원배분 — 재계산 없는 읽기 전용 엔드포인트를 3초 간격으로 폴링
+  const [alloc, setAlloc] = useState(null);
+  useEffect(() => {
+    let dead = false;
+    function poll() {
+      fetch('http://127.0.0.1:8001/api/resources/allocation-result')
+        .then(r => r.json())
+        .then(data => { if (!dead) setAlloc(data); })
+        .catch(() => {});
+    }
+    poll();
+    const t = setInterval(poll, 3000);
+    return () => { dead = true; clearInterval(t); };
+  }, []);
+
   const edgeStats = networkTelemetry?.edge_stats || [];
   const perEdge   = routeEdges?.per_edge || [];
   const perEdgeMap = {};
@@ -95,11 +110,9 @@ function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
   const buildings = networkTelemetry?.intersected_building_count ?? null;
   const congestion = connNode?.congestion_score ?? null;
 
-  const totalVeh = DATA.baseStations.reduce((a, b) => a + b.vehicles, 0);
-  const statCount = hasLive ? (candidates.length || '—') : '3';
-  const statConnected = hasLive ? (connName ?? '없음') : '3개';
-  const statLatency = latency !== null ? latency.toFixed(1) : '4.7';
-  const statCong = congestion !== null ? (congestion * 100).toFixed(1) : '29.9';
+  const statCount = hasLive ? (candidates.length || '—') : '—';
+  const statLatency = latency !== null ? latency.toFixed(1) : '—';
+  const statCong = congestion !== null ? (congestion * 100).toFixed(1) : '—';
 
   return (
     <div className="page-pad fade">
@@ -113,10 +126,10 @@ function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
       </div>
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 18 }}>
-        <Stat label="활성 기지국" icon="antenna" value={statCount} unit={hasLive ? '' : '개'} sub={hasLive ? '후보 노드 수' : '1개 혼잡'} />
-        <Stat label={hasLive ? '연결 기지국' : '연결 차량 합계'} icon={hasLive ? 'antenna' : 'car'} value={hasLive ? (connName ?? '없음') : totalVeh} unit={hasLive ? '' : '대'} sub={hasLive ? `거리 ${distanceM !== null ? distanceM.toFixed(0) + 'm' : '—'}` : '용량 1,500대 중'} />
-        <Stat label={hasLive ? '혼잡도' : '평균 점유율 ρ'} icon="net" value={statCong} unit="%" sub={hasLive ? (connName ?? '연결 기지국') : 'BS-02 최대 62.4%'} accent />
-        <Stat label={hasLive ? '현재 Latency' : '평균 큐 지연'} icon="latency" value={statLatency} unit="ms" sub={hasLive ? (latency !== null && latency > 20 ? '위험 수준' : '정상 범위') : 'L_queue'} />
+        <Stat label="활성 기지국" icon="antenna" value={statCount} unit="" sub={hasLive ? '후보 노드 수' : '—'} />
+        <Stat label="연결 기지국" icon="antenna" value={hasLive ? (connNode?.name ?? connName ?? '없음') : '—'} unit="" sub={hasLive ? `거리 ${distanceM !== null ? distanceM.toFixed(0) + 'm' : '—'}` : '—'} />
+        <Stat label="혼잡도" icon="net" value={statCong} unit={congestion !== null ? '%' : ''} sub={hasLive ? (connName ?? '연결 기지국') : '—'} accent />
+        <Stat label="Latency" icon="latency" value={statLatency} unit={latency !== null ? 'ms' : ''} sub={hasLive ? (latency !== null && latency > 20 ? '위험 수준' : '정상 범위') : '—'} />
       </div>
 
       {hasLive && connName && (
@@ -189,7 +202,7 @@ function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
           </div>
         </Card>
       ) : (
-        <Card title="기지국 상태" en="Base stations" right={<Chip tone="bad" dot>BS-02 혼잡</Chip>} style={{ padding: 0, marginBottom: 18 }}>
+        <Card title="기지국 상태" en="Base stations" style={{ padding: 0, marginBottom: 18 }}>
           <div className="tbl-wrap">
             <table className="tbl">
               <thead>
@@ -200,29 +213,32 @@ function NetworkTab({ networkTelemetry, routeEdges, vehiclePos }) {
                 </tr>
               </thead>
               <tbody>
-                {DATA.baseStations.map(b => {
-                  const tone = b.rho > 50 ? 'bad' : b.rho > 25 ? 'warn' : 'good';
-                  return (
-                    <tr key={b.id}>
-                      <td><span className="mono" style={{ fontWeight: 600 }}>{b.id}</span></td>
-                      <td><span className="num muted">{b.lat.toFixed(4)}, {b.lng.toFixed(4)}</span></td>
-                      <td className="r"><span className="num">{b.height}</span> <span className="muted" style={{ fontSize: 10 }}>m</span></td>
-                      <td className="r"><span className="num" style={{ fontWeight: 600 }}>{b.vehicles}</span></td>
-                      <td className="r"><span className="num muted">{b.capacity}</span></td>
-                      <td>
-                        <div className="row gap8" style={{ minWidth: 130 }}>
-                          <div className="pbar" style={{ flex: 1 }}><i style={{ width: b.rho + '%', background: `var(--${tone})` }} /></div>
-                          <span className="num" style={{ fontSize: 11.5, fontWeight: 600, color: `var(--${tone})`, width: 42, textAlign: 'right' }}>{b.rho}%</span>
-                        </div>
-                      </td>
-                      <td className="r"><span className="num">{b.lqueue.toFixed(1)}</span></td>
-                      <td><Chip tone={statusTone[b.status]} dot>{statusKo[b.status]}</Chip></td>
-                    </tr>
-                  );
-                })}
               </tbody>
             </table>
           </div>
+        </Card>
+      )}
+
+      {alloc?.available && (
+        <Card title="자원배분 현황" en="Resource allocation" right={<Chip tone="brand">{alloc.algorithm_id}</Chip>} style={{ marginBottom: 18 }}>
+          {Object.keys(alloc.bs_load_after_allocation || {}).length === 0 ? (
+            <div className="muted" style={{ padding: 8, fontSize: 12 }}>할당 결과가 없습니다.</div>
+          ) : (
+            <BarChart
+              items={Object.entries(alloc.bs_load_after_allocation).map(([bsId, load]) => {
+                const deficit = alloc.resource_deficit_by_bs?.[bsId] ?? 0;
+                const tone = load >= 0.8 ? 'bad' : load >= 0.5 ? 'warn' : 'good';
+                return {
+                  label: bsId,
+                  value: load * 100,
+                  display: `${(load * 100).toFixed(0)}%${deficit > 0 ? ` (-${deficit.toFixed(1)})` : ''}`,
+                  color: `var(--${tone})`,
+                };
+              })}
+              max={100}
+            />
+          )}
+          <div className="muted" style={{ fontSize: 10.5, marginTop: 10, fontFamily: 'var(--mono)' }}>BS별 할당 후 부하율(%) · 괄호는 RB 부족분</div>
         </Card>
       )}
 

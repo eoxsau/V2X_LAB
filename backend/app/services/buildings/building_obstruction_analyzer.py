@@ -1,24 +1,117 @@
 from __future__ import annotations
 
-from math import exp
+from math import exp, log10
 
 import geopandas as gpd
 from shapely.geometry import LineString
 
 from .building_schema import BuildingObstructionResult
+from .building_height_estimator import material_category_from_strctcd, _classify
 
 _DEFAULT_ANTENNA_HEIGHT_M = 25.0  # 높이 정보 없는 기지국 기본값
 _VEHICLE_HEIGHT_M = 1.5           # 차량 OBU 안테나 높이 (지상 기준)
 
+# ── Material wall-crossing attenuation (dB per effective wall) ─────────────────
+_MATERIAL_WALL_LOSS: dict[str, float] = {
+    "rc":             15.0,   # 철근콘크리트
+    "steel":           8.0,   # 철골구조
+    "brick":          12.0,   # 조적조/벽돌
+    "wood":            6.0,   # 목구조
+    "light_concrete":  9.0,   # ALC/경량콘크리트
+    "unknown":        10.0,   # 재질 미상
+}
 
-def _loss_from_intersections(count: int, max_height: float, crossed_length_m: float) -> tuple[float, str]:
-    if count <= 0:
-        return 0.0, "high"
-    if max_height >= 40 or crossed_length_m >= 80:
-        return min(30.0, 12.0 + count * 3.0 + max_height * 0.2), "medium"
-    if max_height >= 15 or crossed_length_m >= 20:
-        return min(20.0, 8.0 + count * 2.0 + max_height * 0.12), "medium"
-    return min(10.0, 4.0 + count * 1.5 + max_height * 0.06), "low"
+# ── Average effective wall spacing by building use type (m) ───────────────────
+_WALL_SPACING_BY_USE: dict[str, float] = {
+    "detached_house":   5.0,
+    "multi_unit_house": 6.0,
+    "apartment":        8.0,
+    "commercial":       7.0,
+    "office":          10.0,
+    "factory":         15.0,
+    "warehouse":       20.0,
+    "school":           8.0,
+    "public":           8.0,
+    "hospital":        10.0,
+    "industrial":      15.0,
+    "unknown":          8.0,
+}
+
+# ── Technology parameters for the L_total latency model ───────────────────────
+# alpha calibrated so RSRP transitions at realistic urban coverage distances:
+#   4G: retransmissions begin ~400m, 5G ~500m, 6G ~700m
+_TECH_PARAMS: dict[str, dict] = {
+    # alpha calibrated so retransmissions begin at realistic distances:
+    #   4G ~240m  (urban macro, 300-400m coverage radius)
+    #   5G ~450m  (urban NR, 450m coverage radius)
+    #   6G ~1000m (future, extended coverage)
+    "4G": dict(L_base=10.0, P_tx=43.0, alpha=45.0, beta=3.5, RSRP_thresh=-85.0,  RSRP_range=25.0, N_max=6, T_retx=8.0,  C_tech=100),
+    "5G": dict(L_base= 1.0, P_tx=46.0, alpha=55.0, beta=3.0, RSRP_thresh=-90.0,  RSRP_range=25.0, N_max=4, T_retx=1.0,  C_tech=500),
+    "6G": dict(L_base= 0.1, P_tx=48.0, alpha=68.0, beta=2.5, RSRP_thresh=-95.0,  RSRP_range=25.0, N_max=3, T_retx=0.1,  C_tech=2000),
+}
+
+
+def _material_a_seg_db(
+    buildings_bl: "gpd.GeoDataFrame",
+    buildings_bl_3857: "gpd.GeoDataFrame",
+    line_3857: LineString,
+) -> tuple[float, str, float]:
+    """Compute A_seg (total building penetration loss dB) from material + geometry.
+
+    Returns (A_seg_db, confidence, total_crossed_length_m).
+    """
+    if buildings_bl.empty:
+        return 0.0, "high", 0.0
+
+    per_bldg_crossed = buildings_bl_3857.geometry.intersection(line_3857).length
+    total_crossed = float(per_bldg_crossed.sum())
+
+    has_known_material = False
+    A_seg_db = 0.0
+    for i in range(len(buildings_bl)):
+        row = buildings_bl.iloc[i]
+        material = material_category_from_strctcd(row.get("strctCdNm"))
+        if material != "unknown":
+            has_known_material = True
+        use_type = _classify(
+            usability_code=row.get("USABILITY") or row.get("usability_code"),
+            purps_name=row.get("mainPurpsCdNm"),
+        )
+        wall_spacing = _WALL_SPACING_BY_USE.get(use_type, 8.0)
+        crossed = float(per_bldg_crossed.iloc[i])
+        n_walls = max(1, round(crossed / wall_spacing))
+        A_seg_db += n_walls * _MATERIAL_WALL_LOSS.get(material, 10.0)
+
+    confidence = "medium" if has_known_material else "low"
+    return round(A_seg_db, 2), confidence, round(total_crossed, 2)
+
+
+def _L_total(
+    distance_m: float,
+    A_seg_db: float,
+    n_vehicles: int,
+    network_mode: str,
+) -> float:
+    """Compute L_total = L_base + L_signal + L_queue (ms).
+
+    L_signal uses the Log-Distance RSRP model + HARQ retransmission mapping.
+    L_queue uses the M/M/1 model with rho = n_vehicles / C_tech.
+    """
+    p = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])
+    L_base = p["L_base"]
+
+    # Log-Distance Path Loss RSRP model
+    RSRP = p["P_tx"] - p["alpha"] - 10.0 * p["beta"] * log10(max(distance_m, 1.0)) - A_seg_db
+
+    # HARQ retransmission latency
+    N_retx = p["N_max"] * max(0.0, min(1.0, (p["RSRP_thresh"] - RSRP) / p["RSRP_range"]))
+    L_signal = N_retx * p["T_retx"]
+
+    # M/M/1 queuing latency
+    rho = min(n_vehicles / p["C_tech"], 0.99)
+    L_queue = L_base * rho / (1.0 - rho)
+
+    return round(L_base + L_signal + L_queue, 3)
 
 
 def _is_blocked_3d(
@@ -28,15 +121,7 @@ def _is_blocked_3d(
     h_vehicle: float,
     h_antenna: float,
 ) -> bool:
-    """3D LOS 판단: 기지국-차량 빔이 건물 상단을 통과하지 못하면 True.
-
-    빔을 직선으로 모델링한다:
-      t=0 (차량 위치) → 높이 h_vehicle
-      t=1 (기지국 위치) → 높이 h_antenna
-
-    건물 중심의 t 값을 구해 해당 위치의 빔 높이와 건물 높이를 비교한다.
-    빔 높이 < 건물 높이이면 차단(True).
-    """
+    """3D LOS 판단: 기지국-차량 빔이 건물 상단을 통과하지 못하면 True."""
     centroid = bldg_geom_3857.centroid
     t = line_3857.project(centroid, normalized=True)
     t = max(0.0, min(1.0, t))
@@ -66,7 +151,7 @@ def analyze_vehicle_to_node(
             intersected_building_count=0,
             max_building_height_m=0.0,
             estimated_penetration_loss_db=0.0,
-            latency_penalty_ms=vehicle_density_penalty,
+            latency_penalty_ms=round(vehicle_density_penalty, 2),
             stability_score=max(0.0, 1.0 - vehicle_density_penalty / 50.0),
             confidence="high",
             highlighted_buildings=[],
@@ -79,7 +164,6 @@ def analyze_vehicle_to_node(
     h_antenna = float(network_node.get("antenna_height_m") or _DEFAULT_ANTENNA_HEIGHT_M)
 
     # ── 3D LOS 필터 ────────────────────────────────────────────────────────────
-    # 높이 정보가 없는 건물은 보수적으로 차단 처리
     is_blocking: list[bool] = []
     for i in range(len(search_3857)):
         bldg_h = float(search["height_m"].iloc[i] or 0.0) if "height_m" in search.columns else 0.0
@@ -93,20 +177,18 @@ def analyze_vehicle_to_node(
             is_blocking.append(blocked)
 
     mask = [bool(v) for v in is_blocking]
-    search_bl    = search[mask].copy()
+    search_bl = search[mask].copy()
     search_bl_3857 = search_3857[mask].copy()
 
     count = int(len(search_bl))
     max_height = float(search_bl["height_m"].fillna(0).max()) if count and "height_m" in search_bl.columns else 0.0
-    crossed_length_m = 0.0
-    if not search_bl_3857.empty:
-        crossed_length_m = float(
-            search_bl_3857.geometry.intersection(line_3857).length.sum()
-        )
 
-    loss_db, confidence = _loss_from_intersections(count, max_height, crossed_length_m)
-    latency_penalty_ms = round(loss_db * 0.45 + vehicle_density_penalty, 2)
-    stability_score = round(max(0.0, exp(-(loss_db / 18.0)) - vehicle_density_penalty / 100.0), 3)
+    # ── Material-based wall penetration loss ──────────────────────────────────
+    A_seg_db, confidence, crossed_length_m = _material_a_seg_db(search_bl, search_bl_3857, line_3857)
+
+    # latency_penalty_ms: building-only contribution shown on dashboard (ms)
+    latency_penalty_ms = round(A_seg_db * 0.45 + vehicle_density_penalty, 2)
+    stability_score = round(max(0.0, exp(-(A_seg_db / 20.0)) - vehicle_density_penalty / 100.0), 3)
 
     highlighted_buildings = []
     top = search_bl.head(5)
@@ -123,6 +205,7 @@ def analyze_vehicle_to_node(
             "id": row.get("ufid") or row.get("pnu"),
             "height_m": float(row.get("height_m", 0.0) or 0.0),
             "height_confidence": row.get("height_confidence", "low"),
+            "material": material_category_from_strctcd(row.get("strctCdNm")),
             "geometry": coords,
         })
 
@@ -132,7 +215,7 @@ def analyze_vehicle_to_node(
         distance_m=round(distance_m, 2),
         intersected_building_count=count,
         max_building_height_m=round(max_height, 2),
-        estimated_penetration_loss_db=round(loss_db, 2),
+        estimated_penetration_loss_db=A_seg_db,
         latency_penalty_ms=latency_penalty_ms,
         stability_score=stability_score,
         confidence=confidence,
@@ -148,6 +231,7 @@ def analyze_candidates(
     candidate_nodes: list[dict],
     buildings_gdf: gpd.GeoDataFrame,
     vehicle_density_penalty: float = 0.0,
+    network_mode: str = "5G",
 ) -> list[dict]:
     results = []
     for node in candidate_nodes:
@@ -159,18 +243,18 @@ def analyze_candidates(
             buildings_gdf=buildings_gdf,
             vehicle_density_penalty=vehicle_density_penalty,
         )
-        congestion_penalty = float(node.get("congestion_penalty", 0.0))
+        # n_vehicles: ego vehicle + Poisson-sampled background at this BS
+        n_vehicles = 1 + int(node.get("n_background_vehicles", 0))
         edge_latency = float(node.get("edge_latency_ms", 5.0))
-        distance_penalty = obs.distance_m / max(float(node.get("coverage_radius_m", 400.0)), 1.0) * 15.0
-        node_score = round(
-            distance_penalty
-            + congestion_penalty
-            + obs.estimated_penetration_loss_db * 0.8
-            + vehicle_density_penalty
-            + edge_latency,
-            2,
+
+        predicted_latency_ms = _L_total(
+            distance_m=obs.distance_m,
+            A_seg_db=obs.estimated_penetration_loss_db,
+            n_vehicles=n_vehicles,
+            network_mode=network_mode,
         )
-        predicted_latency_ms = round(4.0 + distance_penalty + congestion_penalty + obs.latency_penalty_ms + edge_latency, 2)
+        node_score = round(predicted_latency_ms + edge_latency * 0.5, 2)
+
         results.append({
             "node": node,
             "distance_m": obs.distance_m,

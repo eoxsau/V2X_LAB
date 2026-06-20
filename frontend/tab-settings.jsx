@@ -1,8 +1,8 @@
 /* ============================================================ Settings tab */
 const TECH_PRESETS = {
-  '4G': { L_base: '10', P_tx: '43', beta: '3.5', alpha: '120', N_max: '6', T_retx: '8', C_tech: '100' },
-  '5G': { L_base: '1.0', P_tx: '46', beta: '3.0', alpha: '110', N_max: '4', T_retx: '1.0', C_tech: '500' },
-  '6G': { L_base: '0.1', P_tx: '48', beta: '2.5', alpha: '100', N_max: '3', T_retx: '0.1', C_tech: '2000' },
+  '4G': { L_base: '10', P_tx: '43', beta: '3.5', alpha: '45', N_max: '6', T_retx: '8', C_tech: '100' },
+  '5G': { L_base: '1.0', P_tx: '46', beta: '3.0', alpha: '55', N_max: '4', T_retx: '1.0', C_tech: '500' },
+  '6G': { L_base: '0.1', P_tx: '48', beta: '2.5', alpha: '68', N_max: '3', T_retx: '0.1', C_tech: '2000' },
 };
 
 // ── Stage-1 config helpers ────────────────────────────────────────────────────
@@ -21,6 +21,7 @@ const DEFAULT_SIM_CONFIG = {
   policy_options: {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
+    traffic_lambda: 5.0, network_mode: '5G',
   },
 };
 
@@ -57,6 +58,10 @@ function validateSimulationConfig(config) {
     errors.push('policy_options.lookahead_k: must be integer 1–10');
   if (pol.max_handover_allowed !== undefined && (!Number.isInteger(pol.max_handover_allowed) || pol.max_handover_allowed < 0))
     errors.push('policy_options.max_handover_allowed: must be non-negative integer');
+  if (pol.traffic_lambda !== undefined && (typeof pol.traffic_lambda !== 'number' || pol.traffic_lambda < 0 || pol.traffic_lambda > 200))
+    errors.push('policy_options.traffic_lambda: must be a number 0–200');
+  if (pol.network_mode !== undefined && !['4G', '5G', '6G'].includes(pol.network_mode))
+    errors.push('policy_options.network_mode: must be "4G", "5G", or "6G"');
 
   return { valid: errors.length === 0, errors, sanitized: mergeWithDefaultConfig(config) };
 }
@@ -93,6 +98,10 @@ function mergeWithDefaultConfig(userConfig) {
     if (typeof pol.prefer_low_latency === 'boolean') merged.policy_options.prefer_low_latency = pol.prefer_low_latency;
     if (typeof pol.prefer_load_balance === 'boolean') merged.policy_options.prefer_load_balance = pol.prefer_load_balance;
     if (typeof pol.avoid_disconnection === 'boolean') merged.policy_options.avoid_disconnection = pol.avoid_disconnection;
+    if (typeof pol.traffic_lambda === 'number' && pol.traffic_lambda >= 0)
+      merged.policy_options.traffic_lambda = Math.min(pol.traffic_lambda, 200);
+    if (typeof pol.network_mode === 'string' && ['4G', '5G', '6G'].includes(pol.network_mode))
+      merged.policy_options.network_mode = pol.network_mode;
   }
   return merged;
 }
@@ -205,6 +214,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
     setTech(t);
     setVals(v => ({ ...v, ...TECH_PRESETS[t] }));
     if (t !== '4G') dispatch({ type: 'mode', v: t });
+    setCfgDraft(d => ({ ...d, policy_options: { ...d.policy_options, network_mode: t } }));
   }
   function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
 
@@ -475,6 +485,16 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
                   value={cfgDraft.policy_options.max_handover_allowed}
                   onChange={e => setPolicy('max_handover_allowed', Math.max(0, Math.min(50, parseInt(e.target.value) || 0)))} /></td>
                 <td><span className="muted" style={{ fontSize: 11 }}>허용 BS 전환 최대 횟수 (0–50)</span></td>
+              </tr>
+              <tr>
+                <td><b style={{ fontWeight: 600 }}>트래픽 밀도 (λ)</b></td>
+                <td><div className="input-suffix" style={{ width: 130 }}>
+                  <input className="input" style={{ height: 32 }} type="number" min="0.1" max="200" step="0.5"
+                    value={cfgDraft.policy_options.traffic_lambda ?? 5.0}
+                    onChange={e => setPolicy('traffic_lambda', Math.max(0.1, Math.min(200, parseFloat(e.target.value) || 5.0)))} />
+                  <span className="sfx">v/km²</span>
+                </div></td>
+                <td><span className="muted" style={{ fontSize: 11 }}>배경 차량 밀도 — Poisson 배경 부하 기대치 (0.1–200)</span></td>
               </tr>
               {[
                 ['저지연 우선',    'prefer_low_latency',  '지연시간 최소화 경로 선호'],

@@ -42,6 +42,7 @@ function App() {
     policy_options: {
       lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
       prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
+      traffic_lambda: 5.0, network_mode: '5G',
     },
   };
   const [simConfig, setSimConfig] = useState(() => {
@@ -59,6 +60,7 @@ function App() {
   const [simHistory, setSimHistory] = useState([]);   // {t, speed, progress, latency, bs} per tick
   const [simLogs,    setSimLogs]    = useState([]);   // {t, target, kind, ko} event log
   const prevBsRef = useRef(null);
+  const simElapsedRef = useRef(0);
 
   // hash routing
   useEffect(() => {
@@ -132,7 +134,7 @@ function App() {
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type === 'position') {
-          setVehiclePos({ lat: msg.lat, lng: msg.lng, speed: msg.speed, progress: msg.progress });
+          setVehiclePos({ lat: msg.lat, lng: msg.lng, speed: msg.speed, progress: msg.progress, current_edge_id: msg.current_edge_id ?? null });
         } else if (msg.type === 'route') {
           setRouteCoords(msg.coords);
         } else if (msg.type === 'arrived') {
@@ -145,7 +147,16 @@ function App() {
         } else if (msg.type === 'telemetry') {
           setNetworkTelemetry(msg);
         } else if (msg.type === 'route_cost') {
-          setRouteEdges({ per_edge: msg.per_edge, edge_names: msg.edge_names || {}, routing_mode: msg.routing_mode, avg_latency_ms: msg.avg_latency_ms, total_cost: msg.total_cost });
+          const perEdge = msg.per_edge || [];
+          const totalDist = msg.total_distance_m > 0
+            ? msg.total_distance_m
+            : perEdge.reduce((s, e) => s + (e.distance_m || 0), 0);
+          setRouteEdges({ per_edge: perEdge, edge_names: msg.edge_names || {}, routing_mode: msg.routing_mode, avg_latency_ms: msg.avg_latency_ms, total_cost: msg.total_cost, total_distance_m: totalDist, coverage_risk: msg.coverage_risk ?? 0, handover_count: msg.handover_count ?? 0 });
+        } else if (msg.type === 'disconnected') {
+          setSimLogs(prev => [...prev, {
+            t: fmtClock(simElapsedRef.current), target: 'EGO', kind: 'disconnect',
+            ko: 'BS 커버리지 단절',
+          }]);
         }
       };
     }
@@ -153,6 +164,9 @@ function App() {
     connect();
     return () => { dead = true; ws && ws.close(); };
   }, [bootReady]);
+
+  // Keep elapsed ref current for WS handlers that need current time
+  useEffect(() => { simElapsedRef.current = sim.elapsed; }, [sim.elapsed]);
 
   // Accumulate simHistory + detect events each tick
   useEffect(() => {
@@ -253,7 +267,7 @@ function App() {
       </header>
 
       <main className="page" style={tab === 'simulation' ? { overflow: 'hidden' } : {}}>
-        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
+        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} simLogs={simLogs} simConfig={simConfig} routeEdges={routeEdges} />}
         <div style={{ display: tab === 'simulation' ? 'block' : 'none', height: '100%' }}>
           <SimulationTab
             sim={sim}
@@ -271,10 +285,13 @@ function App() {
             api={API}
           />
         </div>
+        {tab === 'scenario'   && <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} />}
         {tab === 'vehicles'   && <VehiclesTab sim={sim} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
         {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} routeEdges={routeEdges} vehiclePos={vehiclePos} />}
-        {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
-        {tab === 'analysis'   && <AnalysisTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
+        {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} routeEdges={routeEdges} />}
+        {tab === 'forecast'   && <ForecastTab vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
+        {tab === 'comparison' && <ComparisonTab vehiclePos={vehiclePos} simConfig={simConfig} />}
+        {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
         {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} />}
       </main>
     </div>

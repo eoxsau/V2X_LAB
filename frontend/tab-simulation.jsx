@@ -437,6 +437,21 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (!ready) return;
     setSimError(null);
     setSimNotice(null);
+
+    // 일시정지 상태이면 재개 (vehiclePos/routeCoords 유지)
+    if (!sim.running && sim.elapsed > 0) {
+      try {
+        const res = await fetch(`${api}/api/simulation/resume`, { method: 'POST' });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || '재개 실패');
+        dispatch({ type: 'start' });
+      } catch (e) {
+        setSimError(e.message);
+      }
+      return;
+    }
+
+    // 새 시뮬레이션 시작
     setRouteCoords([]);
     setVehiclePos(null);
 
@@ -796,6 +811,16 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   <Icon.antenna size={13} /> {mode === 'bs_delete' ? '제거할 곳 클릭…' : '제거'}
                 </button>
               </div>
+              {stations.length > 0 && (
+                <div className="row gap8">
+                  <button className="btn sm block" onClick={reapplyPlacement} title="기존 기지국을 가장 가까운 건물 옥상으로 재배치합니다" style={{ flex: 1 }}>
+                    <Icon.antenna size={13} /> 옥상 재배치
+                  </button>
+                  <button className="btn sm block" onClick={resetUserStations} title="사용자 지정 기지국만 모두 제거합니다 (시뮬레이션 시나리오는 유지)" style={{ flex: 1 }}>
+                    <Icon.reset size={13} /> 초기화 ({stations.length})
+                  </button>
+                </div>
+              )}
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
           </div>
@@ -919,16 +944,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </button>}
               <button className="btn icon" onClick={clearAll} title="시나리오 초기화"><Icon.reset size={15} /></button>
             </div>
-            {stations.length > 0 && (
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button className="btn sm block" onClick={reapplyPlacement} title="기존 기지국을 가장 가까운 건물 옥상으로 재배치합니다" style={{ flex: 1 }}>
-                  <Icon.antenna size={13} /> 옥상 재배치
-                </button>
-                <button className="btn sm block" onClick={resetUserStations} title="사용자 지정 기지국만 모두 제거합니다 (시뮬레이션 시나리오는 유지)" style={{ flex: 1 }}>
-                  <Icon.reset size={13} /> 초기화 ({stations.length})
-                </button>
-              </div>
-            )}
             {stationsErr && (
               <div style={{ padding: '8px 11px', background: 'var(--warn-tint)', border: '1px solid var(--warn-line)', borderRadius: 9, color: 'var(--warn)', fontSize: 11 }}>
                 {stationsErr}

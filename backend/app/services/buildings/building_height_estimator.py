@@ -229,3 +229,22 @@ def estimate_building_height(row: pd.Series) -> tuple[float, str, str]:
 
     # ── Tier 6: final fallback ───────────────────────────────────────────────
     return 10.0, "default_estimated", "very_low"
+
+
+def material_category_from_strctcd(strct_cd_nm: str | None) -> str:
+    """Map 건축물대장 strctCdNm to a material category for wall-penetration loss."""
+    if not strct_cd_nm:
+        return "unknown"
+    s = str(strct_cd_nm).strip()
+    # Order matters: "철골철근콘크리트" must be matched before bare "철골"
+    if "철골철근" in s or "철근콘크리트" in s:
+        return "rc"
+    if any(k in s for k in ("철골", "경량철골", "강구조", "강재")):
+        return "steel"
+    if any(k in s for k in ("목구조", "목조", "일반목", "경목")):
+        return "wood"
+    if any(k in s for k in ("조적", "벽돌", "블록", "석조")):
+        return "brick"
+    if any(k in s for k in ("ALC", "경량콘크리트", "PC조", "프리캐스트")):
+        return "light_concrete"
+    return "unknown"

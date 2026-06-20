@@ -1,23 +1,75 @@
-/* ============================================================ Analysis tab */
+/* ============================================================ Report tab */
 const LOG_STYLE = {
-  info:     { tone: 'brand', ko: '정보',   ic: 'spark' },
-  handover: { tone: 'brand', ko: '핸드오버', ic: 'antenna' },
-  warn:     { tone: 'warn',  ko: '경고',   ic: 'warn' },
-  risk:     { tone: 'bad',   ko: '위험',   ic: 'warn' },
-  done:     { tone: 'good',  ko: '완료',   ic: 'check' },
-  reroute:  { tone: 'brand', ko: '재경로', ic: 'route' },
-  sys:      { tone: '',      ko: '시스템', ic: 'sliders' },
+  info:       { tone: 'brand', ko: '정보',    ic: 'spark'    },
+  handover:   { tone: 'brand', ko: '핸드오버', ic: 'antenna'  },
+  warn:       { tone: 'warn',  ko: '경고',    ic: 'warn'     },
+  risk:       { tone: 'bad',   ko: '위험',    ic: 'warn'     },
+  done:       { tone: 'good',  ko: '완료',    ic: 'check'    },
+  reroute:    { tone: 'brand', ko: '재경로',  ic: 'route'    },
+  sys:        { tone: '',      ko: '시스템',  ic: 'sliders'  },
+  disconnect: { tone: 'bad',   ko: '단절',    ic: 'warn'     },
 };
 
-function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
+const PROVIDER_LABELS = {
+  vertex:  { name: 'Gemini', color: 'var(--brand-2)' },
+  azure:   { name: 'GPT-5.4', color: '#0078d4' },
+  bedrock: { name: 'Claude', color: 'var(--brand-2)' },
+};
+
+function ReportSectionList({ title, items, render, empty }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div className="row gap8" style={{ marginBottom: 6 }}>
+        <b style={{ fontSize: 12 }}>{title}</b>
+        <Chip>{items.length}건</Chip>
+      </div>
+      <div className="col gap6">
+        {items.slice(0, 6).map((it, i) => (
+          <div key={i} className="row gap8" style={{ fontSize: 11.5, padding: '6px 10px', background: 'var(--surface-2)', borderRadius: 7, border: '1px solid var(--border)' }}>
+            {render(it)}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [revealed, setRevealed] = useState(0);
   const [exported, setExported] = useState(false);
   const [llmResult, setLlmResult] = useState([]);
   const [llmError, setLlmError] = useState(null);
+  const [llmProviders, setLlmProviders] = useState([]);
+  const [selectedProvider, setSelectedProvider] = useState('');
+  const [usedProvider, setUsedProvider] = useState(null);
+  const [summary, setSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+
+  useEffect(() => {
+    fetch('http://127.0.0.1:8001/api/analysis/llm/providers')
+      .then(r => r.json())
+      .then(data => {
+        const ps = data.providers || [];
+        setLlmProviders(ps);
+        const active = ps.find(p => p.active);
+        if (active && !selectedProvider) setSelectedProvider(active.id);
+      })
+      .catch(() => {});
+  }, []);
+
+  function fetchSummary() {
+    setSummaryLoading(true);
+    fetch('http://127.0.0.1:8001/api/analysis/summary')
+      .then(r => r.json())
+      .then(data => { setSummary(data); setSummaryLoading(false); })
+      .catch(() => setSummaryLoading(false));
+  }
+  useEffect(() => { fetchSummary(); }, []);
 
   const hasLiveLogs = simLogs && simLogs.length > 0;
-  const logs = hasLiveLogs ? [...simLogs].reverse() : DATA.logs;
+  const logs = hasLiveLogs ? [...simLogs].reverse() : [];
 
   const connNode = networkTelemetry?.ego_vehicle?.connected_network_node_name
     ?? networkTelemetry?.connected_node?.name ?? '--';
@@ -25,7 +77,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
     ?? networkTelemetry?.latency_ms ?? null;
 
   async function runAI() {
-    setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]);
+    setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]); setUsedProvider(null);
     try {
       const payload = {
         sim_elapsed: sim?.elapsed ?? 0,
@@ -40,6 +92,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
           ?? networkTelemetry?.latency_ms ?? null,
         connected_node: networkTelemetry?.ego_vehicle?.connected_network_node_name
           ?? networkTelemetry?.connected_node?.name ?? null,
+        provider: selectedProvider || null,
       };
       const res = await fetch('http://127.0.0.1:8001/api/analysis/llm', {
         method: 'POST',
@@ -53,6 +106,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
       const data = await res.json();
       const sections = data.sections || [];
       setLlmResult(sections);
+      setUsedProvider(data.provider || null);
       setAnalyzing(false);
       sections.forEach((_, i) => setTimeout(() => setRevealed(i + 1), i * 450));
     } catch (e) {
@@ -78,8 +132,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
       csv = [header.join(','), ...rows.map(r => r.join(',')), ...logRows.map(r => r.join(','))].join('\n');
     } else {
       const header = ['시각', '차량ID', '위치', '속도', '현재엣지', '연결기지국', 'Latency', '이벤트'];
-      const rows = DATA.vehicles.map(v => [`00:03:42`, v.id, `"${v.lat},${v.lng}"`, v.speed, v.edge, v.bs, v.latency, v.state]);
-      csv = [header.join(','), ...rows.map(r => r.join(','))].join('\n');
+      csv = header.join(',');
     }
     const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
@@ -89,13 +142,15 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
     setExported(true); setTimeout(() => setExported(false), 2200);
   }
 
+  const seed = summary?.available ? summary.recommendation_text_seed : null;
+
   return (
     <div className="page-pad fade">
       <div className="page-head">
         <div>
-          <div className="eyebrow">Analysis</div>
-          <h1>분석 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Analysis</span></h1>
-          <div className="sub">시뮬레이션 로그 · LLM 자연어 요약 · CSV 내보내기</div>
+          <div className="eyebrow">Post-run Report</div>
+          <h1>분석 보고서 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Report</span></h1>
+          <div className="sub">구조화 요약 · 시뮬레이션 로그 · LLM 자연어 요약 · CSV 내보내기</div>
         </div>
         <div className="row gap8">
           {hasLiveLogs && <Chip tone="good" dot>LIVE</Chip>}
@@ -104,6 +159,62 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
           </button>
         </div>
       </div>
+
+      {/* ── 구조화 요약 ─────────────────────────────── */}
+      <Card title="구조화 요약" en="Structured summary" right={
+        <button className="btn sm" onClick={fetchSummary}><Icon.reset size={13} /> 새로고침</button>
+      } style={{ marginBottom: 18 }}>
+        {summaryLoading && <div className="muted" style={{ padding: 16, fontSize: 12 }}>불러오는 중…</div>}
+        {!summaryLoading && !summary?.available && (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>{summary?.reason || '시뮬레이션을 먼저 실행하세요.'}</div>
+        )}
+        {!summaryLoading && summary?.available && (
+          <>
+            {seed?.primary_finding && (
+              <div style={{ padding: '12px 14px', background: 'var(--brand-tint)', borderRadius: 9, marginBottom: 14, fontSize: 12.5, lineHeight: 1.5 }}>
+                <b style={{ marginRight: 6 }}>핵심 발견:</b>{seed.primary_finding}
+              </div>
+            )}
+            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <ReportSectionList title="병목 구간" items={summary.bottleneck_sections} render={it => (
+                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span>{it.severity && <Chip tone="warn">{it.severity}</Chip>}</>
+              )} />
+              <ReportSectionList title="과부하 기지국" items={summary.overloaded_base_stations} render={it => (
+                <><span className="mono" style={{ fontWeight: 600 }}>{it.bs_name}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span></>
+              )} />
+              <ReportSectionList title="빈번한 핸드오버 구간" items={summary.frequent_handover_sections} render={it => (
+                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">{it.from_bs_name} → {it.to_bs_name}</span></>
+              )} />
+              <ReportSectionList title="고지연 구간" items={summary.high_latency_sections} render={it => (
+                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">{(it.latency_ms ?? 0).toFixed(1)}ms (+{(it.excess_ms ?? 0).toFixed(1)}ms)</span></>
+              )} />
+            </div>
+            <ReportSectionList title="미래 연결 위험 구간" items={summary.future_connectivity_risk_sections} render={it => (
+              <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span>{it.severity && <Chip tone="bad">{it.severity}</Chip>}</>
+            )} />
+            {seed && (seed.risk_factors?.length > 0 || seed.improvement_highlights?.length > 0) && (
+              <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14, marginTop: 4 }}>
+                {seed.improvement_highlights?.length > 0 && (
+                  <div>
+                    <b style={{ fontSize: 12 }}>개선 사항</b>
+                    <ul style={{ margin: '6px 0 0 16px', fontSize: 11.5, lineHeight: 1.6 }}>
+                      {seed.improvement_highlights.map((t, i) => <li key={i}>{t}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {seed.risk_factors?.length > 0 && (
+                  <div>
+                    <b style={{ fontSize: 12 }}>위험 요인</b>
+                    <ul style={{ margin: '6px 0 0 16px', fontSize: 11.5, lineHeight: 1.6, color: 'var(--bad)' }}>
+                      {seed.risk_factors.map((t, i) => <li key={i}>{t}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </Card>
 
       {hasLiveLogs && vehiclePos && (
         <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 18 }}>
@@ -148,7 +259,23 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
         </Card>
 
         {/* LLM panel */}
-        <Card title="AI 자연어 분석" en="LLM summary" right={<Chip tone="brand"><Icon.spark size={11} /> Claude</Chip>}>
+        <Card title="AI 자연어 분석" en="LLM summary" right={
+          <div className="row gap8">
+            {llmProviders.length > 1 && (
+              <select className="input" style={{ height: 28, fontSize: 11, minWidth: 110 }}
+                value={selectedProvider}
+                onChange={e => setSelectedProvider(e.target.value)}>
+                {llmProviders.map(p => (
+                  <option key={p.id} value={p.id}>{p.name.split('/')[1]?.trim() || p.name} — {p.model}</option>
+                ))}
+              </select>
+            )}
+            <Chip tone="brand">
+              <Icon.spark size={11} />
+              {usedProvider ? (PROVIDER_LABELS[usedProvider]?.name || usedProvider) : (PROVIDER_LABELS[selectedProvider]?.name || 'AI')}
+            </Chip>
+          </div>
+        }>
           {revealed === 0 && !analyzing && (
             <div style={{ textAlign: 'center', padding: '26px 16px' }}>
               <div style={{ width: 52, height: 52, borderRadius: 14, background: 'var(--brand-tint)', display: 'grid', placeItems: 'center', margin: '0 auto 14px', color: 'var(--brand-2)' }}><Icon.spark size={26} /></div>
@@ -165,7 +292,7 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
           {analyzing && (
             <div style={{ textAlign: 'center', padding: '34px 16px' }}>
               <div className="spin" style={{ width: 30, height: 30, border: '3px solid var(--brand-tint2)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 14px' }} />
-              <div className="muted" style={{ fontSize: 12 }}>Claude AI 분석 중…</div>
+              <div className="muted" style={{ fontSize: 12 }}>AI 분석 중…</div>
             </div>
           )}
           {revealed > 0 && (
@@ -186,4 +313,4 @@ function AnalysisTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
     </div>
   );
 }
-window.AnalysisTab = AnalysisTab;
+window.ReportTab = ReportTab;

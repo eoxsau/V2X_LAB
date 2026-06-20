@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import platform
 import shutil
 import subprocess
@@ -262,6 +263,7 @@ def _vworld_road_name(lat: float, lng: float) -> str:
     """Reverse-geocode a coordinate to a Korean road name via V-World API."""
     if not VWORLD_API_KEY:
         return ""
+    dong_fallback = ""
     for qtype in ("road", "both"):
         try:
             url = (
@@ -273,19 +275,26 @@ def _vworld_road_name(lat: float, lng: float) -> str:
             resp = requests.get(url, timeout=5)
             data = resp.json()
             for item in data.get("response", {}).get("result", []):
-                # Primary: level3 field
-                road = item.get("structure", {}).get("level3", "")
+                struct = item.get("structure", {})
+                # Primary: level3 = 도로명
+                road = struct.get("level3", "")
                 if road:
                     return road
-                # Fallback: extract road name pattern from full text address
+                # Fallback: extract road name pattern from full text
                 text = item.get("text", "")
                 m = _ROAD_NAME_RE.search(text)
                 if m:
                     return m.group(0)
+                # Save dong name as last resort
+                if not dong_fallback:
+                    dong = struct.get("level4A", "") or struct.get("level4L", "")
+                    gu  = struct.get("level2", "")
+                    if dong:
+                        dong_fallback = f"{gu} {dong}".strip() if gu else dong
         except Exception as exc:
             print(f"[VWORLD] API error ({lat:.5f},{lng:.5f}): {exc}", flush=True)
             break
-    return ""
+    return dong_fallback  # "" if nothing at all; 동 이름이라도 반환
 
 
 def _enrich_edge_names_vworld(
@@ -318,6 +327,9 @@ def _enrich_edge_names_vworld(
         time.sleep(0.05)  # ~20 req/s max
     _save_road_name_cache()
     print(f"[VWORLD] Road name enrichment done: {fetched}/{len(missing)} matched", flush=True)
+    if fetched > 0:
+        # Bump version so WS handler resends route_cost with updated edge names
+        _state["route_cost_version"] = _state.get("route_cost_version", 0) + 1
 
 
 _load_road_name_cache()
@@ -370,6 +382,7 @@ _state = {
 _ws_clients: list[WebSocket] = []
 _sim_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
+_pause_event = threading.Event()  # set=일시정지, clear=실행
 _runtime_probe_cache: dict[str, dict] = {}
 _network_lock = threading.Lock()
 
@@ -409,6 +422,8 @@ class SimConfigPolicyOptions(BaseModel):
     prefer_low_latency:   bool  = True
     prefer_load_balance:  bool  = False
     avoid_disconnection:  bool  = True
+    traffic_lambda:       float = 5.0   # background vehicle density (vehicles/km²)
+    network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
 
 class SimulationConfigModel(BaseModel):
     cost_weights:        SimConfigCostWeights        = SimConfigCostWeights()
@@ -531,6 +546,8 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         "prefer_low_latency":   bool(pol.prefer_low_latency),
         "prefer_load_balance":  bool(pol.prefer_load_balance),
         "avoid_disconnection":  bool(pol.avoid_disconnection),
+        "traffic_lambda":       max(0.1, min(float(pol.traffic_lambda), 200.0)),
+        "network_mode":         pol.network_mode if pol.network_mode in ("4G", "5G", "6G") else "5G",
     }
     _state["simulation_config"] = cfg.model_dump()
 
@@ -774,13 +791,46 @@ def load_route_buildings(
     }
 
 
-def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
+def _poisson_sample(lam: float) -> int:
+    """Knuth algorithm for Poisson(lam) sampling."""
+    if lam <= 0:
+        return 0
+    L = math.exp(-min(lam, 700.0))
+    k, p = 0, 1.0
+    while p > L:
+        k += 1
+        p *= random.random()
+    return k - 1
+
+
+def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5.0) -> list[dict]:
+    """Generate synthetic network nodes for the route bounding box.
+
+    Background vehicle load at each node is sampled from Poisson(λ × coverage_area_km²)
+    where λ = traffic_lambda (vehicles/km², configurable by the user).
+    """
     if not bbox:
         return []
     center_lat = (bbox["s"] + bbox["n"]) / 2
     center_lng = (bbox["w"] + bbox["e"]) / 2
     lat_span = max((bbox["n"] - bbox["s"]) / 3, 0.0004)
     lng_span = max((bbox["e"] - bbox["w"]) / 3, 0.0004)
+
+    _RB_PER_BG_VEHICLE = 2.5   # average resource blocks consumed per background vehicle
+
+    def _node_load(radius_m: float, capacity_rb: float) -> tuple[float, float, int]:
+        """Return (load_rb, congestion_0_1, n_bg_vehicles)."""
+        area_km2 = math.pi * (radius_m / 1000.0) ** 2
+        n_bg = _poisson_sample(traffic_lambda * area_km2)
+        load_rb = min(n_bg * _RB_PER_BG_VEHICLE, capacity_rb * 0.95)
+        congestion = round(load_rb / max(capacity_rb, 1.0), 3)
+        return round(load_rb, 1), congestion, n_bg
+
+    cap_bs, cap_rsu, cap_edge = 120.0, 80.0, 150.0
+    load_bs,   cong_bs,   n_bg_bs   = _node_load(450.0, cap_bs)
+    load_rsu,  cong_rsu,  n_bg_rsu  = _node_load(220.0, cap_rsu)
+    load_edge, cong_edge, n_bg_edge = _node_load(320.0, cap_edge)
+
     return [
         {
             "id": "BS-01",
@@ -790,11 +840,13 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "lng": center_lng - lng_span,
             "edge_latency_ms": 4.0,
             "coverage_radius_m": 450.0,
-            "congestion_penalty": 8.0,
-            "capacity": 120.0,
-            "load": 42.0,
+            "congestion_penalty": cong_bs,
+            "congestion_score": cong_bs,
+            "capacity": cap_bs,
+            "load": load_bs,
+            "n_background_vehicles": n_bg_bs,
             "source": "synthetic",
-            "antenna_height_m": 25.0,   # 도심 건물 옥상 기준
+            "antenna_height_m": 25.0,
             "antenna_placement": "rooftop",
         },
         {
@@ -805,11 +857,13 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "lng": center_lng + lng_span * 0.7,
             "edge_latency_ms": 2.5,
             "coverage_radius_m": 220.0,
-            "congestion_penalty": 5.0,
-            "capacity": 80.0,
-            "load": 28.0,
+            "congestion_penalty": cong_rsu,
+            "congestion_score": cong_rsu,
+            "capacity": cap_rsu,
+            "load": load_rsu,
+            "n_background_vehicles": n_bg_rsu,
             "source": "synthetic",
-            "antenna_height_m": 8.0,    # 도로변 폴대
+            "antenna_height_m": 8.0,
             "antenna_placement": "pole",
         },
         {
@@ -820,11 +874,13 @@ def generate_network_nodes_for_bbox(bbox: dict | None) -> list[dict]:
             "lng": center_lng - lng_span * 0.3,
             "edge_latency_ms": 1.8,
             "coverage_radius_m": 320.0,
-            "congestion_penalty": 3.5,
-            "capacity": 150.0,
-            "load": 18.0,
+            "congestion_penalty": cong_edge,
+            "congestion_score": cong_edge,
+            "capacity": cap_edge,
+            "load": load_edge,
+            "n_background_vehicles": n_bg_edge,
             "source": "synthetic",
-            "antenna_height_m": 15.0,   # 중간 높이 철탑
+            "antenna_height_m": 15.0,
             "antenna_placement": "pole",
         },
     ]
@@ -899,6 +955,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
     buildings_gdf = _state.get("route_buildings")
     route_coords = _state.get("route_coords") or []
     density_penalty = round(max(len(route_coords) / 120.0, 1.0), 2)
+    _policy = _state.get("policy_options") or {}
     candidates = analyze_candidates(
         vehicle_id="veh0",
         vehicle_lat=vehicle_pos["lat"],
@@ -906,6 +963,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         candidate_nodes=nodes,
         buildings_gdf=buildings_gdf if buildings_gdf is not None else BUILDING_REPOSITORY.query_by_bbox(0, 0, 0, 0),
         vehicle_density_penalty=density_penalty,
+        network_mode=_policy.get("network_mode", "5G"),
     )
     if not candidates:
         _state["network_telemetry"] = None
@@ -2007,6 +2065,11 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
     _mock_prev_cur = -1
 
     while not stop_evt.is_set():
+        # 일시정지 대기
+        while _pause_event.is_set() and not stop_evt.is_set():
+            time.sleep(0.1)
+        if stop_evt.is_set():
+            break
         travelled = min(total_dist, travelled + speed_mps * 0.2)
         step += 1
 
@@ -2067,6 +2130,8 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
                     if _prev_mock_eid not in _state["edge_history"]:
                         _state["edge_history"].append(_prev_mock_eid)
                 _mock_prev_cur = _cur
+                if _state.get("vehicle_pos") is not None:
+                    _state["vehicle_pos"]["current_edge_id"] = _mock_eid
         update_network_telemetry(_state["vehicle_pos"])
 
         if travelled >= total_dist:
@@ -2474,13 +2539,42 @@ def simulation_thread(
         # Define vehicle type and add vehicle
         # Use DEFAULT_VEHTYPE (always exists in SUMO)
         traci.route.add("route0", edges)
+
+        # 목적지 좌표를 도착 엣지에 투영하여 arrivalPos 계산
+        # (미지정 시 엣지 끝까지 과주행)
+        try:
+            _dx, _dy = net.convertLonLat2XY(dest["lng"], dest["lat"])
+            _lane = net.getEdge(to_edge).getLane(0)
+            _shape = _lane.getShape()
+            _arrival_pos = 0.0
+            _cum = 0.0
+            _best_d = float("inf")
+            for _si in range(len(_shape) - 1):
+                _x1, _y1 = _shape[_si]
+                _x2, _y2 = _shape[_si + 1]
+                _sl = math.hypot(_x2 - _x1, _y2 - _y1)
+                if _sl > 0:
+                    _t = max(0.0, min(1.0, ((_dx - _x1) * (_x2 - _x1) + (_dy - _y1) * (_y2 - _y1)) / (_sl * _sl)))
+                    _d = math.hypot(_dx - (_x1 + _t * (_x2 - _x1)), _dy - (_y1 + _t * (_y2 - _y1)))
+                    if _d < _best_d:
+                        _best_d = _d
+                        _arrival_pos = _cum + _t * _sl
+                _cum += _sl
+            _edge_len = net.getEdge(to_edge).getLength()
+            _arrival_pos = max(1.0, min(float(_arrival_pos), _edge_len - 0.5))
+            print(f"[SIM] arrivalPos on {to_edge}: {_arrival_pos:.1f}m / {_edge_len:.1f}m", flush=True)
+        except Exception as _ae:
+            _arrival_pos = "max"
+            print(f"[SIM] arrivalPos fallback to max: {_ae}", flush=True)
+
         traci.vehicle.add(
             vehID="veh0",
             routeID="route0",
             typeID="DEFAULT_VEHTYPE",
             depart="0",
             departLane="best",
-            departSpeed="max",
+            departSpeed="0",
+            arrivalPos=_arrival_pos,
         )
         print("[SIM] Vehicle veh0 added to simulation", flush=True)
 
@@ -2508,6 +2602,11 @@ def simulation_thread(
         _prev_ridx = -1
 
         while not stop_evt.is_set() and not arrived and step < max_steps:
+            # 일시정지 대기 (TraCI 연결 유지)
+            while _pause_event.is_set() and not stop_evt.is_set():
+                time.sleep(0.1)
+            if stop_evt.is_set():
+                break
             traci.simulationStep()
             step += 1
 
@@ -2537,6 +2636,7 @@ def simulation_thread(
                 "progress": round(progress, 3),
                 "step": step,
                 "arrived": False,
+                "current_edge_id": edges[route_idx] if 0 <= route_idx < len(edges) else None,
             }
 
             # Track per-edge average speed (actual vehicle speed while traversing)
@@ -2561,9 +2661,11 @@ def simulation_thread(
                         _spd_ms = traci.edge.getLastStepMeanSpeed(_eid)
                         _occ = traci.edge.getLastStepOccupancy(_eid) / 100.0
                         _vc = traci.edge.getLastStepVehicleNumber(_eid)
+                        # 차량이 없는 엣지는 SUMO가 자유류속도(~100km/h)를 반환하므로 0으로 처리
+                        _spd_kmh = round(max(0.0, _spd_ms) * 3.6, 1) if _vc > 0 else 0.0
                         _estats.append({
                             "edge_id": _eid,
-                            "speed_kmh": round(max(0.0, _spd_ms) * 3.6, 1),
+                            "speed_kmh": _spd_kmh,
                             "occupancy": round(max(0.0, min(1.0, _occ)), 3),
                             "vehicle_count": int(_vc),
                         })
@@ -2811,7 +2913,10 @@ async def setup_network(req: SetupRequest):
             _state["sim_mode"] = chosen_mode
             _state["network_ready"] = True
             _state["current_bbox"] = {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e}
-            _state["synthetic_network_nodes"] = generate_network_nodes_for_bbox(_state["current_bbox"])
+            _state["synthetic_network_nodes"] = generate_network_nodes_for_bbox(
+                _state["current_bbox"],
+                traffic_lambda=(_state.get("policy_options") or {}).get("traffic_lambda", 5.0),
+            )
             # Synthetic nodes are kept in-memory only — not persisted to DB — so they
             # never appear alongside user-created stations.
             _state["network_nodes"] = merged_network_nodes()
@@ -2839,13 +2944,14 @@ async def setup_network(req: SetupRequest):
 @app.post("/api/simulation/start")
 async def start_simulation(req: SimStartRequest):
     """Start SUMO simulation with Dijkstra routing between origin and dest."""
-    global _sim_thread, _stop_event
+    global _sim_thread, _stop_event, _pause_event
 
     if not _state["network_ready"]:
         raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
 
-    # Stop existing simulation
-    if _state["sim_running"] and _sim_thread and _sim_thread.is_alive():
+    # 기존 스레드 정리 (실행 중이거나 일시정지 중인 경우 모두)
+    if _sim_thread and _sim_thread.is_alive():
+        _pause_event.clear()  # 일시정지 해제 후 종료 신호
         _stop_event.set()
         _sim_thread.join(timeout=5)
 
@@ -2854,12 +2960,17 @@ async def start_simulation(req: SimStartRequest):
     _state["network_nodes"] = merged_network_nodes()
 
     _stop_event = threading.Event()
+    _pause_event = threading.Event()
     _state["sim_running"] = True
     _state["vehicle_pos"] = None
     _state["error"] = None
     _state["warning"] = None
     _state["route_coords"] = []
     _state["route_edges"] = []
+    # 이전 런의 엣지 기록 초기화 (다음 런에서 "현재" 고정 버그 방지)
+    _state["edge_history"] = []
+    _state["edge_avg_speeds"] = {}
+    _state["edge_telemetry"] = []
     _state["selected_algorithms"] = req.algorithm_config or {}
     _state["simulation_run_id"] = create_simulation_run(req.origin, req.dest, _state["sim_mode"])
 
@@ -2975,6 +3086,12 @@ async def start_simulation(req: SimStartRequest):
                     print(f"[SIM] Network routing failed: {_net_exc} — Dijkstra baseline", flush=True)
 
         _state["route_edges"] = path
+
+        # Prepend exact origin so vehicle starts from user-selected point, not nearest OSM node
+        origin_pt = [req.origin["lat"], req.origin["lng"]]
+        if route_coords and haversine_m(origin_pt[0], origin_pt[1], route_coords[0][0], route_coords[0][1]) > 5.0:
+            route_coords = [origin_pt] + route_coords
+
         _state["route_coords"] = route_coords
 
         # Collect street names from OSM way_names stored in mock graph
@@ -3037,21 +3154,28 @@ async def start_simulation(req: SimStartRequest):
 
 @app.post("/api/simulation/stop")
 async def stop_simulation():
-    global _stop_event
-    _stop_event.set()
+    """시뮬레이션 일시정지 (스레드·TraCI 연결 유지)."""
+    global _pause_event
+    _pause_event.set()
     _state["sim_running"] = False
-    finish_simulation_run(_state.get("simulation_run_id"), {
-        "vehicle_pos": _state.get("vehicle_pos"),
-        "network_telemetry": _state.get("network_telemetry"),
-        "sim_mode": _state.get("sim_mode"),
-    })
-    _state["sim_mode"] = "idle"
     return {"ok": True}
+
+
+@app.post("/api/simulation/resume")
+async def resume_simulation():
+    """일시정지된 시뮬레이션 재개."""
+    global _pause_event
+    if _sim_thread is not None and _sim_thread.is_alive() and _pause_event.is_set():
+        _pause_event.clear()
+        _state["sim_running"] = True
+        return {"ok": True}
+    raise HTTPException(status_code=400, detail="일시정지 중인 시뮬레이션이 없습니다.")
 
 
 @app.post("/api/simulation/reset")
 async def reset_simulation():
-    global _stop_event, _sim_thread
+    global _stop_event, _sim_thread, _pause_event
+    _pause_event.clear()  # 일시정지 해제 후 종료
     _stop_event.set()
     if _sim_thread and _sim_thread.is_alive():
         _sim_thread.join(timeout=5)
@@ -3062,6 +3186,7 @@ async def reset_simulation():
     })
     _sim_thread = None
     _stop_event = threading.Event()
+    _pause_event = threading.Event()
     reset_simulation_state()
     return {"ok": True}
 
@@ -3422,6 +3547,27 @@ def run_allocation(algorithm_id: Optional[str] = None):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/resources/allocation-result")
+def get_allocation_result():
+    """
+    Read the last-computed resource allocation result without recomputing.
+
+    Unlike POST /api/resources/allocate, this does not mutate _state["network_nodes"] —
+    safe to poll repeatedly from the UI for display purposes.
+    """
+    alloc = _state.get("last_allocation_result")
+    if not alloc:
+        return {"available": False}
+    return {
+        "available": True,
+        "algorithm_id": alloc.get("algorithm_id"),
+        "allocation_result": alloc.get("allocation_result", {}),
+        "bs_load_after_allocation": alloc.get("bs_load_after_allocation", {}),
+        "resource_deficit_by_bs": alloc.get("resource_deficit_by_bs", {}),
+        "expected_latency_impact": alloc.get("expected_latency_impact", {}),
+    }
 
 
 @app.get("/api/resources/demand")
@@ -4140,13 +4286,22 @@ class LLMAnalysisRequest(BaseModel):
     handover_count: int = 0
     latency_ms: Optional[float] = None
     connected_node: Optional[str] = None
+    provider: Optional[str] = None   # "vertex" | "azure" | "bedrock" | None = auto
+
+
+@app.get("/api/analysis/llm/providers")
+def get_llm_providers():
+    """List all configured LLM providers and which one is currently active."""
+    try:
+        from app.services.llm.client import list_providers
+        return {"providers": list_providers()}
+    except Exception as exc:
+        return {"providers": [], "error": str(exc)}
 
 
 @app.post("/api/analysis/llm")
 def run_llm_analysis(req: LLMAnalysisRequest):
-    bedrock_key = os.environ.get("BEDROCK_API_KEY", "")
-    if not bedrock_key:
-        raise HTTPException(status_code=503, detail="BEDROCK_API_KEY가 설정되지 않았습니다.")
+    from app.services.llm.client import generate as llm_generate
 
     elapsed_min = req.sim_elapsed / 60 if req.sim_elapsed > 0 else 0
     arrived = req.vehicle_pos.get("arrived", False) if req.vehicle_pos else False
@@ -4220,35 +4375,13 @@ def run_llm_analysis(req: LLMAnalysisRequest):
   ]
 }}"""
 
-    bedrock_url = (
-        "https://bedrock-runtime.us-east-1.amazonaws.com"
-        "/model/us.anthropic.claude-sonnet-4-6/converse"
-    )
-    payload = {
-        "messages": [{"role": "user", "content": [{"text": prompt}]}],
-        "inferenceConfig": {"maxTokens": 4096, "temperature": 0.3},
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {bedrock_key}",
-    }
-
     try:
-        resp = requests.post(bedrock_url, json=payload, headers=headers, timeout=90)
-        resp.raise_for_status()
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Bedrock API 응답 시간 초과 (90초)")
-    except requests.exceptions.RequestException as exc:
+        text, provider_used = llm_generate(prompt, provider=req.provider or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
         detail = str(exc)
-        if hasattr(exc, "response") and exc.response is not None:
-            detail = f"HTTP {exc.response.status_code}: {exc.response.text[:300]}"
-        raise HTTPException(status_code=502, detail=f"Bedrock API 오류: {detail}")
-
-    raw = resp.json()
-    try:
-        text = raw["output"]["message"]["content"][0]["text"]
-    except (KeyError, IndexError) as exc:
-        raise HTTPException(status_code=502, detail=f"Bedrock 응답 파싱 실패: {exc} — {str(raw)[:200]}")
+        raise HTTPException(status_code=502, detail=f"LLM API 오류 ({req.provider or 'auto'}): {detail[:400]}")
 
     # Parse the JSON sections the model was asked to return
     sections: list = []
@@ -4264,7 +4397,95 @@ def run_llm_analysis(req: LLMAnalysisRequest):
     if not sections:
         sections = [line.strip() for line in text.splitlines() if line.strip()]
 
-    return {"sections": sections}
+    return {"sections": sections, "provider": provider_used}
+
+
+class ScenarioParseRequest(BaseModel):
+    input_text: str
+    input_type: str = "nl"          # "nl" | "code"
+    current_config: dict = {}        # current simConfig for diff context
+    provider: Optional[str] = None
+
+
+@app.post("/api/scenarios/parse")
+def parse_scenario(req: ScenarioParseRequest):
+    """
+    Parse a natural-language or JSON/code scenario description into a
+    structured diff against the simulation config schema (cost_weights /
+    algorithm_selection / policy_options). Does not apply anything —
+    the frontend validates and applies the returned diff itself.
+    """
+    from app.services.llm.client import generate as llm_generate
+
+    schema_doc = """
+스키마 (이 키들만 사용, 다른 키는 절대 만들지 마세요):
+
+cost_weights (모든 값은 0 이상 숫자, 보통 0~20 범위):
+  w_distance, w_time, w_latency, w_load, w_resource, w_handover, w_blockage, w_future
+
+algorithm_selection (각 키는 아래 후보 중 정확히 하나의 문자열):
+  route_algorithm: dijkstra | astar | k_shortest_path | network_aware | lookahead | rl_routing
+  latency_algorithm: full_composite_latency | blockage_aware_latency | mec_aware_latency | distance_based_latency | load_aware_latency
+  base_station_selection_algorithm: lowest_latency_bs | nearest_bs | load_balanced_bs
+  resource_allocation_algorithm: traffic_aware_allocation | equal_allocation | proportional_demand_allocation | load_balancing_allocation | latency_minimizing_allocation | priority_based_allocation | lookahead_resource_allocation
+
+policy_options:
+  lookahead_k (정수 1~10), lookahead_time (숫자, 초), max_handover_allowed (정수 0 이상),
+  prefer_low_latency (true/false), prefer_load_balance (true/false), avoid_disconnection (true/false),
+  traffic_lambda (숫자 0~200), network_mode: "4G" | "5G" | "6G"
+"""
+
+    input_label = "자연어 시나리오 설명" if req.input_type == "nl" else "코드/JSON 형태의 설정 조각"
+    prompt = f"""당신은 V2X 네트워크 시뮬레이션의 설정 어시스턴트입니다.
+사용자가 아래와 같은 {input_label}을 입력했습니다. 이를 시뮬레이션 설정 변경(diff)으로 변환하세요.
+
+=== 현재 설정 ===
+{json.dumps(req.current_config, ensure_ascii=False, indent=2)}
+
+=== 설정 스키마 ===
+{schema_doc}
+
+=== 사용자 입력 ===
+{req.input_text}
+
+=== 작업 지침 ===
+- 사용자 입력에서 실제로 바뀌어야 한다고 판단되는 키만 diff에 포함하세요. 바뀌지 않는 키는 절대 포함하지 마세요.
+- 스키마에 없는 키를 만들지 마세요.
+- 각 변경 키마다 한 줄짜리 변경 이유(rationale)를 작성하세요.
+- 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 출력하지 마세요.
+
+{{
+  "diff": {{
+    "cost_weights": {{}},
+    "algorithm_selection": {{}},
+    "policy_options": {{}}
+  }},
+  "rationale": {{
+    "<바뀐 키>": "한 줄 이유"
+  }}
+}}"""
+
+    try:
+        text, provider_used = llm_generate(prompt, provider=req.provider or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        detail = str(exc)
+        raise HTTPException(status_code=502, detail=f"LLM API 오류 ({req.provider or 'auto'}): {detail[:400]}")
+
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        parsed = json.loads(text[start:end]) if start >= 0 and end > start else {}
+    except (json.JSONDecodeError, ValueError):
+        parsed = {}
+
+    diff = parsed.get("diff") or {}
+    rationale = parsed.get("rationale") or {}
+    if not isinstance(diff, dict):
+        diff = {}
+
+    return {"ok": bool(diff), "provider": provider_used, "diff": diff, "rationale": rationale}
 
 
 @app.websocket("/ws")
@@ -4277,6 +4498,7 @@ async def websocket_endpoint(ws: WebSocket):
         last_route = None
         last_telemetry = None
         last_cost_version = 0
+        last_connected: bool | None = None  # None=unknown, True=connected, False=disconnected
         while True:
             pos = _state.get("vehicle_pos")
             err = _state.get("error")
@@ -4312,6 +4534,16 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "telemetry", **telemetry})
                 last_telemetry = telemetry
 
+            # Disconnection detection: emit once when BS coverage is lost mid-simulation
+            sim_running_now = _state.get("sim_running", False)
+            if pos and sim_running_now:
+                currently_connected = telemetry is not None
+                if last_connected is True and not currently_connected:
+                    await ws.send_json({"type": "disconnected"})
+                last_connected = currently_connected
+            elif not sim_running_now:
+                last_connected = None
+
             if cost_version != last_cost_version:
                 cost_result = _state.get("route_cost_result")
                 if cost_result:
@@ -4334,6 +4566,9 @@ async def websocket_endpoint(ws: WebSocket):
                         "routing_mode": cost_result.get("routing_mode", ""),
                         "avg_latency_ms": cost_result.get("avg_latency_ms", 0),
                         "total_cost": cost_result.get("total_cost", 0),
+                        "total_distance_m": cost_result.get("total_distance_m", 0),
+                        "coverage_risk": cost_result.get("coverage_risk", 0),
+                        "handover_count": cost_result.get("handover_count", 0),
                     })
                 last_cost_version = cost_version
 

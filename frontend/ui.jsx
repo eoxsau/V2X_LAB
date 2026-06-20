@@ -34,16 +34,21 @@ const Icon = {
   flag:    (p) => <Ic {...p} d={<><path d="M5 21V4M5 4h11l-2 4 2 4H5"/></>} />,
   warn:    (p) => <Ic {...p} d={<><path d="M12 3 2 20h20L12 3Z"/><path d="M12 10v4M12 17.5v.5"/></>} />,
   layers:  (p) => <Ic {...p} d={<><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/></>} />,
+  compare: (p) => <Ic {...p} d={<><rect x="3" y="9" width="7" height="11" rx="1.2"/><rect x="14" y="4" width="7" height="16" rx="1.2"/></>} />,
+  radar:   (p) => <Ic {...p} d={<><circle cx="12" cy="12" r="2"/><path d="M12 12 18 8"/><path d="M5.5 5.5a9 9 0 0 1 13 0M3 9a12 12 0 0 1 18 0M7.5 8a6 6 0 0 1 9 0" /></>} />,
 };
 
 const NAV = [
-  { id: 'dashboard',  ko: '대시보드',     en: 'Dashboard',  icon: 'dash' },
-  { id: 'simulation', ko: '시뮬레이션',   en: 'Simulation', icon: 'map'  },
-  { id: 'vehicles',   ko: '차량',         en: 'Vehicles',   icon: 'car'  },
-  { id: 'network',    ko: '네트워크',     en: 'Network',    icon: 'antenna' },
-  { id: 'routes',     ko: '경로',         en: 'Routes',     icon: 'route' },
-  { id: 'analysis',   ko: '분석',         en: 'Analysis',   icon: 'chart' },
-  { id: 'settings',   ko: '설정',         en: 'Settings',   icon: 'sliders' },
+  { id: 'dashboard',  ko: '대시보드',          en: 'Dashboard',  icon: 'dash' },
+  { id: 'simulation', ko: '시뮬레이션',        en: 'Simulation', icon: 'map'  },
+  { id: 'scenario',   ko: '시나리오 어시스턴트', en: 'Scenario',   icon: 'spark' },
+  { id: 'vehicles',   ko: '차량 (Fleet)',      en: 'Fleet',      icon: 'car'  },
+  { id: 'network',    ko: '네트워크',          en: 'Network',    icon: 'antenna' },
+  { id: 'routes',     ko: '경로',              en: 'Routes',     icon: 'route' },
+  { id: 'forecast',   ko: '예측/위험',         en: 'Forecast',   icon: 'radar' },
+  { id: 'comparison', ko: '비교',              en: 'Comparison', icon: 'compare' },
+  { id: 'report',     ko: '분석 보고서',       en: 'Report',     icon: 'chart' },
+  { id: 'settings',   ko: '설정',              en: 'Settings',   icon: 'sliders' },
 ];
 
 /* ---- Primitives -------------------------------------------- */

@@ -117,16 +117,22 @@ function VehiclesTab({ sim, vehiclePos, networkTelemetry, simHistory }) {
   } : null;
 
   const hasLive = !!liveVehicle;
-  const vehicles = hasLive ? [liveVehicle] : DATA.vehicles;
+  const vehicles = Array.isArray(liveVehicle) ? liveVehicle : (hasLive ? [liveVehicle] : []);
   const moving = vehicles.filter(v => v.state === 'moving').length;
   const selVehicle = vehicles.find(v => v.id === sel);
+
+  // 플릿 집계 — 현재는 차량 1대뿐이라도 N대로 확장 시 자연스럽게 집계됨
+  const fleetSize = vehicles.length;
+  const avgLatency = fleetSize > 0 ? vehicles.reduce((s, v) => s + (v.latency ?? 0), 0) / fleetSize : null;
+  const totalHandover = fleetSize > 0 ? vehicles.filter(v => v._handoverActive).length : 0;
+  const disconnectedCount = vehicles.filter(v => (v.latency ?? 0) === 0 && v.state === 'moving').length;
 
   return (
     <div className="page-pad fade">
       <div className="page-head">
         <div>
           <div className="eyebrow">Fleet</div>
-          <h1>차량 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Vehicles</span></h1>
+          <h1>차량 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Vehicles (Fleet)</span></h1>
           <div className="sub">차량별 위치 · 속도 · 경로 · 연결 기지국 — 행을 클릭하면 상세 정보가 열립니다</div>
         </div>
         <div className="row gap8">
@@ -135,6 +141,14 @@ function VehiclesTab({ sim, vehiclePos, networkTelemetry, simHistory }) {
           <Chip tone="good" dot>이동 {moving}</Chip>
           <Chip dot>정지 {vehicles.length - moving}</Chip>
         </div>
+      </div>
+
+      {/* 플릿 집계 바 — 다중차량 확장 시 N대 평균/합계로 자연 확장 */}
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 18 }}>
+        <Stat label="플릿 규모" icon="car" value={fleetSize} unit="대" sub={hasLive ? '실시간 추적 중' : '—'} accent />
+        <Stat label="평균 Latency" icon="latency" value={avgLatency !== null ? avgLatency.toFixed(1) : '—'} unit={avgLatency !== null ? 'ms' : ''} sub={`${fleetSize}대 평균`} />
+        <Stat label="총 핸드오버" icon="antenna" value={totalHandover} unit="회" sub="전체 차량 합계" />
+        <Stat label="동시 단절" icon="warn" value={disconnectedCount} unit="대" sub={disconnectedCount > 0 ? '연결 끊김 감지' : '단절 없음'} />
       </div>
 
       <Card title="차량 목록" en="Vehicle list" style={{ padding: 0, overflow: 'hidden' }}>

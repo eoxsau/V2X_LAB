@@ -23,9 +23,11 @@ data/processed/demo/*.dump
 # Claude Code IDE
 .claude/
 
-# Environment
+# Environment & credentials (never commit)
 .env
 .env.local
+gcp_key.json
+*_service_account.json
 
 # Managed GIS data
 data/raw/*
