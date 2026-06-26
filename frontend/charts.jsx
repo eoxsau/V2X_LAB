@@ -1,6 +1,6 @@
 /* ============================================================
    SVG charts — lightweight, dependency-free (exported to window)
-   Sparkline · LineChart (area) · BarChart · Donut · MiniMap
+   Sparkline · LineChart (area) · BarChart · Donut · MiniMap · SegmentStrip
    ============================================================ */
 
 function niceMax(v) {const p = Math.pow(10, Math.floor(Math.log10(v)));return Math.ceil(v / p) * p;}
@@ -96,6 +96,53 @@ function BarChart({ items, max, height = 180 }) {
 
 }
 
+/* ---- SegmentStrip (route corridor / status strip) --------- */
+function SegmentStrip({ items, height = 74 }) {
+  const wrapRef = useRef(null);
+  const [w, setW] = useState(480);
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const ro = new ResizeObserver((es) => setW(es[0].contentRect.width));
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+  }, []);
+  const gap = 8;
+  const count = Math.max(items.length, 1);
+  const segW = Math.max((w - gap * (count - 1)) / count, 48);
+  return (
+    <div ref={wrapRef} style={{ width: '100%' }}>
+      <div className="row" style={{ gap, alignItems: 'stretch' }}>
+        {items.map((it, i) => (
+          <div key={i} style={{ width: segW, minWidth: 48 }}>
+            <div
+              title={`${it.title || it.label || ''}${it.meta ? ` · ${it.meta}` : ''}`}
+              style={{
+                height: height - 24,
+                borderRadius: 10,
+                background: 'var(--surface-2)',
+                border: `1.5px solid ${it.isCurrent ? 'var(--brand)' : 'var(--border)'}`,
+                borderTop: `4px solid ${it.accent || 'var(--border)'}`,
+                boxShadow: it.isCurrent ? '0 0 0 2px var(--brand-tint)' : 'none',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'space-between',
+                padding: '8px 8px 7px',
+                color: it.textColor || 'var(--ink)',
+              }}
+            >
+              <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '.04em', opacity: 0.75 }}>{it.badge || `#${i + 1}`}</span>
+              {it.value != null && <span className="num" style={{ fontSize: 11.5, fontWeight: 700 }}>{it.value}</span>}
+            </div>
+            <div style={{ fontSize: 10.5, color: 'var(--ink-3)', textAlign: 'center', marginTop: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {it.label || `edge ${i + 1}`}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ---- Donut / gauge ----------------------------------------- */
 function Donut({ value, max = 100, size = 96, stroke = 11, color = 'var(--brand-2)', label, unit = '%' }) {
   const r = (size - stroke) / 2,c = 2 * Math.PI * r;
@@ -117,17 +164,18 @@ function Donut({ value, max = 100, size = 96, stroke = 11, color = 'var(--brand-
 }
 
 /* ---- MiniMap: schematic route on a grid (no tiles) --------- */
-function MiniMap({ path, risk, color = 'var(--brand-2)', height = 180, bs = [], label }) {
-  // normalise lat/lng to box
-  const all = path.concat(bs.map((b) => [b.lat, b.lng]));
+function MiniMap({ path, risk, color = 'var(--brand-2)', height = 180, bs = [], label, extraPaths = [] }) {
+  // normalise lat/lng to box — include extraPaths so alternates always fit in frame
+  const all = path.concat(bs.map((b) => [b.lat, b.lng])).concat(extraPaths.flatMap((p) => p.path));
   const lats = all.map((p) => p[0]),lngs = all.map((p) => p[1]);
   const minLat = Math.min(...lats),maxLat = Math.max(...lats);
   const minLng = Math.min(...lngs),maxLng = Math.max(...lngs);
   const padX = 24,padY = 20,W = 320,H = height;
   const sx = (v) => padX + (v - minLng) / (maxLng - minLng || 1) * (W - padX * 2);
   const sy = (v) => H - padY - (v - minLat) / (maxLat - minLat || 1) * (H - padY * 2);
-  const d = path.map((p, i) => (i ? 'L' : 'M') + sx(p[1]).toFixed(1) + ' ' + sy(p[0]).toFixed(1)).join(' ');
-  const riskD = risk ? risk.map((p, i) => (i ? 'L' : 'M') + sx(p[1]).toFixed(1) + ' ' + sy(p[0]).toFixed(1)).join(' ') : null;
+  const toD = (pts) => pts.map((p, i) => (i ? 'L' : 'M') + sx(p[1]).toFixed(1) + ' ' + sy(p[0]).toFixed(1)).join(' ');
+  const d = toD(path);
+  const riskD = risk ? toD(risk) : null;
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: 'block', background: 'var(--surface-2)', borderRadius: 10 }}>
       <defs>
@@ -136,6 +184,11 @@ function MiniMap({ path, risk, color = 'var(--brand-2)', height = 180, bs = [], 
         </pattern>
       </defs>
       <rect x="0" y="0" width={W} height={H} fill={`url(#grid${label})`} />
+      {/* alternate candidates drawn first (dashed, thinner) so the main path stays on top */}
+      {extraPaths.map((ep, i) => (
+        <path key={'extra' + i} d={toD(ep.path)} fill="none" stroke={ep.color} strokeWidth="2.5"
+              strokeDasharray="6 4" strokeLinecap="round" strokeLinejoin="round" opacity="0.85" />
+      ))}
       <path d={d} fill="none" stroke={color} strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round" />
       {riskD && <path d={riskD} fill="none" stroke="var(--bad)" strokeWidth="5" strokeLinecap="round" opacity="0.85" />}
       {bs.map((b, i) =>
@@ -151,4 +204,4 @@ function MiniMap({ path, risk, color = 'var(--brand-2)', height = 180, bs = [], 
 
 }
 
-Object.assign(window, { Sparkline, LineChart, BarChart, Donut, MiniMap });
+Object.assign(window, { Sparkline, LineChart, BarChart, Donut, MiniMap, SegmentStrip });

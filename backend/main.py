@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from heapq import heappop, heappush
 from pathlib import Path
 from tempfile import gettempdir
@@ -35,6 +36,8 @@ from app.db import (
     fetch_network_nodes,
     finish_simulation_run,
     insert_network_node,
+    list_simulation_runs,
+    list_simulation_runs_by_sheet,
     max_user_station_number,
     postgis_available,
     update_network_node_placement,
@@ -53,6 +56,7 @@ try:
         compute_edge_network_cost,
         evaluate_path,
         evaluate_k_candidates,
+        _find_best_bs_light,
     )
     _route_cost_weights = CostWeights()
     _norm_scales = NormScales()
@@ -347,6 +351,8 @@ _state = {
     "mock_graph": None,    # parsed OSM road graph for fallback mode
     "sim_running": False,
     "vehicle_pos": None,   # {"lat": float, "lng": float, "progress": float}
+    "background_vehicles": [],  # 다중차량 실험군 — 배경 차량 [{"id","lat","lng","route_coords",...}]
+    "background_vehicle_ids": [],  # SUMO 모드 — TraCI에 주입된 배경 차량 vehID 목록
     "route_edges": [],     # list of SUMO edge IDs
     "route_coords": [],    # list of [lat, lng] for the full route polyline
     "sim_mode": "idle",    # idle | sumo | mock
@@ -362,18 +368,21 @@ _state = {
     "building_debug": {"sample_links": [], "warnings": []},
     "simulation_run_id": None,
     "route_cost_result": None,
+    "route_cost_edge_data": None,
     "route_cost_version": 0,
     "route_edge_names": {},
     "edge_telemetry": [],
     "edge_avg_speeds": {},   # {edge_id: avg_speed_kmh} measured while vehicle traversed
     "edge_history": [],      # completed edge_ids in traversal order
     "k_path_candidates": None,
+    "k_path_edge_data": None,  # cached (path_ids, edge_data) tuples — reused to re-score K-path costs periodically without re-running Yen's
     "algorithm_metrics": {},
     "simulation_summary": None,
     "selected_algorithms": {},
     "latency_algorithm": "full_composite_latency",
     "allocation_algorithm": "traffic_aware_allocation",
     "last_allocation_result": None,
+    "algorithm_comparison": {"status": "idle"},
     "simulation_config": None,   # Stage-1: persisted user config
     "policy_options": None,      # Stage-1: policy options from last applied config
     "custom_policies": {},       # Stage-2: active custom policies keyed by policy_key
@@ -385,6 +394,10 @@ _stop_event = threading.Event()
 _pause_event = threading.Event()  # set=일시정지, clear=실행
 _runtime_probe_cache: dict[str, dict] = {}
 _network_lock = threading.Lock()
+# Phase 2: 시나리오 배치 러너 상태. _state를 공유하는 단일 순차 실행이므로 동시에 하나만
+# 돈다 — _active_batch_id가 None이 아니면 실시간 /api/simulation/start도 막는다(위 참고).
+_batch_runs: dict[str, dict] = {}
+_active_batch_id: Optional[str] = None
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -423,6 +436,7 @@ class SimConfigPolicyOptions(BaseModel):
     prefer_load_balance:  bool  = False
     avoid_disconnection:  bool  = True
     traffic_lambda:       float = 5.0   # background vehicle density (vehicles/km²)
+    other_device_lambda:  float = 300.0 # 차량 외 기기(폰/IoT) 밀도 (기기/km²) — _L_total의 n_vehicles에 가산
     network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
 
 class SimulationConfigModel(BaseModel):
@@ -547,6 +561,7 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         "prefer_load_balance":  bool(pol.prefer_load_balance),
         "avoid_disconnection":  bool(pol.avoid_disconnection),
         "traffic_lambda":       max(0.1, min(float(pol.traffic_lambda), 200.0)),
+        "other_device_lambda":  max(0.0, min(float(pol.other_device_lambda), 2000.0)),
         "network_mode":         pol.network_mode if pol.network_mode in ("4G", "5G", "6G") else "5G",
     }
     _state["simulation_config"] = cfg.model_dump()
@@ -558,6 +573,12 @@ class SimStartRequest(BaseModel):
     use_network_routing: bool = False
     algorithm_config: dict = {}
     simulation_config: Optional[dict] = None  # Stage-1 user config
+    vehicle_count: int = 1  # 타겟 차량 1대 + 배경 차량 (vehicle_count - 1)대
+    seed: Optional[int] = None  # 재현성: 기타기기/배경차량 Poisson 샘플링에 사용. None=비결정적(기존 동작)
+    scenario_id: Optional[str] = None  # 배치 러너(Phase 2)가 simulation_runs에 태깅. 단독 실행 시 None
+    batch_id: Optional[str] = None     # 배치 러너(Phase 2)가 simulation_runs에 태깅. 단독 실행 시 None
+    sheet_id: Optional[str] = None     # 시뮬레이션 탭의 "시트"(Phase 5)가 simulation_runs에 태깅. 시트별로 DB에서 분리 조회 가능
+    sheet_name: Optional[str] = None
 
 
 class CostWeightsRequest(BaseModel):
@@ -585,6 +606,52 @@ class RLEpisodeRequest(BaseModel):
     n_episodes: int = 1
     seed: Optional[int] = None
     record_trajectory: bool = True
+
+
+class ScenarioSpec(BaseModel):
+    """
+    Phase 2: one scenario inside a batch. mode="route_metrics" evaluates the
+    classic routing/allocation pipeline (origin/dest, lat/lng) via
+    _evaluate_mock_route(synchronous=True); mode="rl_episode" runs baseline
+    RL policies (origin_id/dest_id, road-graph node IDs) via run_episode(s) —
+    these two modes use disjoint field sets because the two evaluators take
+    different coordinate spaces (lat/lng vs. graph node ID).
+    """
+    id: Optional[str] = None
+    label: Optional[str] = None
+    mode: str = "route_metrics"  # "route_metrics" | "rl_episode"
+    source: str = "manual"  # "manual" | "llm_generated" | "param_batch" — provenance only, not read by the evaluator
+
+    # route_metrics fields
+    origin: Optional[dict] = None
+    dest: Optional[dict] = None
+    vehicle_count: int = 1
+    algorithm_config: dict = {}
+    simulation_config: Optional[dict] = None
+    origin_node_id: Optional[str] = None  # snap-to-road 결과(있으면) — 평가 로직은 안 읽음, 프런트 표시용
+    dest_node_id: Optional[str] = None
+
+    # rl_episode fields
+    origin_id: Optional[str] = None
+    dest_id: Optional[str] = None
+    policy: str = "greedy"
+    max_steps: int = 200
+    n_episodes: int = 1
+    record_trajectory: bool = True
+
+    seed: Optional[int] = None  # shared by both modes
+
+
+class ScenarioBatchRequest(BaseModel):
+    scenarios: list[ScenarioSpec]
+    label: Optional[str] = None
+
+
+class ScenarioGenerateRequest(BaseModel):
+    description: str           # 자연어로 원하는 시나리오 묶음을 설명 (예: "퇴근시간 혼잡 + 차량수 다양화")
+    count: int = 5
+    seed_base: Optional[int] = None  # 지정 시 생성된 시나리오 i번째의 seed = seed_base + i (재현성)
+    provider: Optional[str] = None   # "vertex" | "azure" | "bedrock" | None=auto
 
 
 class LatencyAlgorithmRequest(BaseModel):
@@ -791,16 +858,82 @@ def load_route_buildings(
     }
 
 
-def _poisson_sample(lam: float) -> int:
-    """Knuth algorithm for Poisson(lam) sampling."""
+def _poisson_sample(lam: float, rng: random.Random = random) -> int:
+    """Knuth algorithm for Poisson(lam) sampling.
+
+    rng : a random.Random instance, or the global `random` module itself
+          (both expose .random() with the same signature). Pass a seeded
+          random.Random(seed) instance for reproducible runs; defaults to
+          the global module to preserve existing non-deterministic callers.
+    """
     if lam <= 0:
         return 0
     L = math.exp(-min(lam, 700.0))
     k, p = 0, 1.0
     while p > L:
         k += 1
-        p *= random.random()
+        p *= rng.random()
     return k - 1
+
+
+def _seed_other_device_load(nodes: list[dict], other_device_lambda: float, rng: random.Random = random) -> None:
+    """차량 외 기기(보행자 폰, 고정 IoT 센서) 부하를 노드별 커버리지 반경 기준
+    Poisson(λ × 면적) 샘플로 추정해 node["n_other_devices"]에 저장한다.
+
+    _L_total의 큐잉 모델(rho = n_vehicles / C_tech)은 원래 차량 수만 분자에 넣었는데,
+    실제로는 같은 기지국 capacity를 폰/IoT 기기도 같이 나눠 쓴다 — 이 함수가 그 항을
+    채워서 analyze_candidates가 "차량 + 기타 기기"를 합산해 더 현실적인 부하를 계산하게 한다.
+    합성 노드(synthetic)뿐 아니라 사용자가 직접 배치한 기지국(user_created)에도 동일하게
+    적용된다. 보행자/IoT는 이 시뮬레이션에서 개별 위치를 추적하지 않으므로, 배경 차량처럼
+    매 틱 갱신하지 않고 시뮬레이션 시작 시 1회만 추정해 런 전체에서 고정값으로 둔다.
+    """
+    for node in nodes:
+        radius_m = float(node.get("coverage_radius_m") or 400.0)
+        area_km2 = math.pi * (radius_m / 1000.0) ** 2
+        node["n_other_devices"] = _poisson_sample(other_device_lambda * area_km2, rng)
+
+
+def _seed_its_congestion_load(nodes: list[dict]) -> None:
+    """동기화된 실시간 ITS 교통량(/traffic/sync-its)을 기지국별 부하로 환산해
+    node["n_its_load"]에 저장한다.
+
+    기존에는 ITS congestion_score가 mock 모드 배경 차량의 출발/도착지 샘플링 가중치로만
+    쓰였고 latency 큐잉 모델(_L_total)에는 전혀 반영되지 않았다 — 이 함수가 그 간극을
+    메운다. 각 노드의 coverage_radius_m 반경 안에 들어오는 ITS 링크 geometry 포인트들의
+    congestion_score(0~1) 중 최댓값을 그 노드의 혼잡도로 보고, "혼잡도 1.0 = 모델에 안
+    잡히는 차량/기기 최대 50대 상당이 추가로 깔려있다"는 가정으로 결정론적 가산 부하를
+    만든다. ITS는 Poisson이 아니라 실측값이므로 시뮬레이션 시작 시 1회만 계산하고 런
+    내내 고정 — _seed_other_device_load와 같은 설계 철학.
+    ITS가 동기화되지 않은 상태(링크 없음)에서는 n_its_load=0으로 기존 동작과 동일하다.
+    """
+    try:
+        traffic = TRAFFIC_FUSION_ENGINE.current_traffic()
+    except Exception:
+        traffic = {}
+    links = traffic.get("links") or []
+    hot_points = [
+        (pt.get("lat"), pt.get("lng"), float(link.get("congestion_score") or 0.0))
+        for link in links
+        if link.get("congestion_score") and link.get("geometry")
+        for pt in link["geometry"]
+    ]
+    for node in nodes:
+        node["its_congestion_score"] = 0.0
+        node["n_its_load"] = 0
+        if not hot_points:
+            continue
+        radius_m = float(node.get("coverage_radius_m") or 400.0)
+        nlat, nlng = node.get("lat"), node.get("lng")
+        if nlat is None or nlng is None:
+            continue
+        best_score = 0.0
+        for hlat, hlng, score in hot_points:
+            if hlat is None or hlng is None:
+                continue
+            if haversine_m(nlat, nlng, hlat, hlng) <= radius_m:
+                best_score = max(best_score, score)
+        node["its_congestion_score"] = round(best_score, 3)
+        node["n_its_load"] = round(best_score * 50)
 
 
 def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5.0) -> list[dict]:
@@ -944,6 +1077,29 @@ def _get_ego_allocated_rb(connected_node: Optional[dict]) -> Optional[float]:
     return None
 
 
+def _refresh_realtime_bs_vehicle_counts(nodes: list[dict]) -> None:
+    """다중차량 실험군 — 배경 차량이 있으면 각 차량을 _find_best_bs_light로 정확히 하나의
+    기지국에 배정해서(커버리지 중첩 구간 중복 집계 방지) 실시간 연결 차량 수를
+    node["n_background_vehicles"]에 덮어쓴다. route-cost 평가에서 쓰는 것과 동일한
+    기지국 선택 알고리즘(_active_bs_selection)을 그대로 재사용한다.
+
+    배경 차량이 없으면(vehicle_count=1) 아무것도 하지 않아 구역 설정 시 뽑힌 정적
+    Poisson 샘플값이 그대로 유지된다 — 기존 동작과 100% 동일.
+    """
+    bg = _state.get("background_vehicles")
+    if not bg:
+        return
+    counts: dict[str, int] = {}
+    for v in bg:
+        node, *_ = _find_best_bs_light(v["lat"], v["lng"], nodes)
+        if node is not None:
+            nid = str(node.get("id") or node.get("name") or "")
+            counts[nid] = counts.get(nid, 0) + 1
+    for node in nodes:
+        nid = str(node.get("id") or node.get("name") or "")
+        node["n_background_vehicles"] = counts.get(nid, 0)
+
+
 def update_network_telemetry(vehicle_pos: dict | None) -> None:
     if not vehicle_pos:
         _state["network_telemetry"] = None
@@ -952,6 +1108,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
     if not nodes:
         _state["network_telemetry"] = None
         return
+    _refresh_realtime_bs_vehicle_counts(nodes)
     buildings_gdf = _state.get("route_buildings")
     route_coords = _state.get("route_coords") or []
     density_penalty = round(max(len(route_coords) / 120.0, 1.0), 2)
@@ -971,6 +1128,19 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
     best = candidates[0]
     selected_node = best["node"]
     selected_name = selected_node.get("name") or selected_node["id"]
+
+    def _live_congestion(node: dict) -> float:
+        """
+        실시간 BS 혼잡도 = 현재 할당된 load / capacity. 정적인 congestion_score/
+        congestion_penalty 필드(구역 설정 시 1회 Poisson 샘플, 이후 갱신 안 됨) 대신
+        _run_resource_allocation()이 매 주기 갱신하는 node["load"]를 직접 반영해
+        실시간으로 변하는 값을 보여준다. DB에서 로드된 실제 기지국(load/capacity 필드가
+        없을 수 있음)에도 동일하게 동작 — capacity 기본값 100.0.
+        """
+        cap = float(node.get("capacity") or 100.0)
+        load = float(node.get("load") or 0.0)
+        return round(min(1.0, load / max(cap, 1.0)), 4)
+
     _state["network_telemetry"] = {
         "connected_node": {
             "id": selected_node["id"],
@@ -978,7 +1148,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
             "type": selected_node["type"],
             "lat": selected_node["lat"],
             "lng": selected_node["lng"],
-            "congestion_score": selected_node.get("congestion_score", selected_node.get("congestion_penalty", 0.0)),
+            "congestion_score": _live_congestion(selected_node),
         },
         "network_nodes": [
             {
@@ -988,7 +1158,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
                 "lat": node["lat"],
                 "lng": node["lng"],
                 "source": node.get("source", "synthetic"),
-                "congestion_score": node.get("congestion_score", node.get("congestion_penalty", 0.0)),
+                "congestion_score": _live_congestion(node),
                 "load": node.get("load", 0.0),
                 "antenna_height_m": node.get("antenna_height_m"),
                 "antenna_placement": node.get("antenna_placement"),
@@ -1021,7 +1191,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
                 "node_score": item["node_score"],
                 "distance_m": item["distance_m"],
                 "confidence": item["confidence"],
-                "congestion_score": item["node"].get("congestion_score", item["node"].get("congestion_penalty", 0.0)),
+                "congestion_score": _live_congestion(item["node"]),
             }
             for item in candidates[:3]
         ],
@@ -1033,6 +1203,9 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         "latency_ms": best["predicted_latency_ms"],
         "stability_score": best["stability_score"],
         "vehicle_density_penalty_ms": density_penalty,
+        "l_base_ms": best["l_base_ms"],
+        "l_signal_ms": best["l_signal_ms"],
+        "l_queue_ms": best["l_queue_ms"],
         "connection_line": [
             {"lat": vehicle_pos["lat"], "lng": vehicle_pos["lng"]},
             {"lat": selected_node["lat"], "lng": selected_node["lng"]},
@@ -1278,6 +1451,80 @@ def mock_route_coords(graph: dict, path: list[str]) -> list[list[float]]:
     return [[graph["nodes"][node_id]["lat"], graph["nodes"][node_id]["lng"]] for node_id in path]
 
 
+def _generate_background_vehicles(graph: dict, bbox: dict, count: int, rng: random.Random = random) -> list[dict]:
+    """다중차량 실험군 — bbox 안에서 무작위 출발/도착으로 배경 차량 `count`대의 경로를 생성한다.
+
+    ITS 실시간 교통 동기화 데이터(`/traffic/sync-its`)가 해당 구역에 있으면 혼잡 도로
+    근처 노드를 더 자주 출발/도착지로 뽑도록 가중치를 주고, 없으면 균등 무작위로 폴백한다.
+    시뮬레이션 시작 시 1회만 호출되므로 N=1000이어도 매 틱 비용은 없다.
+
+    rng : random.Random(seed) 인스턴스를 넘기면 재현 가능, 기본값(전역 random 모듈)이면
+          기존과 동일한 비결정적 동작.
+    """
+    if count <= 0:
+        return []
+
+    nodes = graph.get("nodes", {})
+    candidate_ids = [
+        nid for nid, d in nodes.items()
+        if bbox["s"] <= d["lat"] <= bbox["n"] and bbox["w"] <= d["lng"] <= bbox["e"]
+    ]
+    if len(candidate_ids) < 2:
+        return []
+
+    weights = None
+    try:
+        traffic = TRAFFIC_FUSION_ENGINE.current_traffic()
+        hot_points = [
+            (pt.get("lat"), pt.get("lng"), float(link.get("congestion_score") or 0.0))
+            for link in (traffic.get("links") or [])
+            if link.get("congestion_score") and link.get("geometry")
+            for pt in link["geometry"]
+        ]
+    except Exception:
+        hot_points = []
+
+    if hot_points:
+        weights = []
+        for nid in candidate_ids:
+            nlat, nlng = nodes[nid]["lat"], nodes[nid]["lng"]
+            best_score = 0.0
+            for hlat, hlng, score in hot_points:
+                if hlat is None or hlng is None:
+                    continue
+                if haversine_m(nlat, nlng, hlat, hlng) <= 150.0:
+                    best_score = max(best_score, score)
+            weights.append(1.0 + best_score * 4.0)
+
+    background_vehicles: list[dict] = []
+    attempts = 0
+    max_attempts = count * 4
+    while len(background_vehicles) < count and attempts < max_attempts:
+        attempts += 1
+        if weights:
+            a, b = rng.choices(candidate_ids, weights=weights, k=2)
+        else:
+            a, b = rng.sample(candidate_ids, 2)
+        if a == b:
+            continue
+        try:
+            path = shortest_mock_path(graph, a, b)
+        except RuntimeError:
+            continue
+        if len(path) < 2:
+            continue
+        coords = mock_route_coords(graph, path)
+        background_vehicles.append({
+            "id": f"bg{len(background_vehicles)}",
+            "route_coords": coords,
+            "progress": 0.0,
+            "lat": coords[0][0],
+            "lng": coords[0][1],
+            "speed_kmh": round(rng.uniform(25.0, 50.0), 1),
+        })
+    return background_vehicles
+
+
 # ── Route cost helpers ────────────────────────────────────────────────────────
 def build_sumo_edge_data(net, edges: list[str]) -> list[dict]:
     """Extract midpoint, length, and travel_time from sumolib edges."""
@@ -1390,6 +1637,7 @@ def _run_resource_allocation(
     origin: dict,
     raw_k_paths: Optional[list],
     algo_id: str,
+    background_vehicles: Optional[list] = None,
 ) -> Optional[Any]:
     """
     Run resource allocation and apply results to _state["network_nodes"] in-place.
@@ -1399,6 +1647,9 @@ def _run_resource_allocation(
       P3 — called BEFORE path selection so Dijkstra/K-path uses updated loads
       P4 — runs look_ahead_bs_scan from path start node and passes result to
             build_resource_demand_map so lookahead_resource_allocation works correctly
+
+    `background_vehicles` (다중차량 실험군) are folded into the vehicle list so the
+    allocation reflects the full fleet's demand, not just the target vehicle.
 
     Returns AllocationOutput object, or None if allocation is unavailable/failed.
     """
@@ -1413,6 +1664,12 @@ def _run_resource_allocation(
 
     # P1: use origin as initial vehicle (vehicle_pos is None at simulation start)
     vehicles = [{"lat": float(origin["lat"]), "lng": float(origin["lng"]), "speed_mps": 0.0}]
+    for bv in (background_vehicles or []):
+        vehicles.append({
+            "lat": float(bv["lat"]),
+            "lng": float(bv["lng"]),
+            "speed_mps": round(bv.get("speed_kmh", 30.0) / 3.6, 2),
+        })
 
     # Simple path candidates for demand estimation (no KPathCandidate needed here)
     from types import SimpleNamespace
@@ -1496,6 +1753,120 @@ def _run_resource_allocation(
         return None
 
 
+def _run_algorithm_comparison() -> None:
+    """
+    Re-evaluate the already-computed route under every latency algorithm,
+    every BS-selection algorithm, and every resource-allocation algorithm —
+    so the Comparison tab can show how DIFFERENT algorithm *settings* perform
+    on the same route, instead of only comparing K-path route alternatives.
+
+    Route-finding (dijkstra vs astar) is intentionally NOT included: A* has no
+    SUMO-mode implementation, so it would just duplicate the dijkstra path.
+
+    Runs in a background thread (mirrors the existing _bg_cost_eval pattern)
+    since each evaluate_path() re-run repeats the building-intersection
+    analysis and can take several seconds.
+    """
+    edge_data = _state.get("route_cost_edge_data")
+    nodes = _state.get("network_nodes") or []
+    if not edge_data or not nodes or not ROUTE_COST_AVAILABLE:
+        _state["algorithm_comparison"] = {
+            "status": "error",
+            "reason": "시뮬레이션을 먼저 실행하세요.",
+        }
+        return
+
+    buildings = _state.get("route_buildings")
+
+    # Resource-allocation sweep mutates _state["last_allocation_result"] /
+    # ["allocation_algorithm"] / network_nodes[].load on every call — snapshot
+    # the algorithm so we can restore live state afterwards (finally block).
+    _prev_alloc_algo = _state.get("allocation_algorithm") or "traffic_aware_allocation"
+
+    _state["algorithm_comparison"] = {
+        "status": "running",
+        "by_latency": {},
+        "by_bs_selection": {},
+        "by_allocation": {},
+    }
+
+    try:
+        for meta in LATENCY_REGISTRY.list_algorithms():
+            algo_id = meta["id"]
+            try:
+                result = evaluate_path(
+                    edge_data, nodes, buildings,
+                    _route_cost_weights, _norm_scales,
+                    latency_algorithm_id=algo_id,
+                )
+                _state["algorithm_comparison"]["by_latency"][algo_id] = {
+                    "avg_latency_ms": result.avg_latency_ms,
+                    "max_latency_ms": result.max_latency_ms,
+                    "total_cost": result.total_cost,
+                    "handover_count": result.handover_count,
+                    "coverage_risk": result.coverage_risk,
+                }
+            except Exception as exc:
+                print(f"[CMP] latency algo {algo_id} failed: {exc}", flush=True)
+
+        for algo_id in ("lowest_latency_bs", "nearest_bs", "load_balanced_bs"):
+            try:
+                result = evaluate_path(
+                    edge_data, nodes, buildings,
+                    _route_cost_weights, _norm_scales,
+                    bs_selection_algo=algo_id,
+                )
+                _state["algorithm_comparison"]["by_bs_selection"][algo_id] = {
+                    "avg_latency_ms": result.avg_latency_ms,
+                    "total_cost": result.total_cost,
+                    "handover_count": result.handover_count,
+                    "coverage_risk": result.coverage_risk,
+                }
+            except Exception as exc:
+                print(f"[CMP] bs-selection algo {algo_id} failed: {exc}", flush=True)
+
+        if RESOURCE_DEMAND_AVAILABLE:
+            _live_origin = _state.get("vehicle_pos")
+            _bg_vehicles = _state.get("background_vehicles")
+            _alias_ids = {"proportional_allocation", "custom_allocation_algorithm"}
+            if _live_origin and _live_origin.get("lat") is not None:
+                for meta in ALLOCATION_REGISTRY.list_algorithms():
+                    algo_id = meta["id"]
+                    if algo_id in _alias_ids:
+                        continue
+                    try:
+                        alloc_out = _run_resource_allocation(
+                            _live_origin, [], algo_id, _bg_vehicles,
+                        )
+                        if alloc_out:
+                            ar = alloc_out.allocation_result
+                            _state["algorithm_comparison"]["by_allocation"][algo_id] = {
+                                "total_utilization": ar.get("total_utilization", 0.0),
+                                "overloaded_bs_count": ar.get("overloaded_bs_count", 0),
+                                "total_deficit_rb": ar.get("total_deficit_rb", 0.0),
+                            }
+                    except Exception as exc:
+                        print(f"[CMP] allocation algo {algo_id} failed: {exc}", flush=True)
+
+        _state["algorithm_comparison"]["status"] = "done"
+        _state["algorithm_comparison"]["generated_at"] = time.time()
+    except Exception as exc:
+        print(f"[CMP] algorithm comparison failed: {exc}", flush=True)
+        _state["algorithm_comparison"] = {"status": "error", "reason": str(exc)}
+    finally:
+        # Restore live resource-allocation state to the user's actual config —
+        # the sweep above left it pointing at whichever algorithm ran last.
+        if RESOURCE_DEMAND_AVAILABLE:
+            _live_origin = _state.get("vehicle_pos")
+            if _live_origin and _live_origin.get("lat") is not None:
+                try:
+                    _run_resource_allocation(
+                        _live_origin, [], _prev_alloc_algo, _state.get("background_vehicles"),
+                    )
+                except Exception as exc:
+                    print(f"[CMP] failed to restore allocation state: {exc}", flush=True)
+
+
 def _store_route_cost(edge_data: list[dict], routing_mode: str) -> None:
     """Evaluate the selected route with full network cost and persist to _state."""
     import time as _time
@@ -1513,7 +1884,14 @@ def _store_route_cost(edge_data: list[dict], routing_mode: str) -> None:
         exec_ms = (_time.perf_counter() - _t0) * 1000.0
 
         _state["route_cost_result"] = _path_cost_to_dict(result, routing_mode)
+        _state["route_cost_result"]["street_names"] = _resolve_path_street_names(
+            [e.edge_id for e in result.edge_results]
+        )
         _state["route_cost_version"] = _state.get("route_cost_version", 0) + 1
+        # route_cost_result["per_edge"] is the OUTPUT shape (EdgeCostResult fields) and is
+        # missing travel_time_s, so the algorithm-comparison sweep needs the raw INPUT
+        # edge_data (with travel_time_s) cached separately to re-run evaluate_path().
+        _state["route_cost_edge_data"] = edge_data
 
         if ROUTE_METRICS_AVAILABLE:
             try:
@@ -1531,6 +1909,54 @@ def _store_route_cost(edge_data: list[dict], routing_mode: str) -> None:
         _store_simulation_summary()
     except Exception as exc:
         print(f"[COST] Route evaluation failed: {exc}", flush=True)
+
+
+def _resolve_path_street_names(edge_ids: list[str]) -> list[str]:
+    """
+    Resolve a deduplicated, ordered street-name sequence for any edge-id path (the
+    main driven route or a K-path candidate), so the comparison UI can show *which
+    road* each algorithm/rank actually represents instead of an opaque label. Reuses
+    the main route's name map first (K-path alternates share most edges with the
+    selected route via Yen's algorithm), then falls back to the same OSM-way/mock-way
+    lookups the main route uses, with forward/backward name propagation for edges that
+    resolve to nothing — same approach as the Report tab's structured summary
+    (_fill_edge_names in simulation_summary.py).
+    """
+    from types import SimpleNamespace
+    from app.services.analysis.simulation_summary import _fill_edge_names
+
+    raw_names: dict[str, str] = dict(_state.get("route_edge_names") or {})
+    missing = [eid for eid in edge_ids if eid not in raw_names]
+
+    if missing:
+        if _state.get("sim_mode") == "mock":
+            way_names = (_state.get("mock_graph") or {}).get("way_names", {})
+            for eid in missing:
+                parts = eid.split("_")
+                if len(parts) == 2:
+                    name = way_names.get((parts[0], parts[1])) or way_names.get((parts[1], parts[0]))
+                    if name:
+                        raw_names[eid] = name
+        else:
+            osm_file = _state.get("osm_file")
+            if osm_file:
+                try:
+                    osm_names = load_osm_way_names(Path(osm_file))
+                    for eid in missing:
+                        name = osm_names.get(sumo_edge_to_way_id(eid))
+                        if name:
+                            raw_names[eid] = name
+                except Exception:
+                    pass
+
+    filled = _fill_edge_names([SimpleNamespace(edge_id=eid) for eid in edge_ids], raw_names)
+
+    ordered: list[str] = []
+    for eid in edge_ids:
+        name = filled.get(eid) or eid
+        if not ordered or ordered[-1] != name:
+            ordered.append(name)
+    return ordered
 
 
 def _store_k_candidates(
@@ -1551,6 +1977,9 @@ def _store_k_candidates(
     nodes = _state.get("network_nodes") or []
     if not k_edge_data or not nodes or not ROUTE_COST_AVAILABLE:
         return []
+    # Cache so the periodic allocation-refresh loop can re-score these same K-paths
+    # under updated load/congestion without re-running Yen's K-shortest-paths search.
+    _state["k_path_edge_data"] = k_edge_data
     try:
         _t0 = _time.perf_counter()
         k_results = evaluate_k_candidates(
@@ -1607,6 +2036,9 @@ def _store_k_candidates(
                     "selected_bs_sequence":     r.selected_bs_sequence,
                     "resource_deficit_cost":    r.resource_deficit_cost,
                     "expected_latency_impact":  r.expected_latency_impact,
+                    "street_names": _resolve_path_street_names(
+                        [e.edge_id for e in (r.path_cost_result.edge_results if r.path_cost_result else [])]
+                    ),
                     "per_edge": [
                         {
                             "edge_id":         e.edge_id,
@@ -1644,6 +2076,26 @@ def _store_k_candidates(
     except Exception as exc:
         print(f"[COST] K-path evaluation failed: {exc}", flush=True)
         return []
+
+
+_k_refresh_running = threading.Lock()
+
+
+def _refresh_k_candidates_async(allocation_output: Optional[dict]) -> None:
+    """
+    Periodic (~2s) background re-score of the cached K-path candidates under the
+    latest allocation output, so "경로 대안 비교" doesn't stay frozen at simulation-
+    start costs for the whole run. Skips if a previous refresh is still running
+    (full re-score includes building-intersection analysis and can take longer than
+    one 2s cycle) rather than letting threads pile up out of order.
+    """
+    edge_data = _state.get("k_path_edge_data")
+    if not edge_data or not _k_refresh_running.acquire(blocking=False):
+        return
+    try:
+        _store_k_candidates(edge_data, allocation_output=allocation_output)
+    finally:
+        _k_refresh_running.release()
 
 
 # ── Yen's K-shortest paths ────────────────────────────────────────────────────
@@ -1780,7 +2232,7 @@ def _dijkstra_blocked_sumo(
             cur_edge = net.getEdge(cur_id)
         except Exception:
             continue
-        for nxt_edge in cur_edge.getToNode().getOutgoing():
+        for nxt_edge in cur_edge.getOutgoing().keys():
             nxt_id = nxt_edge.getID()
             if nxt_id.startswith(":"):
                 continue
@@ -1881,6 +2333,78 @@ def build_mock_k_edge_data(
     return [(path, build_mock_edge_data(graph, path)) for path in paths]
 
 
+def astar_sumo_path(net, from_edge: str, to_edge: str) -> list[str]:
+    """
+    A* search on the sumolib edge graph using a Haversine heuristic.
+    'Nodes' in this graph are sumolib edge IDs (see _dijkstra_blocked_sumo).
+    Cost is distance-only — the same metric as baseline Dijkstra — so this is a
+    different *search strategy* reaching an equivalent-or-better distance-shortest
+    path, mirroring astar_mock_path's role in the mock-graph mode.
+    """
+    try:
+        end_edge_obj = net.getEdge(to_edge)
+        end_shape = end_edge_obj.getShape()
+        end_mx = sum(p[0] for p in end_shape) / len(end_shape)
+        end_my = sum(p[1] for p in end_shape) / len(end_shape)
+        end_lon, end_lat = net.convertXY2LonLat(end_mx, end_my)
+    except Exception:
+        raise RuntimeError("A*(SUMO): 도착 엣지를 찾을 수 없습니다.")
+
+    heuristic_cache: dict[str, float] = {}
+
+    def h(edge_id: str) -> float:
+        if edge_id in heuristic_cache:
+            return heuristic_cache[edge_id]
+        try:
+            e = net.getEdge(edge_id)
+            shape = e.getShape()
+            mx = sum(p[0] for p in shape) / len(shape)
+            my = sum(p[1] for p in shape) / len(shape)
+            lon, lat = net.convertXY2LonLat(mx, my)
+            val = haversine_m(lat, lon, end_lat, end_lon)
+        except Exception:
+            val = 0.0
+        heuristic_cache[edge_id] = val
+        return val
+
+    open_set: list[tuple[float, float, str]] = [(h(from_edge), 0.0, from_edge)]
+    g_score: dict[str, float] = {from_edge: 0.0}
+    prev: dict[str, Optional[str]] = {from_edge: None}
+    seen: set[str] = set()
+
+    while open_set:
+        _, g, current = heappop(open_set)
+        if current in seen:
+            continue
+        seen.add(current)
+        if current == to_edge:
+            break
+        try:
+            cur_edge = net.getEdge(current)
+        except Exception:
+            continue
+        for nxt_edge in cur_edge.getOutgoing().keys():
+            nxt_id = nxt_edge.getID()
+            if nxt_id.startswith(":"):
+                continue
+            ng = g + nxt_edge.getLength()
+            if ng < g_score.get(nxt_id, float("inf")):
+                g_score[nxt_id] = ng
+                prev[nxt_id] = current
+                heappush(open_set, (ng + h(nxt_id), ng, nxt_id))
+
+    if to_edge not in prev:
+        raise RuntimeError(f"A*(SUMO): 경로를 찾을 수 없습니다: {from_edge} → {to_edge}")
+
+    path: list[str] = []
+    cur: Optional[str] = to_edge
+    while cur is not None:
+        path.append(cur)
+        cur = prev.get(cur)
+    path.reverse()
+    return path
+
+
 def network_weighted_sumo_path(
     net,
     from_edge: str,
@@ -1946,7 +2470,7 @@ def network_weighted_sumo_path(
         except Exception:
             continue
         _, cur_bn = _edge_cost(cur_id)
-        for next_edge_obj in cur_edge_obj.getToNode().getOutgoing():
+        for next_edge_obj in cur_edge_obj.getOutgoing().keys():
             next_id = next_edge_obj.getID()
             if next_id.startswith(":"):
                 continue
@@ -2044,6 +2568,287 @@ def network_weighted_mock_path(
     return path
 
 
+def best_of_k_path(
+    k_edge_data: list[tuple[list[str], list[dict]]],
+    nodes: list[dict],
+    weights: "CostWeights",
+) -> Optional[list[str]]:
+    """
+    Pick the lowest full-network-cost candidate among Yen's K topologically-shortest
+    paths. This IS the "k_shortest_path" routing algorithm: an approximation of
+    network-cost-optimal routing that re-scores only the K cheapest-by-distance
+    alternatives instead of searching the full cost-weighted graph (compare with
+    network_weighted_sumo_path/network_weighted_mock_path, which search exactly).
+    """
+    if not k_edge_data or not ROUTE_COST_AVAILABLE:
+        return None
+    best_path: Optional[list[str]] = None
+    best_cost = float("inf")
+    for path_ids, edge_data in k_edge_data:
+        if not edge_data:
+            continue
+        try:
+            result = evaluate_path(edge_data, nodes, weights=weights, norm_scales=_norm_scales)
+        except Exception:
+            continue
+        if result.total_cost < best_cost:
+            best_cost = result.total_cost
+            best_path = path_ids
+    return best_path
+
+
+def _build_sumo_road_graph_view(net) -> tuple[dict, dict]:
+    """
+    Translate the sumolib net into the {road_nodes, adjacency} shape that
+    look_ahead_bs_scan() expects — the same shape the mock graph already uses
+    natively. Cheap to build (single pass over nodes/edges); call once per route
+    and reuse, not once per Dijkstra expansion.
+    """
+    road_nodes: dict[str, dict] = {}
+    for node in net.getNodes():
+        try:
+            x, y = node.getCoord()
+            lon, lat = net.convertXY2LonLat(x, y)
+            road_nodes[node.getID()] = {"lat": lat, "lng": lon}
+        except Exception:
+            continue
+
+    adjacency: dict[str, list[tuple]] = {}
+    for edge in net.getEdges():
+        eid = edge.getID()
+        if eid.startswith(":"):
+            continue
+        try:
+            from_id = edge.getFromNode().getID()
+            to_id = edge.getToNode().getID()
+            length_m = edge.getLength()
+            lanes = edge.getLanes()
+            speed_mps = lanes[0].getSpeed() if lanes else 13.89
+            adjacency.setdefault(from_id, []).append((to_id, eid, length_m, speed_mps))
+        except Exception:
+            continue
+    return road_nodes, adjacency
+
+
+LOOKAHEAD_PENALTY = 2.0  # cost multiplier weight for look-ahead coverage risk
+
+
+def _lookahead_risk_by_edge(
+    start_node_id: Optional[str],
+    road_nodes: dict,
+    adjacency: dict,
+    bs_nodes: list[dict],
+    lookahead_hops: int,
+) -> dict[str, float]:
+    """
+    Run look_ahead_bs_scan() once from the route's starting node and convert its
+    per-hop uncovered-edge lists into a per-edge risk score (0-1, nearer hops
+    weighted higher — same "near hops matter more" convention the scan itself uses)
+    usable as a Dijkstra edge-cost multiplier.
+    """
+    if not start_node_id:
+        return {}
+    try:
+        from app.services.routing.look_ahead_scan import look_ahead_bs_scan
+    except ImportError:
+        return {}
+    try:
+        result = look_ahead_bs_scan(
+            start_node_id, {"adjacency": adjacency}, road_nodes, bs_nodes, lookahead_hops,
+        )
+    except Exception:
+        return {}
+    risk: dict[str, float] = {}
+    n = len(result.per_hop)
+    for i, hop_scan in enumerate(result.per_hop):
+        weight = (n - i) / n if n else 0.0
+        for edge_id in hop_scan.uncovered_edge_ids:
+            risk[edge_id] = max(risk.get(edge_id, 0.0), weight)
+    return risk
+
+
+def lookahead_weighted_sumo_path(
+    net,
+    from_edge: str,
+    to_edge: str,
+    nodes: list[dict],
+    weights: "CostWeights",
+    lookahead_hops: int = 3,
+) -> list[str]:
+    """
+    Network-cost-weighted Dijkstra (same base cost as network_weighted_sumo_path)
+    with an added BFS look-ahead coverage-risk penalty: edges that look_ahead_bs_scan()
+    predicts will be uncovered within the next `lookahead_hops` hops cost more, so the
+    router prefers paths that route around soon-to-be-uncovered segments.
+    """
+    road_nodes, adjacency = _build_sumo_road_graph_view(net)
+    try:
+        start_node_id = net.getEdge(from_edge).getFromNode().getID()
+    except Exception:
+        start_node_id = None
+    risk_by_edge = _lookahead_risk_by_edge(start_node_id, road_nodes, adjacency, nodes, lookahead_hops)
+
+    edge_cost_cache: dict[str, tuple[float, Optional[str]]] = {}
+
+    def _edge_cost(edge_id: str) -> tuple[float, Optional[str]]:
+        if edge_id in edge_cost_cache:
+            return edge_cost_cache[edge_id]
+        try:
+            e = net.getEdge(edge_id)
+            shape = e.getShape()
+            if not shape:
+                edge_cost_cache[edge_id] = (1.0, None)
+                return (1.0, None)
+            mid_x = sum(p[0] for p in shape) / len(shape)
+            mid_y = sum(p[1] for p in shape) / len(shape)
+            lon, lat = net.convertXY2LonLat(mid_x, mid_y)
+            length_m = e.getLength()
+            lanes = e.getLanes()
+            speed_mps = lanes[0].getSpeed() if lanes else 13.89
+            r = compute_edge_network_cost(
+                edge_id=edge_id,
+                midpoint_lat=lat,
+                midpoint_lng=lon,
+                distance_m=length_m,
+                travel_time_s=length_m / max(speed_mps, 0.1),
+                nodes=nodes,
+                buildings_gdf=None,
+                prev_best_node_id=None,
+                weights=weights,
+                norm_scales=_norm_scales,
+                skip_buildings=True,
+            )
+            base_cost = r.total_cost * (1.0 + LOOKAHEAD_PENALTY * risk_by_edge.get(edge_id, 0.0))
+            val: tuple[float, Optional[str]] = (base_cost, r.best_node_id)
+        except Exception:
+            val = (1.0, None)
+        edge_cost_cache[edge_id] = val
+        return val
+
+    pq: list[tuple[float, str, Optional[str]]] = [(0.0, from_edge, None)]
+    cost_map: dict[str, float] = {from_edge: 0.0}
+    prev_edge: dict[str, Optional[str]] = {from_edge: None}
+
+    while pq:
+        cost, cur_id, cur_best_node = heappop(pq)
+        if cur_id == to_edge:
+            break
+        if cost > cost_map.get(cur_id, float("inf")) + 1e-9:
+            continue
+        try:
+            cur_edge_obj = net.getEdge(cur_id)
+        except Exception:
+            continue
+        _, cur_bn = _edge_cost(cur_id)
+        for next_edge_obj in cur_edge_obj.getOutgoing().keys():
+            next_id = next_edge_obj.getID()
+            if next_id.startswith(":"):
+                continue
+            base_cost, next_bn = _edge_cost(next_id)
+            handover_extra = (
+                weights.w_handover
+                if (cur_bn and next_bn and cur_bn != next_bn)
+                else 0.0
+            )
+            new_cost = cost + base_cost + handover_extra
+            if new_cost < cost_map.get(next_id, float("inf")):
+                cost_map[next_id] = new_cost
+                prev_edge[next_id] = cur_id
+                heappush(pq, (new_cost, next_id, cur_bn))
+
+    if to_edge not in prev_edge:
+        raise RuntimeError(f"Look-ahead 가중치 경로를 찾을 수 없습니다: {from_edge} → {to_edge}")
+
+    path: list[str] = []
+    cur: Optional[str] = to_edge
+    while cur is not None:
+        path.append(cur)
+        cur = prev_edge.get(cur)
+    path.reverse()
+    return path
+
+
+def lookahead_weighted_mock_path(
+    graph: dict,
+    start_id: str,
+    end_id: str,
+    nodes: list[dict],
+    weights: "CostWeights",
+    lookahead_hops: int = 3,
+) -> list[str]:
+    """
+    Mock-graph counterpart of lookahead_weighted_sumo_path. No graph-view
+    translation is needed — graph["adjacency"] is already in the shape
+    look_ahead_bs_scan() expects.
+    """
+    risk_by_edge = _lookahead_risk_by_edge(
+        start_id, graph["nodes"], graph["adjacency"], nodes, lookahead_hops,
+    )
+
+    edge_cost_cache: dict[tuple[str, str], tuple[float, Optional[str]]] = {}
+
+    def _edge_cost(a_id: str, b_id: str, dist_m: float) -> tuple[float, Optional[str]]:
+        key = (a_id, b_id)
+        if key in edge_cost_cache:
+            return edge_cost_cache[key]
+        a = graph["nodes"].get(a_id)
+        b = graph["nodes"].get(b_id)
+        mid_lat = (a["lat"] + b["lat"]) / 2 if (a and b) else 0.0
+        mid_lng = (a["lng"] + b["lng"]) / 2 if (a and b) else 0.0
+        edge_id = f"{a_id}_{b_id}"
+        r = compute_edge_network_cost(
+            edge_id=edge_id,
+            midpoint_lat=mid_lat,
+            midpoint_lng=mid_lng,
+            distance_m=dist_m,
+            travel_time_s=dist_m / 9.0,
+            nodes=nodes,
+            buildings_gdf=None,
+            prev_best_node_id=None,
+            weights=weights,
+            norm_scales=_norm_scales,
+            skip_buildings=True,
+        )
+        base_cost = r.total_cost * (1.0 + LOOKAHEAD_PENALTY * risk_by_edge.get(edge_id, 0.0))
+        val: tuple[float, Optional[str]] = (base_cost, r.best_node_id)
+        edge_cost_cache[key] = val
+        return val
+
+    pq: list[tuple[float, str, Optional[str]]] = [(0.0, start_id, None)]
+    cost_map: dict[str, float] = {start_id: 0.0}
+    prev_node: dict[str, Optional[str]] = {start_id: None}
+
+    while pq:
+        cost, node_id, cur_best = heappop(pq)
+        if node_id == end_id:
+            break
+        if cost > cost_map.get(node_id, float("inf")) + 1e-9:
+            continue
+        for nxt, dist in graph["adjacency"].get(node_id, []):
+            ec, next_best = _edge_cost(node_id, nxt, dist)
+            handover_extra = (
+                weights.w_handover
+                if (cur_best and next_best and cur_best != next_best)
+                else 0.0
+            )
+            new_cost = cost + ec + handover_extra
+            if new_cost < cost_map.get(nxt, float("inf")):
+                cost_map[nxt] = new_cost
+                prev_node[nxt] = node_id
+                heappush(pq, (new_cost, nxt, next_best))
+
+    if end_id not in prev_node:
+        raise RuntimeError("Look-ahead 가중치 mock 경로를 찾을 수 없습니다.")
+
+    path: list[str] = []
+    cur: Optional[str] = end_id
+    while cur is not None:
+        path.append(cur)
+        cur = prev_node.get(cur)
+    path.reverse()
+    return path
+
+
 def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.Event):
     global _state
     if len(route_coords) < 2:
@@ -2063,6 +2868,25 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
     step = 0
     _mock_spd_acc: dict[str, list] = {}
     _mock_prev_cur = -1
+
+    # 다중차량 실험군 — 배경 차량별 진행 상태 (자기 route_coords를 따라 단순 선형보간만 수행)
+    _bg_state = []
+    for bv in (_state.get("background_vehicles") or []):
+        bv_coords = bv["route_coords"]
+        bv_seg_lengths = []
+        bv_total = 0.0
+        for a, b in zip(bv_coords, bv_coords[1:]):
+            d = haversine_m(a[0], a[1], b[0], b[1])
+            bv_seg_lengths.append(d)
+            bv_total += d
+        _bg_state.append({
+            "vehicle": bv,
+            "coords": bv_coords,
+            "seg_lengths": bv_seg_lengths,
+            "total_dist": bv_total,
+            "travelled": 0.0,
+            "speed_mps": bv.get("speed_kmh", 30.0) / 3.6,
+        })
 
     while not stop_evt.is_set():
         # 일시정지 대기
@@ -2132,6 +2956,49 @@ def mock_simulation_thread(route_coords: list[list[float]], stop_evt: threading.
                 _mock_prev_cur = _cur
                 if _state.get("vehicle_pos") is not None:
                     _state["vehicle_pos"]["current_edge_id"] = _mock_eid
+
+        # 배경 차량 위치 전진 (타겟과 같은 루프 안에서 처리 — 스레드 N개 생성 안 함)
+        for bg in _bg_state:
+            if bg["total_dist"] <= 0:
+                continue
+            bg["travelled"] += bg["speed_mps"] * 0.2
+            if bg["travelled"] >= bg["total_dist"]:
+                bg["travelled"] = 0.0  # 끝에 도달하면 처음부터 다시 (배경 트래픽은 계속 돌아다님)
+            _remaining = bg["travelled"]
+            _lat = bg["coords"][-1][0]
+            _lng = bg["coords"][-1][1]
+            for _idx, _seg_len in enumerate(bg["seg_lengths"]):
+                _start = bg["coords"][_idx]
+                _end = bg["coords"][_idx + 1]
+                if _remaining <= _seg_len or _idx == len(bg["seg_lengths"]) - 1:
+                    _ratio = 0.0 if _seg_len == 0 else min(1.0, _remaining / _seg_len)
+                    _lat = _start[0] + (_end[0] - _start[0]) * _ratio
+                    _lng = _start[1] + (_end[1] - _start[1]) * _ratio
+                    break
+                _remaining -= _seg_len
+            bg["vehicle"]["lat"] = _lat
+            bg["vehicle"]["lng"] = _lng
+            bg["vehicle"]["progress"] = round(bg["travelled"] / bg["total_dist"], 3)
+
+        # 자원할당 주기적 재계산(~2초마다) — SUMO 모드와 동일한 이유/패턴
+        # (simulation_thread 참고): last_allocation_result가 시작 시 1회 값으로 굳지 않게 한다.
+        if RESOURCE_DEMAND_AVAILABLE and step % 20 == 0 and _state.get("network_nodes"):
+            _live_origin = _state.get("vehicle_pos")
+            if _live_origin and _live_origin.get("lat") is not None:
+                _periodic_alloc_algo = _state.get("allocation_algorithm") or "traffic_aware_allocation"
+                _periodic_alloc_out = _run_resource_allocation(
+                    _live_origin, [], _periodic_alloc_algo, _state.get("background_vehicles"),
+                )
+                # "경로 대안 비교"(K-path) 후보들도 최신 부하/혼잡 조건으로 다시 점수 매김
+                # (SUMO 모드와 동일한 이유 — Yen's 재탐색 없이 가볍게). 건물 교차 분석을
+                # 포함해 무거울 수 있어 메인 루프를 막지 않게 백그라운드 스레드로 돌린다.
+                if _periodic_alloc_out:
+                    threading.Thread(
+                        target=_refresh_k_candidates_async,
+                        args=(_periodic_alloc_out.to_dict(),),
+                        daemon=True,
+                    ).start()
+
         update_network_telemetry(_state["vehicle_pos"])
 
         if travelled >= total_dist:
@@ -2240,8 +3107,15 @@ def overpass_download(bbox: BBox, out_file: Path):
     print(f"[OSM] Downloaded {size_kb:.1f} KB → {out_file}", flush=True)
 
 
-def netconvert(osm_file: Path, net_file: Path):
-    """Convert OSM to SUMO network with netconvert."""
+def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
+    """Convert OSM to SUMO network with netconvert.
+
+    Overpass의 way[...](bbox); >; 쿼리는 매칭된 way의 "전체" 지오메트리를 가져오므로,
+    bbox 경계를 살짝 걸친 긴 도로(예: 간선도로)가 통째로 포함되어 실제 선택 구역을
+    훨씬 벗어나는 edge가 net.xml에 들어갈 수 있다. bbox가 주어지면
+    --keep-edges.in-geo-boundary로 해당 영역(다운로드 시 사용한 확장 bbox와 동일)
+    밖으로 뻗어나가는 edge를 잘라내, 경로가 구역 밖으로 크게 우회하는 것을 막는다.
+    """
     netconvert_bin = resolve_binary("netconvert")
     if not netconvert_bin:
         raise RuntimeError(
@@ -2263,6 +3137,8 @@ def netconvert(osm_file: Path, net_file: Path):
         "--no-warnings",
         "--log", str(log_file),
     ]
+    if bbox is not None:
+        args += ["--keep-edges.in-geo-boundary", f"{bbox.w},{bbox.s},{bbox.e},{bbox.n}"]
     print(f"[NET] Running netconvert: {osm_file.name} → {net_file.name}", flush=True)
     rc, out, err = run_cmd(args, extra_env={"SUMO_HOME": SUMO_HOME} if SUMO_HOME else None)
     if rc != 0:
@@ -2321,13 +3197,21 @@ def simulation_thread(
     origin: dict,
     dest: dict,
     stop_evt: threading.Event,
-    use_network_routing: bool = False,
+    route_algorithm: str = "dijkstra",
+    vehicle_count: int = 1,
 ):
     """
     Runs in a background thread.
-    Starts SUMO with TraCI, injects one vehicle on the Dijkstra path,
+    Starts SUMO with TraCI, injects one vehicle on the baseline Dijkstra path,
     and updates _state["vehicle_pos"] each step.
-    When use_network_routing=True, replaces Dijkstra with network-cost Dijkstra.
+    `route_algorithm` selects how the baseline path is replaced before the vehicle
+    is injected: "astar" / "k_shortest_path" / "network_aware"(_routing) /
+    "lookahead"(look_ahead_routing) each run a real, distinct search — see
+    astar_sumo_path / best_of_k_path / network_weighted_sumo_path /
+    lookahead_weighted_sumo_path. "rl_routing" and unknown values fall through to
+    baseline Dijkstra (no trained RL agent exists yet — intentionally deferred).
+    다중차량 실험군 — vehicle_count > 1이면 무작위 경로의 배경 차량 (vehicle_count - 1)대를
+    TraCI로 추가 주입하고, 매 틱 위치를 _state["background_vehicles"]에 갱신한다.
     """
     global _state
     sumo_bin = resolve_binary("sumo")
@@ -2410,44 +3294,90 @@ def simulation_thread(
         edges = dijkstra_edges
         print(f"[SIM] Baseline Dijkstra route: {len(edges)} edges", flush=True)
 
-        # Optionally replace Dijkstra route with network-cost weighted route
-        if use_network_routing and ROUTE_COST_AVAILABLE:
-            nodes_for_routing = _state.get("network_nodes") or []
-            if nodes_for_routing:
-                try:
-                    net_edges = network_weighted_sumo_path(
-                        net, from_edge, to_edge,
-                        nodes_for_routing, _route_cost_weights, stop_evt,
-                    )
-                    if net_edges:
-                        # Validate consecutive edge connectivity via sumolib before using
-                        def _edges_connected(e1_id, e2_id):
-                            try:
-                                return any(
-                                    out.getID() == e2_id
-                                    for out in net.getEdge(e1_id).getOutgoing().keys()
-                                )
-                            except Exception:
-                                return False
+        # Replace baseline Dijkstra with the selected route_algorithm's real path,
+        # if implemented. Each candidate is validated for edge-to-edge connectivity
+        # before being trusted; any failure/gap falls back to baseline Dijkstra.
+        def _edges_connected(e1_id, e2_id):
+            try:
+                return any(
+                    out.getID() == e2_id
+                    for out in net.getEdge(e1_id).getOutgoing().keys()
+                )
+            except Exception:
+                return False
 
-                        gaps = [
-                            (net_edges[i], net_edges[i + 1])
-                            for i in range(len(net_edges) - 1)
-                            if not _edges_connected(net_edges[i], net_edges[i + 1])
-                        ]
-                        if gaps:
-                            print(
-                                f"[SIM] Network-weighted route has {len(gaps)} disconnected edge(s) "
-                                f"— falling back to Dijkstra",
-                                flush=True,
-                            )
-                            _state["warning"] = "네트워크 가중치 경로에 불연속 구간이 있어 기본 Dijkstra 경로를 사용합니다."
-                        else:
-                            edges = net_edges
-                            print(f"[SIM] Network-weighted route: {len(edges)} edges", flush=True)
-                except Exception as _net_exc:
-                    print(f"[SIM] Network routing failed: {_net_exc} — using Dijkstra baseline", flush=True)
-                    _state["warning"] = "네트워크 가중치 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
+        def _try_use_candidate(candidate, label: str) -> bool:
+            nonlocal edges
+            if not candidate:
+                return False
+            gaps = [
+                (candidate[i], candidate[i + 1])
+                for i in range(len(candidate) - 1)
+                if not _edges_connected(candidate[i], candidate[i + 1])
+            ]
+            if gaps:
+                print(
+                    f"[SIM] {label} route has {len(gaps)} disconnected edge(s) "
+                    f"— falling back to Dijkstra",
+                    flush=True,
+                )
+                _state["warning"] = f"{label} 경로에 불연속 구간이 있어 기본 Dijkstra 경로를 사용합니다."
+                return False
+            edges = candidate
+            print(f"[SIM] {label} route: {len(edges)} edges", flush=True)
+            return True
+
+        _sumo_routing_mode = "baseline_dijkstra"
+        nodes_for_routing = _state.get("network_nodes") or []
+
+        if route_algorithm == "astar":
+            try:
+                if _try_use_candidate(astar_sumo_path(net, from_edge, to_edge), "A*"):
+                    _sumo_routing_mode = "astar"
+            except Exception as _astar_exc:
+                print(f"[SIM] A* routing failed: {_astar_exc} — using Dijkstra baseline", flush=True)
+                _state["warning"] = "A* 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
+
+        elif route_algorithm == "k_shortest_path" and ROUTE_COST_AVAILABLE and nodes_for_routing:
+            try:
+                _k_paths_pre = yen_k_paths_sumo(net, from_edge, to_edge, k=5)
+                candidate = best_of_k_path(
+                    build_sumo_k_edge_data(net, _k_paths_pre), nodes_for_routing, _route_cost_weights,
+                ) if _k_paths_pre else None
+                if _try_use_candidate(candidate, "K-shortest-path"):
+                    _sumo_routing_mode = "k_shortest_path"
+            except Exception as _ksp_exc:
+                print(f"[SIM] K-shortest-path routing failed: {_ksp_exc} — using Dijkstra baseline", flush=True)
+                _state["warning"] = "K-shortest-path 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
+
+        elif route_algorithm in ("network_aware", "network_aware_routing") and ROUTE_COST_AVAILABLE and nodes_for_routing:
+            try:
+                candidate = network_weighted_sumo_path(
+                    net, from_edge, to_edge, nodes_for_routing, _route_cost_weights, stop_evt,
+                )
+                if _try_use_candidate(candidate, "Network-weighted"):
+                    _sumo_routing_mode = "network_aware"
+            except Exception as _net_exc:
+                print(f"[SIM] Network routing failed: {_net_exc} — using Dijkstra baseline", flush=True)
+                _state["warning"] = "네트워크 가중치 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
+
+        elif route_algorithm in ("lookahead", "look_ahead_routing") and ROUTE_COST_AVAILABLE and nodes_for_routing:
+            try:
+                _lookahead_hops = (
+                    (_state.get("simulation_config") or {}).get("policy_options", {}).get("lookahead_k", 3)
+                )
+                candidate = lookahead_weighted_sumo_path(
+                    net, from_edge, to_edge, nodes_for_routing, _route_cost_weights, _lookahead_hops,
+                )
+                if _try_use_candidate(candidate, "Look-ahead"):
+                    _sumo_routing_mode = "lookahead"
+            except Exception as _la_exc:
+                print(f"[SIM] Look-ahead routing failed: {_la_exc} — using Dijkstra baseline", flush=True)
+                _state["warning"] = "Look-ahead 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
+
+        # rl_routing and any unknown value: no dispatch — stays on baseline Dijkstra.
+        # No trained RL agent exists yet (app/services/rl/rl_trainer.py only has
+        # random/greedy/coverage baseline policies) — intentionally deferred.
 
         _state["route_edges"] = edges
 
@@ -2524,7 +3454,7 @@ def simulation_thread(
 
         # Pre-build edge data (cheap — no building analysis yet)
         _sumo_edge_data = build_sumo_edge_data(net, edges) if ROUTE_COST_AVAILABLE else []
-        _sumo_routing_mode = "network_aware" if use_network_routing else "baseline_dijkstra"
+        # _sumo_routing_mode was already set by the route_algorithm dispatch above
         _sumo_from_edge = from_edge
         _sumo_to_edge = to_edge
         _sumo_net_ref = net  # sumolib only — safe to share across threads
@@ -2577,6 +3507,94 @@ def simulation_thread(
             arrivalPos=_arrival_pos,
         )
         print("[SIM] Vehicle veh0 added to simulation", flush=True)
+
+        # ── 다중차량 실험군 — 배경 차량 주입 (vehicle_count > 1일 때만, SUMO 모드) ──────
+        _bg_vehicle_ids: list[str] = []
+        _bg_drivable_edges: list = []  # sumolib Edge 객체 리스트 (오프라인 경로탐색용)
+        # 막 주입했지만 아직 getIDList()에 안 보이는(삽입 대기 중) 차량을 추적 — 값=대기 틱 수.
+        # 너무 오래(10틱~1초) 안 보이면 도착했거나 영구히 막힌 것으로 보고 새 id로 교체한다.
+        _bg_pending: dict[str, int] = {}
+
+        def _inject_bg_vehicle(drivable_edges: list, max_attempts: int = 5) -> Optional[str]:
+            """무작위 출발/도착 엣지로 SUMO에 배경 차량 1대를 새 vehID로 주입한다.
+            매번 새 id(uuid)를 생성하므로 "이미 존재함" 충돌이 구조적으로 생기지 않는다.
+            경로탐색은 sumolib의 오프라인 getShortestPath()로 수행 — TraCI 왕복 없이
+            클라이언트 측에서 계산되므로 대량 주입 시 findRoute() 대비 훨씬 빠르다.
+            유효한 경로를 못 찾으면 max_attempts번까지 재시도하고 실패하면 None을 반환한다."""
+            for _ in range(max_attempts):
+                from_edge = random.choice(drivable_edges)
+                to_edge = random.choice(drivable_edges)
+                if from_edge is to_edge:
+                    continue
+                try:
+                    _path, _cost = net.getShortestPath(from_edge, to_edge)
+                except Exception:
+                    continue
+                if not _path:
+                    continue
+                edge_ids = [e.getID() for e in _path]
+                veh_id = f"bg{uuid4().hex[:8]}"
+                try:
+                    traci.route.add(f"route_{veh_id}", edge_ids)
+                    traci.vehicle.add(
+                        vehID=veh_id,
+                        routeID=f"route_{veh_id}",
+                        typeID="DEFAULT_VEHTYPE",
+                        depart="now",
+                        departLane="best",
+                        departSpeed="random",
+                        departPos="random_free",  # 무작위지만 충돌 없는 빈 자리를 SUMO가 재시도해서 찾음
+                    )
+                    return veh_id
+                except Exception as _bg_exc:
+                    print(f"[BG-VEH] inject failed: {_bg_exc}", flush=True)
+                    continue
+            return None
+
+        if vehicle_count > 1:
+            _bg_drivable_edges = [e for e in net.getEdges() if e.allows("passenger")]
+            if len(_bg_drivable_edges) >= 2:
+                # 면적 기준 어림 용량 — 도로 엣지 총길이는 bbox 밖 연결 엣지까지 포함돼
+                # 항상 과대평가되므로(임계값이 거의 안 걸림), 실제 구역 면적 × 현실적인
+                # 도심 교통 밀도(흐르는 교통 기준 ~150대/km², 정체 직전 어림치)로 추정한다.
+                _bbox = _state.get("current_bbox")
+                _capacity_hint = None
+                if _bbox:
+                    _w_m = haversine_m(_bbox["s"], _bbox["w"], _bbox["s"], _bbox["e"])
+                    _h_m = haversine_m(_bbox["s"], _bbox["w"], _bbox["n"], _bbox["w"])
+                    _area_km2 = max((_w_m * _h_m) / 1_000_000.0, 0.01)
+                    _capacity_hint = max(1, round(_area_km2 * 150))
+                if _capacity_hint and vehicle_count - 1 > _capacity_hint:
+                    _state["warning"] = (
+                        f"요청한 배경 차량 {vehicle_count - 1}대는 현재 시뮬레이션 구역 규모"
+                        f"(약 {_area_km2:.2f}km²)에 비해 비현실적으로 많을 수 있습니다 "
+                        f"(어림 용량 ~{_capacity_hint}대). 시뮬레이션은 계속 진행됩니다."
+                    )
+                for _ in range(vehicle_count - 1):
+                    _new_id = _inject_bg_vehicle(_bg_drivable_edges)
+                    if _new_id:
+                        _bg_vehicle_ids.append(_new_id)
+                        _bg_pending[_new_id] = 0
+            _state["background_vehicle_ids"] = _bg_vehicle_ids
+            print(f"[BG-VEH] injected {len(_bg_vehicle_ids)}/{vehicle_count - 1} background vehicles", flush=True)
+
+            if _bg_vehicle_ids:
+                # 초기 위치를 확보하려면 1틱 진행이 필요 — mock 모드와 동일한 패턴으로
+                # 자원할당을 1회 호출해 route-cost/K-path 쪽 부하 반영을 SUMO 모드에도 맞춘다.
+                traci.simulationStep()
+                _live_ids0 = set(traci.vehicle.getIDList())
+                _bg_snapshot = []
+                for _bg_id in _bg_vehicle_ids:
+                    if _bg_id in _live_ids0:
+                        _bg_pending.pop(_bg_id, None)
+                        _bx, _by = traci.vehicle.getPosition(_bg_id)
+                        _blon, _blat = traci.simulation.convertGeo(_bx, _by)
+                        _bspd = round(traci.vehicle.getSpeed(_bg_id) * 3.6, 1)
+                        _bg_snapshot.append({"id": _bg_id, "lat": _blat, "lng": _blon, "speed": _bspd})
+                _state["background_vehicles"] = _bg_snapshot
+                if RESOURCE_DEMAND_AVAILABLE and _state.get("network_nodes"):
+                    _sumo_alloc_algo = _state.get("allocation_algorithm") or "traffic_aware_allocation"
+                    _run_resource_allocation(origin, [], _sumo_alloc_algo, _bg_snapshot)
 
         # Run cost evaluation and K-path analysis in background so the
         # simulation loop (and vehicle marker) starts immediately.
@@ -2673,6 +3691,64 @@ def simulation_thread(
                         pass
                 if _estats:
                     _state["edge_telemetry"] = _estats
+
+            # 다중차량 실험군 — 배경 차량 위치 갱신, 도착/소멸한 차량은 새 id로 즉시 교체 주입.
+            # 도착 감지(아이디 집합 비교)는 매 틱 수행하지만, 무거운 getPosition() 호출은
+            # WS background_positions 브로드캐스트와 같은 주기(4틱)로만 수행해 대수가 많을 때
+            # 틱당 TraCI 비용을 1/4로 줄인다.
+            if _bg_vehicle_ids:
+                _live_ids = set(traci.vehicle.getIDList())
+                _new_bg_vehicle_ids = []
+                _fetch_bg_positions = (step % 4 == 0)
+                _bg_snapshot = [] if _fetch_bg_positions else None
+                for _bg_id in _bg_vehicle_ids:
+                    if _bg_id in _live_ids:
+                        _bg_pending.pop(_bg_id, None)
+                        _new_bg_vehicle_ids.append(_bg_id)
+                        if _fetch_bg_positions:
+                            _bx, _by = traci.vehicle.getPosition(_bg_id)
+                            _blon, _blat = traci.simulation.convertGeo(_bx, _by)
+                            _bspd = round(traci.vehicle.getSpeed(_bg_id) * 3.6, 1)
+                            _bg_snapshot.append({"id": _bg_id, "lat": _blat, "lng": _blon, "speed": _bspd})
+                        continue
+                    # 아직 안 보임 — 막 주입돼서 삽입 대기 중일 수 있으니 잠깐 봐줌
+                    _waited = _bg_pending.get(_bg_id, 0)
+                    if _waited < 10:
+                        _bg_pending[_bg_id] = _waited + 1
+                        _new_bg_vehicle_ids.append(_bg_id)
+                        continue
+                    # 너무 오래 안 보임 — 도착했거나 영구히 막힌 것으로 보고 새 id로 교체
+                    _bg_pending.pop(_bg_id, None)
+                    _new_id = _inject_bg_vehicle(_bg_drivable_edges)
+                    if _new_id:
+                        _bg_pending[_new_id] = 0
+                        _new_bg_vehicle_ids.append(_new_id)
+                _bg_vehicle_ids = _new_bg_vehicle_ids
+                if _fetch_bg_positions:
+                    _state["background_vehicles"] = _bg_snapshot
+
+            # 자원할당 주기적 재계산(~2초마다) — 시작 시 1회 계산된 last_allocation_result가
+            # 핸드오버/배경 차량 이동 후에도 그대로 굳어있어 대시보드 "자원 할당" 패널이
+            # 갱신되지 않던 문제를 해결한다. K-path 재탐색 없이(빈 리스트) ego의 현재
+            # 위치와 최신 배경 차량 스냅샷만으로 가볍게 재계산한다.
+            if RESOURCE_DEMAND_AVAILABLE and step % 20 == 0 and _state.get("network_nodes"):
+                _live_origin = _state.get("vehicle_pos") or origin
+                if _live_origin and _live_origin.get("lat") is not None:
+                    _periodic_alloc_algo = _state.get("allocation_algorithm") or "traffic_aware_allocation"
+                    _periodic_alloc_out = _run_resource_allocation(
+                        _live_origin, [], _periodic_alloc_algo, _state.get("background_vehicles"),
+                    )
+                    # "경로 대안 비교"(K-path) 후보들이 시작 시 1회 비용으로 고정되지 않도록,
+                    # 같은 K-path 토폴로지를 최신 부하/혼잡 조건으로 다시 점수만 매긴다
+                    # (Yen's 재탐색은 안 함 — 가볍게). 건물 교차 분석 포함이라 무거울 수 있어
+                    # SUMO TraCI 루프를 막지 않게 백그라운드 스레드로 돌린다.
+                    if _periodic_alloc_out:
+                        threading.Thread(
+                            target=_refresh_k_candidates_async,
+                            args=(_periodic_alloc_out.to_dict(),),
+                            daemon=True,
+                        ).start()
+
             update_network_telemetry(_state["vehicle_pos"])
             time.sleep(0.1)  # ~10 fps
 
@@ -2726,16 +3802,21 @@ def reset_simulation_state() -> None:
     _state["building_debug"] = {"sample_links": [], "warnings": []}
     _state["simulation_run_id"] = None
     _state["route_cost_result"] = None
+    _state["route_cost_edge_data"] = None
     _state["route_cost_version"] = 0
     _state["route_edge_names"] = {}
     _state["edge_telemetry"] = []
     _state["edge_avg_speeds"] = {}
     _state["edge_history"] = []
     _state["k_path_candidates"] = None
+    _state["k_path_edge_data"] = None
     _state["algorithm_metrics"] = {}
     _state["simulation_summary"] = None
     _state["selected_algorithms"] = {}
     _state["last_allocation_result"] = None
+    _state["background_vehicles"] = []
+    _state["background_vehicle_ids"] = []
+    _state["algorithm_comparison"] = {"status": "idle"}
     # Stage-1: keep simulation_config across resets (user's saved config persists)
     _state["policy_options"] = None
 
@@ -2752,6 +3833,7 @@ def _store_simulation_summary() -> None:
             algorithm_metrics=_state.get("algorithm_metrics") or {},
             bs_nodes=_state.get("network_nodes") or [],
             scenario_id=scenario_id,
+            edge_names=_state.get("route_edge_names") or {},
         )
         summary_dict = summary.to_dict()
         summary_dict["used_config"] = _state.get("simulation_config") or SimulationConfigModel().model_dump()
@@ -2897,7 +3979,7 @@ async def setup_network(req: SetupRequest):
             chosen_mode = "mock"
             try:
                 await asyncio.get_event_loop().run_in_executor(
-                    None, netconvert, osm_file, net_file
+                    None, netconvert, osm_file, net_file, download_bbox
                 )
                 chosen_net_file = str(net_file)
                 chosen_mode = "sumo"
@@ -2941,43 +4023,59 @@ async def setup_network(req: SetupRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/simulation/start")
-async def start_simulation(req: SimStartRequest):
-    """Start SUMO simulation with Dijkstra routing between origin and dest."""
-    global _sim_thread, _stop_event, _pause_event
+def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
+    """
+    Per-run setup shared by both the live /api/simulation/start endpoint and
+    the headless batch runner (Phase 2): reloads network nodes, resets the
+    per-run _state keys, creates the persistent simulation_runs row, seeds
+    device/ITS load, and applies the requested algorithm selection.
 
-    if not _state["network_ready"]:
-        raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
+    Does NOT touch _sim_thread/_stop_event/_pause_event (live-endpoint-only
+    concerns — a previous real-time thread to clean up, irrelevant to a
+    headless batch run that never starts one) and does NOT decide SUMO vs
+    mock-graph mode (caller's responsibility).
 
-    # 기존 스레드 정리 (실행 중이거나 일시정지 중인 경우 모두)
-    if _sim_thread and _sim_thread.is_alive():
-        _pause_event.clear()  # 일시정지 해제 후 종료 신호
-        _stop_event.set()
-        _sim_thread.join(timeout=5)
-
+    Returns the random.Random instance seeded from req.seed (or
+    self-seeded from OS entropy if req.seed is None) — pass this into
+    _evaluate_mock_route() and any other per-run sampling.
+    """
     # Reload network nodes from the DB so any user-created base stations
     # added since the last setup/run are included as connection candidates.
     _state["network_nodes"] = merged_network_nodes()
 
-    _stop_event = threading.Event()
-    _pause_event = threading.Event()
     _state["sim_running"] = True
     _state["vehicle_pos"] = None
     _state["error"] = None
     _state["warning"] = None
     _state["route_coords"] = []
     _state["route_edges"] = []
+    _state["background_vehicles"] = []
+    _state["background_vehicle_ids"] = []
     # 이전 런의 엣지 기록 초기화 (다음 런에서 "현재" 고정 버그 방지)
     _state["edge_history"] = []
     _state["edge_avg_speeds"] = {}
     _state["edge_telemetry"] = []
     _state["selected_algorithms"] = req.algorithm_config or {}
-    _state["simulation_run_id"] = create_simulation_run(req.origin, req.dest, _state["sim_mode"])
+    _state["simulation_run_id"] = create_simulation_run(
+        req.origin, req.dest, _state["sim_mode"],
+        seed=req.seed, scenario_id=req.scenario_id, batch_id=req.batch_id,
+        sheet_id=req.sheet_id, sheet_name=req.sheet_name,
+    )
+    # 재현성: seed가 주어지면 이 런의 모든 Poisson/배경차량 샘플링을 격리된 random.Random
+    # 인스턴스로 고정한다(전역 random 모듈은 건드리지 않음 — 다른 코드의 randomness와 분리).
+    _state["sim_seed"] = req.seed
+    _rng = random.Random(req.seed)
 
     # Stage-1: apply simulation config (per-request overrides persistent state)
     _raw_cfg = req.simulation_config or _state.get("simulation_config")
     _sim_cfg = merge_with_default_config(_raw_cfg)
     _apply_simulation_config(_sim_cfg)
+    _seed_other_device_load(
+        _state.get("network_nodes") or [],
+        (_state.get("policy_options") or {}).get("other_device_lambda", 300.0),
+        _rng,
+    )
+    _seed_its_congestion_load(_state.get("network_nodes") or [])
     # algorithm_config uses frontend key names (latency, resource_allocation) and
     # backend key names (latency_algorithm, allocation_algorithm) — accept both.
     _lat_alg = (
@@ -3005,6 +4103,227 @@ async def start_simulation(req: SimStartRequest):
         except Exception:
             pass
 
+    return _rng
+
+
+def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchronous: bool = False) -> dict:
+    """
+    OSM-fallback (mock-graph) route search + K-path + resource-allocation +
+    cost evaluation — STEP 1 through STEP 4+5, extracted verbatim from the
+    mock-graph branch of /api/simulation/start so the headless batch runner
+    (Phase 2) can call exactly the same evaluation the live Simulation tab
+    uses, without spawning the real-time mock_simulation_thread.
+
+    Mutates _state exactly as before (route_coords, route_edges, route_edge_names,
+    route_buildings, background_vehicles, algorithm_metrics, k_path_candidates,
+    route_cost_result, simulation_summary, ...) — callers read those back from
+    _state after this returns, same as the live endpoint always has.
+
+    synchronous : False (default, live-endpoint behaviour) — cost evaluation
+                  runs in a fire-and-forget background thread so the vehicle
+                  appears on the map immediately while metrics catch up a beat
+                  later. True (batch runner) — runs inline so algorithm_metrics
+                  /route_cost_result/k_path_candidates/simulation_summary are
+                  guaranteed populated by the time this function returns.
+
+    Returns {"path": [...], "route_coords": [...]} (the rest is in _state).
+    """
+    _route_algo = req.algorithm_config.get("route", "dijkstra")
+    if not _state["mock_graph"]:
+        raise HTTPException(status_code=500, detail="Fallback OSM graph를 준비하지 못했습니다.")
+    try:
+        start_node = nearest_mock_node(_state["mock_graph"], req.origin["lat"], req.origin["lng"])
+        end_node = nearest_mock_node(_state["mock_graph"], req.dest["lat"], req.dest["lng"])
+        if _route_algo == "astar":
+            path = astar_mock_path(_state["mock_graph"], start_node, end_node)
+        else:
+            path = shortest_mock_path(_state["mock_graph"], start_node, end_node)
+        route_coords = mock_route_coords(_state["mock_graph"], path)
+    except RuntimeError as exc:
+        _state["sim_running"] = False
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # ── STEP 1: Generate K topology paths (before allocation) ──────────────
+    _raw_k_paths: list = []
+    _k_candidates_data: list = []
+    if ROUTE_COST_AVAILABLE:
+        try:
+            _raw_k_paths = yen_k_paths_mock(_state["mock_graph"], start_node, end_node, k=5)
+            if _raw_k_paths:
+                _k_candidates_data = build_mock_k_edge_data(_state["mock_graph"], _raw_k_paths)
+        except Exception as _k_gen_exc:
+            print(f"[COST] K-path generation failed: {_k_gen_exc}", flush=True)
+
+    # ── STEP 1.5: 다중차량 실험군 — 배경 차량 생성 (vehicle_count > 1일 때만) ──
+    _bg_vehicles: list = []
+    if req.vehicle_count and req.vehicle_count > 1 and _state.get("current_bbox"):
+        try:
+            _bg_vehicles = _generate_background_vehicles(
+                _state["mock_graph"], _state["current_bbox"], req.vehicle_count - 1, _rng
+            )
+        except Exception as _bg_exc:
+            print(f"[BG-VEHICLES] generation failed: {_bg_exc}", flush=True)
+    _state["background_vehicles"] = _bg_vehicles
+
+    # ── STEP 2: Resource allocation (P1+P3+P4 fixes) ──────────────────────
+    # Runs BEFORE path selection so Dijkstra/K-path use allocation-updated loads.
+    # Uses origin as initial vehicle (P1), passes K paths + look-ahead (P4).
+    # Background vehicles (실험군) are folded into the demand so the target's
+    # latency reflects the full fleet, not just itself.
+    _alloc_out = None
+    _alloc_dict: Optional[dict] = None
+    if RESOURCE_DEMAND_AVAILABLE and _state.get("network_nodes"):
+        _alloc_algo = (
+            req.algorithm_config.get("allocation_algorithm")
+            or req.algorithm_config.get("resource_allocation")
+            or _state.get("allocation_algorithm")
+            or "traffic_aware_allocation"
+        )
+        _alloc_out = _run_resource_allocation(req.origin, _raw_k_paths, _alloc_algo, _bg_vehicles)
+        _alloc_dict = _alloc_out.to_dict() if _alloc_out else None
+
+    # ── STEP 3: Path selection using allocation-updated loads ──────────────
+    # Each route_algorithm value runs a real, distinct search — see
+    # astar_mock_path / best_of_k_path / network_weighted_mock_path /
+    # lookahead_weighted_mock_path. rl_routing and unknown values stay on the
+    # baseline path chosen above (no trained RL agent exists yet).
+    _mock_routing_mode = "astar" if _route_algo == "astar" else "baseline_dijkstra"
+
+    if _route_algo == "k_shortest_path" and ROUTE_COST_AVAILABLE and _k_candidates_data:
+        try:
+            # Best K-path candidate re-evaluated with allocation costs
+            _k_results = _store_k_candidates(_k_candidates_data, allocation_output=_alloc_dict)
+            if _k_results:
+                path = _k_results[0].path  # rank 0 = lowest allocation-adjusted cost
+                route_coords = mock_route_coords(_state["mock_graph"], path)
+                _mock_routing_mode = "k_shortest_path"
+                print(
+                    f"[SIM] Selected path: rank=0 of {len(_k_results)}, "
+                    f"total_cost={_k_results[0].total_cost:.3f}, "
+                    f"deficit={_k_results[0].resource_deficit_cost:.4f}",
+                    flush=True,
+                )
+                _k_candidates_data = []  # already stored — skip duplicate call below
+        except Exception as _ksp_exc:
+            print(f"[SIM] K-shortest-path routing failed: {_ksp_exc} — Dijkstra baseline", flush=True)
+
+    elif _route_algo in ("network_aware", "network_aware_routing") and ROUTE_COST_AVAILABLE and _state.get("network_nodes"):
+        try:
+            net_path = network_weighted_mock_path(
+                _state["mock_graph"], start_node, end_node,
+                _state["network_nodes"], _route_cost_weights,
+            )
+            path = net_path
+            route_coords = mock_route_coords(_state["mock_graph"], path)
+            _mock_routing_mode = "network_aware"
+            print(f"[SIM] Network-weighted route: {len(path)} nodes", flush=True)
+        except Exception as _net_exc:
+            print(f"[SIM] Network routing failed: {_net_exc} — Dijkstra baseline", flush=True)
+
+    elif _route_algo in ("lookahead", "look_ahead_routing") and ROUTE_COST_AVAILABLE and _state.get("network_nodes"):
+        try:
+            _lookahead_hops = (
+                (_state.get("simulation_config") or {}).get("policy_options", {}).get("lookahead_k", 3)
+            )
+            la_path = lookahead_weighted_mock_path(
+                _state["mock_graph"], start_node, end_node,
+                _state["network_nodes"], _route_cost_weights, _lookahead_hops,
+            )
+            path = la_path
+            route_coords = mock_route_coords(_state["mock_graph"], path)
+            _mock_routing_mode = "lookahead"
+            print(f"[SIM] Look-ahead route: {len(path)} nodes", flush=True)
+        except Exception as _la_exc:
+            print(f"[SIM] Look-ahead routing failed: {_la_exc} — Dijkstra baseline", flush=True)
+
+    _state["route_edges"] = path
+
+    # Prepend exact origin so vehicle starts from user-selected point, not nearest OSM node
+    origin_pt = [req.origin["lat"], req.origin["lng"]]
+    if route_coords and haversine_m(origin_pt[0], origin_pt[1], route_coords[0][0], route_coords[0][1]) > 5.0:
+        route_coords = [origin_pt] + route_coords
+
+    _state["route_coords"] = route_coords
+
+    # Collect street names from OSM way_names stored in mock graph
+    _mock_way_names = _state["mock_graph"].get("way_names", {})
+    _mock_graph_nodes = _state["mock_graph"].get("nodes", {})
+    _mock_edge_names: dict[str, str] = {}
+    _mock_edge_midpoints: dict[str, tuple[float, float]] = {}
+    for _a, _b in zip(path, path[1:]):
+        _eid = f"{_a}_{_b}"
+        _mock_edge_names[_eid] = _mock_way_names.get((_a, _b)) or _mock_way_names.get((_b, _a)) or ""
+        # Collect midpoint for V-World enrichment
+        _na = _mock_graph_nodes.get(_a)
+        _nb = _mock_graph_nodes.get(_b)
+        if _na and _nb:
+            _mock_edge_midpoints[_eid] = (
+                (_na["lat"] + _nb["lat"]) / 2,
+                (_na["lng"] + _nb["lng"]) / 2,
+            )
+    _state["route_edge_names"] = _mock_edge_names
+    # V-World enrichment for edges still missing names (background) — skip entirely
+    # in headless/batch mode (synchronous=True): firing N background threads per
+    # scenario in a sweep is pure waste, nothing renders street names anywhere.
+    if VWORLD_API_KEY and not synchronous:
+        threading.Thread(
+            target=_enrich_edge_names_vworld,
+            args=(_mock_edge_midpoints, _state["route_edge_names"]),
+            daemon=True,
+        ).start()
+
+    _state["route_buildings"], _state["building_debug"] = load_route_buildings(
+        route_coords, _state.get("network_nodes")
+    )
+
+    # ── STEP 4+5: cost evaluation ────────────────────────────────────────
+    # Live endpoint (synchronous=False): fire-and-forget background thread so
+    # the vehicle appears on the map immediately while metrics catch up a beat
+    # later. Batch runner (synchronous=True): run inline so the caller can read
+    # _state["algorithm_metrics"]/["route_cost_result"]/["k_path_candidates"]/
+    # ["simulation_summary"] immediately after this function returns.
+    if ROUTE_COST_AVAILABLE:
+        _mock_edge_data = build_mock_edge_data(_state["mock_graph"], path)
+        # _mock_routing_mode was already set by the route_algorithm dispatch above
+        _mock_k_data = list(_k_candidates_data)  # snapshot before clearing
+        _mock_alloc = _alloc_dict
+
+        def _bg_mock_cost():
+            _store_route_cost(_mock_edge_data, _mock_routing_mode)
+            if _mock_k_data:
+                _store_k_candidates(_mock_k_data, allocation_output=_mock_alloc)
+
+        if synchronous:
+            _bg_mock_cost()
+        else:
+            threading.Thread(target=_bg_mock_cost, daemon=True).start()
+
+    return {"path": path, "route_coords": route_coords}
+
+
+@app.post("/api/simulation/start")
+async def start_simulation(req: SimStartRequest):
+    """Start SUMO simulation with Dijkstra routing between origin and dest."""
+    global _sim_thread, _stop_event, _pause_event
+
+    if not _state["network_ready"]:
+        raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
+    if _active_batch_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="시나리오 배치가 실행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 배치가 끝난 후 다시 시도하세요.",
+        )
+
+    # 기존 스레드 정리 (실행 중이거나 일시정지 중인 경우 모두) — 실시간 엔드포인트 전용 관심사,
+    # _prepare_simulation_run()에는 포함하지 않는다(헤드리스 배치 러너는 _sim_thread를 안 씀).
+    if _sim_thread and _sim_thread.is_alive():
+        _pause_event.clear()  # 일시정지 해제 후 종료 신호
+        _stop_event.set()
+        _sim_thread.join(timeout=5)
+    _stop_event = threading.Event()
+    _pause_event = threading.Event()
+
+    _rng = _prepare_simulation_run(req)
     _route_algo = req.algorithm_config.get("route", "dijkstra")
 
     use_sumo, sumo_error = can_run_sumo()
@@ -3013,116 +4332,11 @@ async def start_simulation(req: SimStartRequest):
         _sim_thread = threading.Thread(
             target=simulation_thread,
             args=(_state["net_file"], req.origin, req.dest, _stop_event),
-            kwargs={"use_network_routing": req.use_network_routing},
+            kwargs={"route_algorithm": _route_algo, "vehicle_count": req.vehicle_count},
             daemon=True,
         )
     else:
-        if not _state["mock_graph"]:
-            raise HTTPException(status_code=500, detail="Fallback OSM graph를 준비하지 못했습니다.")
-        try:
-            start_node = nearest_mock_node(_state["mock_graph"], req.origin["lat"], req.origin["lng"])
-            end_node = nearest_mock_node(_state["mock_graph"], req.dest["lat"], req.dest["lng"])
-            if _route_algo == "astar":
-                path = astar_mock_path(_state["mock_graph"], start_node, end_node)
-            else:
-                path = shortest_mock_path(_state["mock_graph"], start_node, end_node)
-            route_coords = mock_route_coords(_state["mock_graph"], path)
-        except RuntimeError as exc:
-            _state["sim_running"] = False
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        # ── STEP 1: Generate K topology paths (before allocation) ──────────────
-        _raw_k_paths: list = []
-        _k_candidates_data: list = []
-        if ROUTE_COST_AVAILABLE:
-            try:
-                _raw_k_paths = yen_k_paths_mock(_state["mock_graph"], start_node, end_node, k=5)
-                if _raw_k_paths:
-                    _k_candidates_data = build_mock_k_edge_data(_state["mock_graph"], _raw_k_paths)
-            except Exception as _k_gen_exc:
-                print(f"[COST] K-path generation failed: {_k_gen_exc}", flush=True)
-
-        # ── STEP 2: Resource allocation (P1+P3+P4 fixes) ──────────────────────
-        # Runs BEFORE path selection so Dijkstra/K-path use allocation-updated loads.
-        # Uses origin as initial vehicle (P1), passes K paths + look-ahead (P4).
-        _alloc_out = None
-        _alloc_dict: Optional[dict] = None
-        if RESOURCE_DEMAND_AVAILABLE and _state.get("network_nodes"):
-            _alloc_algo = (
-                req.algorithm_config.get("allocation_algorithm")
-                or req.algorithm_config.get("resource_allocation")
-                or _state.get("allocation_algorithm")
-                or "traffic_aware_allocation"
-            )
-            _alloc_out = _run_resource_allocation(req.origin, _raw_k_paths, _alloc_algo)
-            _alloc_dict = _alloc_out.to_dict() if _alloc_out else None
-
-        # ── STEP 3: Path selection using allocation-updated loads ──────────────
-        if req.use_network_routing and ROUTE_COST_AVAILABLE and _state.get("network_nodes"):
-            if _k_candidates_data:
-                # Preferred: best K-path candidate re-evaluated with allocation costs
-                _k_results = _store_k_candidates(_k_candidates_data, allocation_output=_alloc_dict)
-                if _k_results:
-                    path = _k_results[0].path  # rank 0 = lowest allocation-adjusted cost
-                    route_coords = mock_route_coords(_state["mock_graph"], path)
-                    print(
-                        f"[SIM] Selected path: rank=0 of {len(_k_results)}, "
-                        f"total_cost={_k_results[0].total_cost:.3f}, "
-                        f"deficit={_k_results[0].resource_deficit_cost:.4f}",
-                        flush=True,
-                    )
-                    _k_candidates_data = []  # already stored — skip duplicate call below
-            if not path:
-                # Fallback: network_weighted_mock_path with allocation-updated loads
-                try:
-                    net_path = network_weighted_mock_path(
-                        _state["mock_graph"], start_node, end_node,
-                        _state["network_nodes"], _route_cost_weights,
-                    )
-                    path = net_path
-                    route_coords = mock_route_coords(_state["mock_graph"], path)
-                    print(f"[SIM] Network-weighted fallback: {len(path)} nodes", flush=True)
-                except Exception as _net_exc:
-                    print(f"[SIM] Network routing failed: {_net_exc} — Dijkstra baseline", flush=True)
-
-        _state["route_edges"] = path
-
-        # Prepend exact origin so vehicle starts from user-selected point, not nearest OSM node
-        origin_pt = [req.origin["lat"], req.origin["lng"]]
-        if route_coords and haversine_m(origin_pt[0], origin_pt[1], route_coords[0][0], route_coords[0][1]) > 5.0:
-            route_coords = [origin_pt] + route_coords
-
-        _state["route_coords"] = route_coords
-
-        # Collect street names from OSM way_names stored in mock graph
-        _mock_way_names = _state["mock_graph"].get("way_names", {})
-        _mock_graph_nodes = _state["mock_graph"].get("nodes", {})
-        _mock_edge_names: dict[str, str] = {}
-        _mock_edge_midpoints: dict[str, tuple[float, float]] = {}
-        for _a, _b in zip(path, path[1:]):
-            _eid = f"{_a}_{_b}"
-            _mock_edge_names[_eid] = _mock_way_names.get((_a, _b)) or _mock_way_names.get((_b, _a)) or ""
-            # Collect midpoint for V-World enrichment
-            _na = _mock_graph_nodes.get(_a)
-            _nb = _mock_graph_nodes.get(_b)
-            if _na and _nb:
-                _mock_edge_midpoints[_eid] = (
-                    (_na["lat"] + _nb["lat"]) / 2,
-                    (_na["lng"] + _nb["lng"]) / 2,
-                )
-        _state["route_edge_names"] = _mock_edge_names
-        # V-World enrichment for edges still missing names (background)
-        if VWORLD_API_KEY:
-            threading.Thread(
-                target=_enrich_edge_names_vworld,
-                args=(_mock_edge_midpoints, _state["route_edge_names"]),
-                daemon=True,
-            ).start()
-
-        _state["route_buildings"], _state["building_debug"] = load_route_buildings(
-            route_coords, _state.get("network_nodes")
-        )
-
+        _evaluate_mock_route(req, _rng, synchronous=False)
         _state["sim_mode"] = "mock"
         _state["warning"] = (
             "SUMO runtime is unavailable on this machine, so the simulation is running in "
@@ -3130,26 +4344,292 @@ async def start_simulation(req: SimStartRequest):
         )
         _sim_thread = threading.Thread(
             target=mock_simulation_thread,
-            args=(route_coords, _stop_event),
+            args=(_state["route_coords"], _stop_event),
             daemon=True,
         )
 
-        # ── STEP 4+5: Cost eval in background so vehicle appears immediately ─────
-        if ROUTE_COST_AVAILABLE:
-            _mock_edge_data = build_mock_edge_data(_state["mock_graph"], path)
-            _mock_routing_mode = "network_aware" if req.use_network_routing else "baseline_dijkstra"
-            _mock_k_data = list(_k_candidates_data)  # snapshot before clearing
-            _mock_alloc = _alloc_dict
-
-            def _bg_mock_cost():
-                _store_route_cost(_mock_edge_data, _mock_routing_mode)
-                if _mock_k_data:
-                    _store_k_candidates(_mock_k_data, allocation_output=_mock_alloc)
-
-            threading.Thread(target=_bg_mock_cost, daemon=True).start()
-
     _sim_thread.start()
-    return {"ok": True, "mode": _state["sim_mode"], "warning": _state["warning"]}
+    return {"ok": True, "mode": _state["sim_mode"], "warning": _state["warning"], "run_id": _state.get("simulation_run_id")}
+
+
+def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str) -> dict:
+    """route_metrics 모드: 실시간 스레드 없이 _prepare_simulation_run + _evaluate_mock_route(synchronous=True)로 즉시 평가."""
+    if not _state["network_ready"]:
+        raise RuntimeError("네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
+    if not spec.origin or not spec.dest:
+        raise RuntimeError("route_metrics 모드는 origin/dest가 필요합니다.")
+
+    req = SimStartRequest(
+        origin=spec.origin,
+        dest=spec.dest,
+        vehicle_count=spec.vehicle_count,
+        seed=spec.seed,
+        algorithm_config=spec.algorithm_config or {},
+        simulation_config=spec.simulation_config,
+        scenario_id=scenario_id,
+        batch_id=batch_id,
+    )
+    _state["sim_mode"] = "mock"  # 배치는 항상 mock-graph 즉시평가만 사용(SUMO 실시간 스레드 없음)
+    _rng = _prepare_simulation_run(req)
+    _evaluate_mock_route(req, _rng, synchronous=True)
+
+    # 대시보드가 실시간으로 보여주는 network_telemetry(L_base/L_signal/L_queue 분해,
+    # 연결 기지국, 후보 기지국 비교, RB deficit 등)는 원래 vehicle_pos가 틱마다 갱신될 때만
+    # 채워지는데, 배치 평가에는 움직이는 차량이 없다 — origin을 대표 위치로 한 번 계산해서
+    # 같이 묶어야 배치 결과로도 대시보드와 동일한 축으로 비교할 수 있다(2026-06-24 사용자 피드백).
+    update_network_telemetry(spec.origin)
+    telemetry = _state.get("network_telemetry")
+
+    metrics = _state.get("algorithm_metrics") or {}
+    route_cost = _state.get("route_cost_result")
+    summary = _state.get("simulation_summary")
+    if _state.get("simulation_run_id"):
+        finish_simulation_run(_state["simulation_run_id"], {
+            "algorithm_metrics": metrics,
+            "route_cost_result": route_cost,
+            "simulation_summary": summary,
+            "network_telemetry": telemetry,
+        })
+    return {
+        "mode": "route_metrics",
+        "route_cost_result": route_cost,
+        "algorithm_metrics": metrics,
+        "simulation_summary": summary,
+        "network_telemetry": telemetry,
+    }
+
+
+def _evaluate_rl_scenario(spec: ScenarioSpec) -> dict:
+    """rl_episode 모드: 도로 그래프 + 기지국 목록만 읽는 순수 평가 — /api/rl/episode와 동일한 로직이며
+    이미 헤드리스(실시간 스레드/_state 변경 없음)이므로 Phase 1 같은 분리 작업이 필요 없다."""
+    if not RL_AVAILABLE:
+        raise RuntimeError("RL 모듈을 사용할 수 없습니다.")
+    graph = _state.get("mock_graph")
+    if not graph:
+        raise RuntimeError("도로 그래프가 아직 로드되지 않았습니다. 시뮬레이션을 먼저 설정하세요.")
+    road_nodes = graph.get("nodes", {})
+    bs_nodes = _state.get("network_nodes") or []
+    if not spec.origin_id or spec.origin_id not in road_nodes:
+        raise RuntimeError(f"출발 노드 '{spec.origin_id}'를 도로 그래프에서 찾을 수 없습니다.")
+    if not spec.dest_id or spec.dest_id not in road_nodes:
+        raise RuntimeError(f"목적지 노드 '{spec.dest_id}'를 도로 그래프에서 찾을 수 없습니다.")
+    if spec.policy not in SUPPORTED_POLICIES:
+        raise RuntimeError(f"지원하지 않는 정책입니다. 선택 가능: {SUPPORTED_POLICIES}")
+
+    env = V2XRoutingEnv(
+        graph=graph,
+        road_nodes=road_nodes,
+        bs_nodes=bs_nodes,
+        origin_id=spec.origin_id,
+        dest_id=spec.dest_id,
+        max_steps=spec.max_steps,
+        allocation_output=_state.get("last_allocation_result"),
+    )
+    if spec.n_episodes == 1:
+        result = run_episode(
+            env, policy=spec.policy, seed=spec.seed, record_trajectory=spec.record_trajectory,
+        )
+        payload = result.to_dict()
+    else:
+        payload = run_episodes(
+            env, n_episodes=spec.n_episodes, policy=spec.policy,
+            seed=spec.seed, record_trajectory=spec.record_trajectory,
+        )
+    return {"mode": "rl_episode", **payload}
+
+
+def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
+    """배치 워커(백그라운드 스레드). _state를 시나리오마다 재사용/덮어쓰므로 반드시 순차 실행."""
+    global _active_batch_id
+    run = _batch_runs[batch_id]
+    for i, spec in enumerate(scenarios):
+        item_id = spec.id or spec.label or str(i)
+        # 평가 함수(_evaluate_route_scenario/_evaluate_rl_scenario)는 결과만 반환하므로,
+        # 원본 요청 파라미터(vehicle_count/seed/origin 등)는 여기서 같이 기록해야 프런트의
+        # 시나리오 비교 카드가 결과만 보고도 "무엇을 입력해서 나온 결과인지" 알 수 있다.
+        base_info = {
+            "index": i, "id": item_id, "label": spec.label, "mode": spec.mode,
+            "vehicle_count": spec.vehicle_count, "seed": spec.seed,
+            "origin": spec.origin, "dest": spec.dest,
+            "origin_id": spec.origin_id, "dest_id": spec.dest_id,
+        }
+        try:
+            if spec.mode == "rl_episode":
+                result = _evaluate_rl_scenario(spec)
+            else:
+                result = _evaluate_route_scenario(spec, scenario_id=item_id, batch_id=batch_id)
+            run["results"].append({**base_info, "status": "done", **result})
+        except Exception as exc:
+            run["results"].append({**base_info, "status": "error", "error": str(exc)})
+        run["completed"] = i + 1
+    run["status"] = "completed"
+    run["ended_at"] = datetime.now(timezone.utc).isoformat()
+    _active_batch_id = None
+
+
+@app.post("/api/scenarios/batch")
+def start_scenario_batch(req: ScenarioBatchRequest):
+    """
+    Phase 2: 여러 시나리오를 순차적으로 헤드리스 평가(실시간 애니메이션 스레드 없음).
+    각 시나리오는 mode="route_metrics"(경로/자원할당/기지국선택 비교, lat/lng 기반) 또는
+    mode="rl_episode"(RL 베이스라인 정책 평가, 도로그래프 노드ID 기반) 중 하나.
+
+    _state를 공유하는 단일 순차 실행이므로 동시에 배치 하나만 돌 수 있고, 실행 중에는
+    실시간 /api/simulation/start도 막힌다(서로 같은 _state를 덮어써서 충돌하기 때문).
+
+    즉시 batch_id를 반환하고 백그라운드 스레드에서 순차 실행 — 진행 상황과 결과는
+    GET /api/scenarios/batch/{batch_id}로 폴링.
+    """
+    global _active_batch_id
+    if not req.scenarios:
+        raise HTTPException(status_code=400, detail="scenarios가 비어 있습니다.")
+    if len(req.scenarios) > 100:
+        raise HTTPException(status_code=400, detail="배치당 최대 100개 시나리오까지 지원합니다.")
+    if _active_batch_id is not None:
+        raise HTTPException(status_code=409, detail="다른 배치가 이미 실행 중입니다.")
+    if _sim_thread and _sim_thread.is_alive():
+        raise HTTPException(
+            status_code=409,
+            detail="실시간 시뮬레이션이 진행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 먼저 종료하세요.",
+        )
+
+    batch_id = str(uuid4())
+    _batch_runs[batch_id] = {
+        "batch_id": batch_id,
+        "label": req.label,
+        "status": "running",
+        "total": len(req.scenarios),
+        "completed": 0,
+        "results": [],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "ended_at": None,
+    }
+    _active_batch_id = batch_id
+    threading.Thread(target=_run_scenario_batch, args=(batch_id, req.scenarios), daemon=True).start()
+    return {"batch_id": batch_id, "status": "running", "total": len(req.scenarios)}
+
+
+@app.get("/api/scenarios/batch/{batch_id}")
+def get_scenario_batch(batch_id: str):
+    """배치 진행 상태 + 완료된 시나리오 결과 폴링."""
+    run = _batch_runs.get(batch_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"배치 '{batch_id}'를 찾을 수 없습니다.")
+    return run
+
+
+@app.post("/api/scenarios/generate")
+def generate_scenarios(req: ScenarioGenerateRequest):
+    """
+    Phase 3: 자연어 설명으로 시나리오 묶음을 LLM이 생성 + 도로망에 snap.
+
+    LLM은 현재 로드된 지역의 bbox만 알 뿐 실제 도로망은 모르므로, origin/dest로 내놓은
+    좌표가 건물 위/도로 밖에 떨어질 수 있다. 그래서 응답을 그대로 쓰지 않고:
+      1) bbox 안에 있는지 1차로 거른다(많이 벗어난 좌표는 버리고 warnings에 기록).
+      2) 통과한 좌표를 nearest_mock_node()로 실제 도로 그래프 노드에 snap한다
+         (origin/dest를 snap된 노드의 실좌표로 덮어쓰고, origin_node_id/dest_node_id에 기록).
+    결과는 ScenarioSpec과 동일한 모양이라 POST /api/scenarios/batch에 그대로 넣을 수 있다.
+    """
+    from app.services.llm.client import generate as llm_generate
+
+    if not _state["network_ready"] or not _state.get("mock_graph"):
+        raise HTTPException(
+            status_code=400,
+            detail="도로 그래프가 아직 로드되지 않았습니다. 먼저 구역을 설정하세요(snap-to-road에 필요).",
+        )
+    count = max(1, min(req.count, 20))
+    bbox = _state.get("current_bbox") or {}
+    graph = _state["mock_graph"]
+
+    prompt = f"""당신은 V2X 차량-네트워크 시뮬레이션의 시나리오 설계자입니다.
+아래 사용자 설명에 맞는 시뮬레이션 시나리오 {count}개를 생성하세요.
+
+=== 사용자 설명 ===
+{req.description}
+
+=== 제약 조건 ===
+- 모든 origin/dest 좌표는 반드시 아래 bbox 범위 안에 있어야 합니다:
+  남쪽(lat 최소)={bbox.get('s')}, 북쪽(lat 최대)={bbox.get('n')}, 서쪽(lng 최소)={bbox.get('w')}, 동쪽(lng 최대)={bbox.get('e')}
+- origin과 dest는 서로 달라야 하고, 직선거리로 최소 200m 이상 떨어져야 합니다.
+- vehicle_count는 1~30 사이 정수로, 사용자 설명의 의도(예: "혼잡"은 큰 값, "단일 차량"은 1)를 반영하세요.
+- label은 시나리오를 한국어로 간단히 설명하는 10자 내외 문구로 작성하세요.
+
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 출력하지 마세요.
+{{
+  "scenarios": [
+    {{"label": "...", "origin": {{"lat": 0.0, "lng": 0.0}}, "dest": {{"lat": 0.0, "lng": 0.0}}, "vehicle_count": 1}}
+  ]
+}}"""
+
+    try:
+        text, provider_used = llm_generate(prompt, provider=req.provider or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM API 오류 ({req.provider or 'auto'}): {str(exc)[:400]}")
+
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        raw_scenarios = json.loads(text[start:end]).get("scenarios", []) if start >= 0 and end > start else []
+    except (json.JSONDecodeError, ValueError):
+        raw_scenarios = []
+
+    if not raw_scenarios:
+        raise HTTPException(status_code=502, detail="LLM 응답에서 시나리오를 파싱하지 못했습니다.")
+
+    pad = 0.02  # bbox 살짝 벗어난 좌표(경계 근처)는 허용, 멀리 벗어난 건 버림
+    lat_lo, lat_hi = bbox.get("s", -90) - pad, bbox.get("n", 90) + pad
+    lng_lo, lng_hi = bbox.get("w", -180) - pad, bbox.get("e", 180) + pad
+
+    def _in_bbox(pt: dict) -> bool:
+        return lat_lo <= pt.get("lat", 0) <= lat_hi and lng_lo <= pt.get("lng", 0) <= lng_hi
+
+    scenarios: list[dict] = []
+    warnings: list[str] = []
+    seed_base = req.seed_base if req.seed_base is not None else 0
+
+    for i, raw in enumerate(raw_scenarios[:count]):
+        label = str(raw.get("label") or f"시나리오 {i + 1}")
+        origin = raw.get("origin") or {}
+        dest = raw.get("dest") or {}
+        if not _in_bbox(origin) or not _in_bbox(dest):
+            warnings.append(f"'{label}': origin/dest가 로드된 지역 범위를 벗어나 제외했습니다.")
+            continue
+        try:
+            origin_node_id = nearest_mock_node(graph, float(origin["lat"]), float(origin["lng"]))
+            dest_node_id = nearest_mock_node(graph, float(dest["lat"]), float(dest["lng"]))
+        except (RuntimeError, KeyError, TypeError):
+            warnings.append(f"'{label}': 도로망에 snap하지 못해 제외했습니다.")
+            continue
+
+        snapped_origin = graph["nodes"][origin_node_id]
+        snapped_dest = graph["nodes"][dest_node_id]
+        if origin_node_id == dest_node_id:
+            warnings.append(f"'{label}': origin/dest가 같은 도로 노드로 snap되어 제외했습니다.")
+            continue
+
+        vehicle_count = max(1, min(int(raw.get("vehicle_count") or 1), 30))
+        scenarios.append({
+            "id": f"gen-{i + 1}",
+            "label": label,
+            "mode": "route_metrics",
+            "source": "llm_generated",
+            "origin": {"lat": snapped_origin["lat"], "lng": snapped_origin["lng"]},
+            "dest": {"lat": snapped_dest["lat"], "lng": snapped_dest["lng"]},
+            "origin_node_id": origin_node_id,
+            "dest_node_id": dest_node_id,
+            "vehicle_count": vehicle_count,
+            "seed": seed_base + i,
+        })
+
+    if not scenarios:
+        raise HTTPException(
+            status_code=502,
+            detail="LLM이 생성한 시나리오 중 도로망에 유효하게 snap된 것이 없습니다. " + " ".join(warnings),
+        )
+
+    return {"scenarios": scenarios, "warnings": warnings, "provider": provider_used, "requested_count": count}
 
 
 @app.post("/api/simulation/stop")
@@ -3183,11 +4663,77 @@ async def reset_simulation():
         "vehicle_pos": _state.get("vehicle_pos"),
         "network_telemetry": _state.get("network_telemetry"),
         "sim_mode": _state.get("sim_mode"),
+        # 비교/리포트에 실제로 쓰이는 메트릭까지 같이 저장 — 이전에는 vehicle_pos만 있어서
+        # 영구 저장된 run을 나중에 비교할 방법이 없었다.
+        "algorithm_metrics": _state.get("algorithm_metrics"),
+        "simulation_summary": _state.get("simulation_summary"),
     })
     _sim_thread = None
     _stop_event = threading.Event()
     _pause_event = threading.Event()
     reset_simulation_state()
+    return {"ok": True}
+
+
+@app.get("/api/simulation/runs")
+def get_simulation_runs(limit: int = 50, offset: int = 0):
+    """
+    Persistent, team-shared simulation run history (backed by Postgres
+    `simulation_runs`, populated automatically on every start/reset —
+    no extra action needed to record a run).
+
+    Falls back gracefully when no DB is connected: returns
+    {"available": False} rather than an error, so the frontend can fall
+    back to its local-only history (localStorage) instead.
+
+    Response (available):
+      { "available": true, "runs": [ {id, origin, destination, mode,
+        scenario_id, seed, batch_id, started_at, ended_at, metrics_json}, ... ],
+        "limit": int, "offset": int }
+    """
+    if not postgis_available():
+        return {"available": False, "reason": "DB가 연결되어 있지 않습니다 (로컬 기록만 사용 가능)."}
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    runs = list_simulation_runs(limit=limit, offset=offset)
+    return {"available": True, "runs": runs, "limit": limit, "offset": offset}
+
+
+@app.get("/api/simulation/runs/by-sheet/{sheet_id}")
+def get_simulation_runs_by_sheet(sheet_id: str, limit: int = 50):
+    """Same shape as /api/simulation/runs, filtered to one sheet — lets the
+    Dashboard/Report tabs show a sheet's durable history from the DB instead
+    of (or alongside) whatever's still sitting in this browser's localStorage."""
+    if not postgis_available():
+        return {"available": False, "reason": "DB가 연결되어 있지 않습니다 (로컬 기록만 사용 가능)."}
+    runs = list_simulation_runs_by_sheet(sheet_id, limit=max(1, min(limit, 200)))
+    return {"available": True, "runs": runs}
+
+
+class RunCaptureRequest(BaseModel):
+    sim_logs: list[dict] = []
+    sim_history: list[dict] = []
+    route_edges: Optional[dict] = None
+
+
+@app.post("/api/simulation/runs/{run_id}/capture")
+def capture_simulation_run(run_id: int, req: RunCaptureRequest):
+    """
+    프런트의 시트 캡처(도착/정지 시점)가 이 엔드포인트도 같이 호출해, sim_logs/sim_history/
+    route_edges처럼 백엔드 _state에는 없는(프런트 전용) 데이터를 DB simulation_runs 행에
+    영구 저장한다. finish_simulation_run이 metrics_json을 머지하므로, 이후 다른 경로(예:
+    /api/simulation/reset)가 같은 run_id를 다시 finish해도 여기서 저장한 값을 덮어쓰지 않는다.
+    """
+    finish_simulation_run(run_id, {
+        "vehicle_pos": _state.get("vehicle_pos"),
+        "network_telemetry": _state.get("network_telemetry"),
+        "sim_mode": _state.get("sim_mode"),
+        "algorithm_metrics": _state.get("algorithm_metrics"),
+        "simulation_summary": _state.get("simulation_summary"),
+        "sim_logs": req.sim_logs,
+        "sim_history": req.sim_history,
+        "route_edges": req.route_edges,
+    })
     return {"ok": True}
 
 
@@ -3365,6 +4911,28 @@ def get_route_metrics():
         "algorithms": algorithms,
         "comparison": comparison,
     }
+
+
+@app.post("/api/route/compare-algorithms")
+def post_compare_algorithms():
+    """
+    Re-evaluate the current route under every latency / BS-selection /
+    resource-allocation algorithm and store results in
+    _state["algorithm_comparison"] for the Comparison tab. Runs in a
+    background thread — poll GET /api/route/compare-algorithms for status.
+    """
+    if not _state.get("route_cost_result"):
+        raise HTTPException(status_code=400, detail="시뮬레이션을 먼저 실행하세요.")
+    if (_state.get("algorithm_comparison") or {}).get("status") == "running":
+        return {"ok": True, "status": "running"}
+    threading.Thread(target=_run_algorithm_comparison, daemon=True).start()
+    return {"ok": True, "status": "running"}
+
+
+@app.get("/api/route/compare-algorithms")
+def get_compare_algorithms():
+    """Poll the status/result of the algorithm-comparison sweep."""
+    return _state.get("algorithm_comparison") or {"status": "idle"}
 
 
 @app.get("/api/latency/algorithms")
@@ -4400,6 +5968,174 @@ def run_llm_analysis(req: LLMAnalysisRequest):
     return {"sections": sections, "provider": provider_used}
 
 
+class BatchAnalysisRequest(BaseModel):
+    """
+    배치 비교 AI 분석(Phase 6) 요청. 배치 결과는 프런트(localStorage)에 저장돼 있고 백엔드의
+    _batch_runs는 서버 재시작 시 사라지므로, batch_id로 재조회하지 않고 프런트가 가진 results
+    배열을 그대로 받는다 — GET /api/scenarios/batch/{id}가 반환하는 모양과 동일.
+    """
+    label: Optional[str] = None
+    results: list[dict]
+    provider: Optional[str] = None
+
+
+@app.post("/api/analysis/llm/batch-compare")
+def run_batch_comparison_analysis(req: BatchAnalysisRequest):
+    """
+    여러 시나리오(시트)의 배치 결과를 한 번에 LLM에 보내 비교 분석을 생성한다.
+    기존 /api/analysis/llm은 단일 실행을 깊게 분석하는 용도라 그대로 두고,
+    이건 "어떤 설정이 어떤 지표에서 우수했는지" 비교 서술이 목적인 별도 엔드포인트다.
+    """
+    from app.services.llm.client import generate as llm_generate
+
+    if not req.results:
+        raise HTTPException(status_code=400, detail="results가 비어 있습니다.")
+
+    lines = []
+    for r in req.results:
+        label = r.get("label") or r.get("id") or "이름없음"
+        if r.get("status") != "done":
+            lines.append(f"- {label}: 실패 ({r.get('error', '알 수 없는 오류')})")
+            continue
+        if r.get("mode") == "rl_episode":
+            reward = r.get("total_reward", r.get("mean_reward"))
+            steps = r.get("steps", r.get("mean_steps"))
+            arrived = r.get("arrived", r.get("arrival_rate"))
+            lines.append(
+                f"- {label} (RL 정책 {r.get('policy', '')}): reward={reward}, steps={steps}, "
+                f"도착={arrived}, seed={r.get('seed')}"
+            )
+        else:
+            rc = r.get("route_cost_result") or {}
+            lines.append(
+                f"- {label} (경로평가): 총비용={rc.get('total_cost')}, "
+                f"평균지연={rc.get('avg_latency_ms')}ms, 핸드오버={rc.get('handover_count')}회, "
+                f"커버리지={rc.get('covered_pct')}%, 차량수={r.get('vehicle_count')}, seed={r.get('seed')}"
+            )
+
+    prompt = f"""당신은 V2X 네트워크 시뮬레이션 비교 분석가입니다.
+아래는 같은 배치("{req.label or '제목 없음'}") 안에서 서로 다른 설정으로 실행한
+시나리오(시트)들의 결과입니다. 시나리오 수: {len(req.results)}개
+
+=== 시나리오별 결과 ===
+{chr(10).join(lines)}
+
+=== 분석 요구사항 ===
+반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 출력하지 마세요.
+각 section은 한 문단(2~4문장)으로, 위 실측 수치를 반드시 인용해 구체적으로 작성하세요.
+
+{{
+  "sections": [
+    "[01 종합 비교] 전체적으로 가장 우수한 시나리오와 그 이유를 요약하세요.",
+    "[02 지연시간·비용 비교] 시나리오 간 차이와 추정 원인(차량 수, 알고리즘 설정 등)을 분석하세요.",
+    "[03 자원·연결 안정성 비교] 핸드오버·커버리지·자원할당 측면의 트레이드오프를 짚으세요.",
+    "[04 권장 설정] 어떤 상황(혼잡/한적, 연구 목적 등)에 어떤 시나리오 설정을 추천할지 제시하세요."
+  ]
+}}"""
+
+    try:
+        text, provider_used = llm_generate(prompt, provider=req.provider or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM API 오류 ({req.provider or 'auto'}): {str(exc)[:400]}")
+
+    sections: list = []
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            sections = json.loads(text[start:end]).get("sections", [])
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    if not sections:
+        sections = [line.strip() for line in text.splitlines() if line.strip()]
+
+    return {"sections": sections, "provider": provider_used}
+
+
+# 경로/기지국선택 알고리즘은 LATENCY_REGISTRY/ALLOCATION_REGISTRY 같은 description
+# 레지스트리가 없어 여기서 직접 한 줄 설명을 작성한다 — route_cost_function.py의
+# BS 알고리즘 docstring, main.py의 cost_weights/policy_options 필드 의미를 근거로 함.
+_ROUTE_ALGO_DESC = {
+    "dijkstra": "거리 기준 최단경로 (기본값)",
+    "astar": "목적지 방향 휴리스틱을 더한 최단경로 탐색 — dijkstra와 같은 거리 축을 쓰지만 더 빠르게 같은/비슷한 경로를 찾음",
+    "k_shortest_path": "위상적으로 짧은 후보 경로 K개를 뽑은 뒤, 그중 네트워크 비용(지연·부하·핸드오버 등)이 가장 낮은 것을 선택",
+    "network_aware": "거리뿐 아니라 지연시간·기지국 부하·핸드오버 비용까지 반영해 그래프 전체를 다시 탐색",
+    "lookahead": "출발 지점에서 몇 홉 앞의 기지국 커버리지 공백을 미리 예측해, 커버리지가 끊길 위험이 큰 구간을 피해가도록 가중치를 줌",
+    "rl_routing": "강화학습 기반 경로 선택 — 아직 학습된 에이전트가 없어 미구현 상태, 선택해도 baseline dijkstra로 동작함",
+}
+_BS_SELECTION_DESC = {
+    "nearest_bs": "단순 직선거리(Haversine)가 가장 가까운 기지국 선택",
+    "lowest_latency_bs": "전파 손실 + 혼잡도 + 구간 지연을 합쳐 예상 지연시간이 가장 낮은 기지국 선택 (기본값)",
+    "strongest_signal_bs": "거리의 제곱에 반비례하는 자유공간 경로손실 근사값으로 신호가 가장 강한 기지국 선택",
+    "load_balanced_bs": "부하율(load/capacity)이 가장 낮은 기지국을 우선하고, 거리는 동률일 때만 보조 기준으로 사용",
+    "look_ahead_bs_selection": "lowest_latency_bs와 동일하지만, 곧 커버리지를 벗어날 기지국에는 강한 페널티를 추가",
+    "rl_based_bs_selection": "강화학습 기반 기지국 선택 — 아직 학습된 에이전트가 없어 미구현 상태, 선택해도 lowest_latency_bs로 동작함",
+}
+_COST_WEIGHT_DESC = {
+    "w_distance": "경로 길이(거리)에 대한 가중치 — 클수록 더 짧은 경로를 선호",
+    "w_time": "주행 예상 시간에 대한 가중치 — 클수록 더 빠른 경로를 선호",
+    "w_latency": "통신 지연시간에 대한 가중치 — 클수록 지연이 낮은 경로/기지국을 선호",
+    "w_load": "기지국 부하율에 대한 가중치 — 클수록 혼잡한 기지국 인근 경로를 피함",
+    "w_resource": "자원(무선 자원블록) 부족 비용에 대한 가중치",
+    "w_handover": "핸드오버(기지국 전환) 횟수에 대한 가중치 — 클수록 전환이 적은 경로를 선호",
+    "w_blockage": "건물에 의한 신호 차폐 손실에 대한 가중치",
+    "w_future": "미래 커버리지 리스크(앞으로 커버리지가 끊길 가능성)에 대한 가중치",
+}
+_POLICY_OPTION_DESC = {
+    "lookahead_k": "lookahead 경로 알고리즘이 몇 홉 앞까지 미리 내다볼지 (정수 1~10)",
+    "lookahead_time": "lookahead가 내다보는 시간 범위(초)",
+    "max_handover_allowed": "시뮬레이션 중 허용하는 최대 핸드오버 횟수",
+    "prefer_low_latency": "true면 지연시간이 낮은 선택을 더 강하게 선호",
+    "prefer_load_balance": "true면 기지국 간 부하 분산을 더 강하게 선호",
+    "avoid_disconnection": "true면 커버리지 단절 구간을 적극적으로 회피",
+    "traffic_lambda": "배경 차량/트래픽 강도를 나타내는 파라미터 (0~200)",
+    "network_mode": "통신 세대 — \"4G\" | \"5G\" | \"6G\"",
+}
+
+
+def _scenario_schema_doc() -> str:
+    """시나리오 어시스턴트(파싱/챗봇)가 LLM에 넘기는 설정 스키마 + 알고리즘 설명 문서.
+
+    LATENCY_REGISTRY/ALLOCATION_REGISTRY에 등록된 실제 description을 우선 사용해
+    LLM이 실제 백엔드 동작과 어긋나지 않는 설명을 하도록 그라운딩한다.
+    """
+    lat_lines = []
+    if LATENCY_AVAILABLE:
+        for meta in LATENCY_REGISTRY.list_algorithms():
+            lat_lines.append(f"    {meta['id']}: {meta.get('description', '')}")
+    alloc_lines = []
+    if RESOURCE_DEMAND_AVAILABLE:
+        for meta in ALLOCATION_REGISTRY.list_algorithms():
+            alloc_lines.append(f"    {meta['id']}: {meta.get('description', '')}")
+    route_lines = [f"    {k}: {v}" for k, v in _ROUTE_ALGO_DESC.items()]
+    bs_lines = [f"    {k}: {v}" for k, v in _BS_SELECTION_DESC.items()]
+    weight_lines = [f"    {k}: {v}" for k, v in _COST_WEIGHT_DESC.items()]
+    policy_lines = [f"    {k}: {v}" for k, v in _POLICY_OPTION_DESC.items()]
+
+    return f"""
+스키마 (이 키들만 사용, 다른 키는 절대 만들지 마세요):
+
+cost_weights (모든 값은 0 이상 숫자, 보통 0~20 범위) — 각 필드 의미:
+{chr(10).join(weight_lines)}
+
+algorithm_selection (각 키는 아래 후보 중 정확히 하나의 문자열) — 각 옵션 의미:
+  route_algorithm 후보:
+{chr(10).join(route_lines)}
+  latency_algorithm 후보:
+{chr(10).join(lat_lines) if lat_lines else "    (레지스트리 미사용 — full_composite_latency 등 기본 후보만 가능)"}
+  base_station_selection_algorithm 후보:
+{chr(10).join(bs_lines)}
+  resource_allocation_algorithm 후보:
+{chr(10).join(alloc_lines) if alloc_lines else "    (레지스트리 미사용 — traffic_aware_allocation 등 기본 후보만 가능)"}
+
+policy_options — 각 필드 의미:
+{chr(10).join(policy_lines)}
+"""
+
+
 class ScenarioParseRequest(BaseModel):
     input_text: str
     input_type: str = "nl"          # "nl" | "code"
@@ -4417,23 +6153,7 @@ def parse_scenario(req: ScenarioParseRequest):
     """
     from app.services.llm.client import generate as llm_generate
 
-    schema_doc = """
-스키마 (이 키들만 사용, 다른 키는 절대 만들지 마세요):
-
-cost_weights (모든 값은 0 이상 숫자, 보통 0~20 범위):
-  w_distance, w_time, w_latency, w_load, w_resource, w_handover, w_blockage, w_future
-
-algorithm_selection (각 키는 아래 후보 중 정확히 하나의 문자열):
-  route_algorithm: dijkstra | astar | k_shortest_path | network_aware | lookahead | rl_routing
-  latency_algorithm: full_composite_latency | blockage_aware_latency | mec_aware_latency | distance_based_latency | load_aware_latency
-  base_station_selection_algorithm: lowest_latency_bs | nearest_bs | load_balanced_bs
-  resource_allocation_algorithm: traffic_aware_allocation | equal_allocation | proportional_demand_allocation | load_balancing_allocation | latency_minimizing_allocation | priority_based_allocation | lookahead_resource_allocation
-
-policy_options:
-  lookahead_k (정수 1~10), lookahead_time (숫자, 초), max_handover_allowed (정수 0 이상),
-  prefer_low_latency (true/false), prefer_load_balance (true/false), avoid_disconnection (true/false),
-  traffic_lambda (숫자 0~200), network_mode: "4G" | "5G" | "6G"
-"""
+    schema_doc = _scenario_schema_doc()
 
     input_label = "자연어 시나리오 설명" if req.input_type == "nl" else "코드/JSON 형태의 설정 조각"
     prompt = f"""당신은 V2X 네트워크 시뮬레이션의 설정 어시스턴트입니다.
@@ -4488,6 +6208,98 @@ policy_options:
     return {"ok": bool(diff), "provider": provider_used, "diff": diff, "rationale": rationale}
 
 
+class ScenarioChatMessage(BaseModel):
+    role: str   # "user" | "assistant"
+    content: str
+
+
+class ScenarioChatRequest(BaseModel):
+    messages: list[ScenarioChatMessage]
+    current_config: dict = {}
+    provider: Optional[str] = None
+
+
+@app.post("/api/scenarios/chat")
+def chat_scenario(req: ScenarioChatRequest):
+    """
+    대화형 시나리오 어시스턴트 — 무상태(stateless) 엔드포인트.
+    매 호출마다 프론트가 전체 대화 히스토리를 보낸다(백엔드에 아무것도 저장하지 않음).
+    사용자가 옵션에 대해 질문하면 diff 없이 설명만, 변경을 요청하면 diff를 채워 반환한다.
+    프론트가 diff를 검증해 적용 여부를 결정한다(파싱 결과를 그대로 믿고 적용하지 않음).
+    """
+    from app.services.llm.client import generate as llm_generate
+
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages가 비어 있습니다.")
+
+    schema_doc = _scenario_schema_doc()
+    history_lines = []
+    for m in req.messages[-10:]:
+        speaker = "사용자" if m.role == "user" else "어시스턴트"
+        history_lines.append(f"{speaker}: {m.content}")
+    last_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
+
+    prompt = f"""당신은 V2X 네트워크 시뮬레이션의 설정 어시스턴트 챗봇입니다.
+사용자와 대화하며, (1) 시뮬레이션 옵션/필드가 무엇을 하는지 질문하면 설명해주고,
+(2) 설정을 바꿔달라고 요청하면 실제로 바뀌어야 하는 값을 diff로 만들어 돌려줍니다.
+
+=== 현재 설정 ===
+{json.dumps(req.current_config, ensure_ascii=False, indent=2)}
+
+=== 설정 스키마 및 각 옵션 설명 ===
+
+{schema_doc}
+
+=== 대화 기록 (최근 순) ===
+{chr(10).join(history_lines)}
+
+=== 작업 지침 ===
+- 마지막 사용자 메시지("{last_user_msg}")가 질문이면: reply에 친절하고 정확한 한국어
+  설명만 작성하고, diff는 비워두세요(섹션 모두 빈 객체).
+- 마지막 사용자 메시지가 설정 변경 요청이면: reply에 무엇을 어떻게 바꿨는지 한두 문장으로
+  확인하고, diff에 실제로 바뀌어야 하는 키만 포함하세요. 스키마에 없는 키는 절대 만들지
+  마세요. 바뀌지 않는 키는 diff에 넣지 마세요.
+- 변경 요청인지 질문인지 모호하면 설명을 우선하고 diff는 비워둔 채, 어떤 값으로
+  바꾸고 싶은지 되물어보세요.
+- 각 변경 키마다 한 줄짜리 변경 이유(rationale)를 작성하세요.
+- 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 출력하지 마세요.
+
+{{
+  "reply": "사용자에게 보여줄 한국어 대화 응답",
+  "diff": {{
+    "cost_weights": {{}},
+    "algorithm_selection": {{}},
+    "policy_options": {{}}
+  }},
+  "rationale": {{
+    "<바뀐 키>": "한 줄 이유"
+  }}
+}}"""
+
+    try:
+        text, provider_used = llm_generate(prompt, provider=req.provider or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        detail = str(exc)
+        raise HTTPException(status_code=502, detail=f"LLM API 오류 ({req.provider or 'auto'}): {detail[:400]}")
+
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        parsed = json.loads(text[start:end]) if start >= 0 and end > start else {}
+    except (json.JSONDecodeError, ValueError):
+        parsed = {}
+
+    reply = parsed.get("reply") or "응답을 이해하지 못했어요. 다시 한 번 말씀해 주시겠어요?"
+    diff = parsed.get("diff") or {}
+    rationale = parsed.get("rationale") or {}
+    if not isinstance(diff, dict):
+        diff = {}
+
+    return {"ok": True, "provider": provider_used, "reply": reply, "diff": diff, "rationale": rationale}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     """WebSocket — sends vehicle position at ~10 fps."""
@@ -4499,6 +6311,7 @@ async def websocket_endpoint(ws: WebSocket):
         last_telemetry = None
         last_cost_version = 0
         last_connected: bool | None = None  # None=unknown, True=connected, False=disconnected
+        bg_tick = 0  # 배경 차량 위치는 매 틱(100ms)이 아니라 더 느리게 보냄 (대충 보여주는 용도)
         while True:
             pos = _state.get("vehicle_pos")
             err = _state.get("error")
@@ -4533,6 +6346,18 @@ async def websocket_endpoint(ws: WebSocket):
             if telemetry and telemetry != last_telemetry:
                 await ws.send_json({"type": "telemetry", **telemetry})
                 last_telemetry = telemetry
+
+            # 다중차량 실험군 — 배경 차량 위치는 매 틱이 아니라 4틱(~400ms)마다 한번씩만 전송
+            bg_tick += 1
+            bg_veh = _state.get("background_vehicles")
+            if bg_veh and bg_tick % 4 == 0:
+                await ws.send_json({
+                    "type": "background_positions",
+                    "vehicles": [
+                        {"id": v["id"], "lat": v["lat"], "lng": v["lng"], "speed": v.get("speed", v.get("speed_kmh", 0))}
+                        for v in bg_veh
+                    ],
+                })
 
             # Disconnection detection: emit once when BS coverage is lost mid-simulation
             sim_running_now = _state.get("sim_running", False)

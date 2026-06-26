@@ -45,21 +45,128 @@ const DEFAULT_ALGORITHM_SELECTION = {
   base_station_selection: 'lowest_latency_bs',
   resource_allocation: 'equal_allocation',
 };
-const NETWORK_ROUTING_ALGORITHMS = new Set([
-  'network_aware_routing',
-  'look_ahead_routing',
-  'rl_routing',
-]);
+// rl_routing은 아직 학습된 RL 에이전트가 없어 미구현 — 선택해도 baseline Dijkstra로
+// 동작한다(거짓 표시 방지를 위해 선택 버튼에 "미구현" 칩을 붙임).
+const UNIMPLEMENTED_ROUTE_ALGORITHMS = new Set(['rl_routing']);
 
 function formatAlgorithmName(name) {
   return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, api }) {
+// 시뮬레이션 시트(Phase 5) — 엑셀 시트탭처럼 여러 설정/결과 묶음을 저장·전환·비교.
+// "전체 비교 실행"이 만든 결과는 tab-scenario.jsx의 시나리오 배치와 같은 키를 써서
+// 분석보고서 탭의 "시나리오 배치 비교" 카드가 그대로 보여준다 — 비교 로직을 한 곳에만 둔다.
+const SIM_SHEETS_KEY = 'v2x_sim_sheets';
+function loadSimSheets() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SIM_SHEETS_KEY) || 'null');
+    if (saved && saved.length) return saved;
+  } catch {}
+  return [{ id: `sheet-${Date.now()}`, name: 'Sheet 1', config: {}, result: null, status: 'draft' }];
+}
+function saveSimSheets(list) {
+  try { localStorage.setItem(SIM_SHEETS_KEY, JSON.stringify(list)); } catch {}
+}
+const SCB_BATCH_KEY = 'v2x_scenario_batches'; // tab-scenario.jsx / tab-report.jsx와 동일 키(읽기·쓰기 공용)
+function scbLoadBatches() {
+  try { return JSON.parse(localStorage.getItem(SCB_BATCH_KEY) || '[]'); } catch { return []; }
+}
+function scbSaveBatches(list) {
+  try { localStorage.setItem(SCB_BATCH_KEY, JSON.stringify(list.slice(-10))); } catch {}
+}
+
+// 엑셀 시트탭 스트립 — 더블클릭으로 이름 수정, "+"로 새 시트, "전체 비교 실행"으로 일괄 평가.
+function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError }) {
+  const [editingIdx, setEditingIdx] = useState(null);
+  const [editValue, setEditValue] = useState('');
+  return (
+    <div style={{
+      flex: '0 0 auto', height: 44, background: 'var(--surface)', borderTop: '1px solid var(--border)',
+      display: 'flex', alignItems: 'center', padding: '0 8px', gap: 3, overflowX: 'auto',
+    }}>
+      {sheets.map((s, i) => (
+        <div
+          key={s.id}
+          onClick={() => editingIdx !== i && onSwitch(i)}
+          onDoubleClick={() => { setEditingIdx(i); setEditValue(s.name); }}
+          title="더블클릭으로 이름 수정"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '0 10px', flex: '0 0 auto', height: 27,
+            borderRadius: 7, cursor: 'pointer', fontSize: 12, fontWeight: i === activeIdx ? 600 : 500,
+            background: i === activeIdx ? 'var(--brand-tint)' : 'transparent',
+            color: i === activeIdx ? 'var(--brand)' : 'var(--ink-3)',
+          }}
+        >
+          {editingIdx === i ? (
+            <input
+              autoFocus
+              value={editValue}
+              onChange={e => setEditValue(e.target.value)}
+              onBlur={() => { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }
+                if (e.key === 'Escape') setEditingIdx(null);
+              }}
+              onClick={e => e.stopPropagation()}
+              style={{ fontSize: 12.5, padding: '2px 4px', width: 90, border: '1px solid var(--border)', borderRadius: 4 }}
+            />
+          ) : (
+            <span style={{ whiteSpace: 'nowrap' }}>{s.name}</span>
+          )}
+          {s.status === 'ran' && <span title="실행 완료" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--good)', flex: '0 0 auto' }} />}
+          {sheets.length > 1 && (
+            <button
+              onClick={e => { e.stopPropagation(); onRemove(i); }}
+              title="시트 삭제"
+              style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--ink-4)', fontSize: 11, padding: 0, lineHeight: 1 }}
+            >✕</button>
+          )}
+        </div>
+      ))}
+      <button onClick={onAdd} title="새 시트" style={{
+        display: 'grid', placeItems: 'center', width: 30, flex: '0 0 auto', border: 'none', background: 'none',
+        cursor: 'pointer', color: 'var(--ink-3)', fontSize: 16,
+      }}>+</button>
+      <div style={{ flex: 1 }} />
+      {batchError && <span style={{ alignSelf: 'center', fontSize: 11, color: 'var(--bad)', marginRight: 8, whiteSpace: 'nowrap' }}>{batchError}</span>}
+      <button
+        className="btn sm"
+        disabled={batchRunning || sheets.length < 2}
+        onClick={onRunBatch}
+        style={{ alignSelf: 'center', margin: '0 4px', flex: '0 0 auto' }}
+        title={sheets.length < 2 ? '비교하려면 시트가 2개 이상 필요합니다' : '모든 시트를 헤드리스로 일괄 평가해 분석보고서 탭에서 비교'}
+      >
+        {batchRunning ? <><Icon.reset size={12} className="spin" /> 비교 실행 중…</> : <><Icon.compare size={12} /> 전체 비교 실행 ({sheets.length})</>}
+      </button>
+    </div>
+  );
+}
+
+// 컨트롤 패널 / 시뮬레이션 챗봇을 지도 위에 띄우는 원형 토글 버튼 — 둘 다 같은 디자인.
+function FabButton({ icon, active, onClick, title }) {
+  const IconComp = Icon[icon];
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        width: 38, height: 38, borderRadius: '50%', border: 'none', cursor: 'pointer',
+        display: 'grid', placeItems: 'center', flex: '0 0 auto',
+        background: active ? 'var(--brand-2)' : 'var(--brand)',
+        color: '#fff', boxShadow: 'var(--sh-2)',
+      }}
+    >
+      <IconComp size={16} />
+    </button>
+  );
+}
+
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, simHistory, routeEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
   const prevVehPos = useRef(null);
+  const bgVehMarkers = useRef({}); // 다중차량 실험군 — 배경 차량 마커 풀 (id → circleMarker), setLatLng로 재사용
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
   const MAX_SETUP_AREA_KM2 = 25;
@@ -73,13 +180,211 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [osmStage,   setOsmStage]   = useState(0); // 0 idle · 1 download · 2 convert · 3 ready
   const [osmError,   setOsmError]   = useState(null);
   const [osmWarning, setOsmWarning] = useState(null);
-  const [showLayers, setShowLayers] = useState({ vehicles: true, routes: true });
+  const [showLayers, setShowLayers] = useState({ vehicles: true, routes: true, stations: true });
   const [simError,   setSimError]   = useState(null);
   const [stations,   setStations]   = useState([]);   // user_created base stations from DB
   const [stationsErr,setStationsErr]= useState(null);
   const [openAlgorithmGroup, setOpenAlgorithmGroup] = useState(null);
   const [selectedAlgorithms, setSelectedAlgorithms] = useState(DEFAULT_ALGORITHM_SELECTION);
   const [networkGen, setNetworkGen] = useState('5g'); // 4g · 5g · 6g — UI only, not wired to backend
+  const [vehicleCount, setVehicleCount] = useState(1); // 다중차량 실험군 — 타겟 1대 + 배경 차량 (vehicleCount - 1)대
+  const [openPanel, setOpenPanel] = useState('control'); // null · 'control' · 'scenario' — 우측 FAB로 띄우는 플로팅 패널, 처음 열 때는 컨트롤 패널이 기본으로 열려있음
+
+  // ── 시뮬레이션 시트 (Phase 5) ──────────────────────────────────
+  // sheets/activeSheetIdx는 App(app.jsx)으로 끌어올려져 props로 내려온다 — 대시보드 탭도
+  // "지금 실행 중인 시트가 뭔지" 같은 출처를 봐야 시트별로 분리해서 보여줄 수 있기 때문.
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchError, setBatchError] = useState(null);
+  const prevArrived = useRef(false);
+  const currentRunIdRef = useRef(null); // /api/simulation/start가 돌려준 DB simulation_runs.id — 도착 시 시트 데이터를 같은 행에 영구 저장하는 데 씀
+
+  // 캡처된 결과가 있으면(이미 실행 완료된 시트) 그 로그를, 없으면(현재 진행 중인 시트) 실시간
+  // simLogs를 보여준다 — 둘 다 같은 시트 안에서만 머무르고 분석보고서 탭으로는 넘어가지 않는다.
+  const displayedSheetLogs = sheets[activeSheetIdx]?.result?.simLogs?.length
+    ? sheets[activeSheetIdx].result.simLogs
+    : (simLogs || []);
+
+  function currentConfigSnapshot() {
+    return { origin, dest, vehicleCount, selectedAlgorithms, networkGen, simConfig };
+  }
+
+  function loadSheetConfig(sheet) {
+    const c = sheet.config || {};
+    setOrigin(c.origin || null); setOriginDone(!!c.origin);
+    setDest(c.dest || null); setDestDone(!!c.dest);
+    setVehicleCount(c.vehicleCount ?? 1);
+    setSelectedAlgorithms(c.selectedAlgorithms || DEFAULT_ALGORITHM_SELECTION);
+    setNetworkGen(c.networkGen || '5g');
+    if (c.simConfig) setSimConfig(c.simConfig);
+    setNetworkTelemetry(sheet.result?.network_telemetry || null);
+    setRouteCoords(sheet.result?.routeCoords || []);
+    setVehiclePos(sheet.result?.vehiclePos || null);
+    prevArrived.current = !!sheet.result?.vehiclePos?.arrived;
+  }
+
+  async function switchToSheet(idx) {
+    if (idx === activeSheetIdx) return;
+    // 이전 시트의 시뮬레이션 스레드가 백그라운드에서 계속 돌고 있으면, 그 위치 업데이트가
+    // 웹소켓으로 계속 들어와 방금 비운 vehiclePos를 되돌려놓고, 나중에 도착하면 "지금"
+    // 활성화된(전혀 다른) 시트로 잘못 캡처되는 문제가 있었다 — 전환 전에 반드시 멈춘다.
+    if (sim.running) { try { await fetch(`${api}/api/simulation/stop`, { method: 'POST' }); } catch (_) {} }
+    const next = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
+    setSheets(next); saveSimSheets(next);
+    loadSheetConfig(next[idx]);
+    setActiveSheetIdx(idx);
+    dispatch({ type: 'pause' });
+  }
+
+  async function addSheet() {
+    // 새 시트 = 완전히 새로운 시뮬레이션. 이전엔 현재 설정을 복제만 해서 지도/출발지·도착지가
+    // 그대로 남아있어 "바뀐 게 없어 보인다"는 문제가 있었다 — origin/dest/결과를 비워서
+    // 사용자가 새로 출발지·도착지를 찍게 한다.
+    //
+    // 구역(area)도 비운다 — 시트끼리 같은 구역/지도를 그대로 이어받으면 "시트가 분리가
+    // 안 되고 하나의 지도에서 시뮬레이션되는 것처럼" 보인다는 피드백이 있었다. 새 시트는
+    // "지도에서 구역 그리기"부터 다시 시작해야 한다.
+    //
+    // 주의1: /api/simulation/reset은 호출하지 않는다 — 그 엔드포인트는 reset_simulation_state()를
+    // 통해 network_ready/mock_graph/current_bbox까지 전부 지워버리지만, 이미 area를 null로
+    // 비웠으므로 의미가 없다. 어차피 사용자가 새 구역을 그리면 /api/setup-network가 백엔드의
+    // current_bbox/mock_graph를 통째로 덮어써서 이전 시트의 네트워크를 자연스럽게 대체한다.
+    //
+    // 주의2: 이전 시트가 아직 실행 중이면 반드시 /api/simulation/stop으로 멈춰야 한다. 안 그러면
+    // 백그라운드 스레드가 계속 vehiclePos를 웹소켓으로 밀어넣어 방금 비운 상태를 되돌리고,
+    // 나중에 도착하면 그 시점에 활성화된(새로 만든) 시트로 잘못 캡처된다 — 실행도 안 한 새
+    // 시트에 초록 점이 찍히는 버그의 원인이었다.
+    if (sim.running) { try { await fetch(`${api}/api/simulation/stop`, { method: 'POST' }); } catch (_) {} }
+
+    const blankConfig = { origin: null, dest: null, vehicleCount: 1, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig };
+    const newSheet = { id: `sheet-${Date.now()}`, name: `Sheet ${sheets.length + 1}`, config: blankConfig, result: null, status: 'draft' };
+    const next = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s).concat(newSheet);
+    setSheets(next); saveSimSheets(next);
+    setActiveSheetIdx(next.length - 1);
+
+    setMode(null);
+    setArea(null);
+    setOsmStage(0); setOsmError(null); setOsmWarning(null);
+    setOrigin(null); setOriginDone(false);
+    setDest(null); setDestDone(false);
+    setVehicleCount(1);
+    setSelectedAlgorithms(DEFAULT_ALGORITHM_SELECTION);
+    setNetworkTelemetry(null);
+    setRouteCoords([]); setVehiclePos(null);
+    if (setBackgroundVehicles) setBackgroundVehicles([]);
+    setSimError(null); setSimNotice(null);
+    prevArrived.current = false;
+    dispatch({ type: 'reset' });
+    if (groups.current.areaRect) { groups.current.areaRect.remove(); groups.current.areaRect = null; }
+    if (groups.current.veh)     { groups.current.veh.remove(); groups.current.veh = null; }
+    if (groups.current.route)   groups.current.route.clearLayers();
+    if (groups.current.wp)      groups.current.wp.clearLayers();
+    if (groups.current.network) groups.current.network.clearLayers();
+    if (groups.current.blocks)  groups.current.blocks.clearLayers();
+    if (groups.current.bgVeh)   groups.current.bgVeh.clearLayers();
+    bgVehMarkers.current = {};
+  }
+
+  function renameSheet(idx, name) {
+    const next = sheets.map((s, i) => i === idx ? { ...s, name } : s);
+    setSheets(next); saveSimSheets(next);
+  }
+
+  function removeSheet(idx) {
+    if (sheets.length <= 1) return;
+    const next = sheets.filter((_, i) => i !== idx);
+    setSheets(next); saveSimSheets(next);
+    if (idx === activeSheetIdx) loadSheetConfig(next[Math.min(idx, next.length - 1)]);
+    setActiveSheetIdx(prev => idx < prev ? prev - 1 : Math.min(prev, next.length - 1));
+  }
+
+  // 도착(또는 정지)을 그 시점의 시트 결과로 캡처 — 시트를 바꿔도 잃지 않게 프런트에 저장.
+  // simLogs는 시트 안에 읽기전용으로만 저장한다(설계 B) — 분석보고서 탭의 로그 뷰는 항상
+  // "현재/마지막 실행"만 보여주고, 시트별 로그 비교는 이 시뮬레이션 탭에서 따로 보여준다.
+  // simHistory/routeEdges도 같이 담아둔다 — 대시보드 탭이 시트별로 분리해서 보여주려면
+  // (지금 실행 중이 아닌) 다른 시트의 latency 추이/엣지 비용도 스냅샷으로 남아 있어야 한다.
+  function captureResultIntoActiveSheet() {
+    setSheets(prev => {
+      const next = prev.map((s, i) => i === activeSheetIdx ? {
+        ...s,
+        config: currentConfigSnapshot(),
+        result: {
+          network_telemetry: networkTelemetry, routeCoords, vehiclePos, simLogs: simLogs || [],
+          simHistory: simHistory || [], routeEdges: routeEdges || null,
+          capturedAt: new Date().toISOString(),
+        },
+        status: 'ran',
+      } : s);
+      saveSimSheets(next);
+      return next;
+    });
+    // localStorage 스냅샷과 같은 데이터를 DB simulation_runs 행(sheet_id/sheet_name 태깅됨)에도
+    // 영구 저장 — 브라우저를 바꾸거나 localStorage가 지워져도 시트별 로그/수치가 남아있게 한다.
+    if (currentRunIdRef.current) {
+      fetch(`${api}/api/simulation/runs/${currentRunIdRef.current}/capture`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sim_logs: simLogs || [], sim_history: simHistory || [], route_edges: routeEdges || null }),
+      }).catch(() => {});
+    }
+  }
+
+  useEffect(() => {
+    if (vehiclePos?.arrived && !prevArrived.current) captureResultIntoActiveSheet();
+    prevArrived.current = !!vehiclePos?.arrived;
+  }, [vehiclePos?.arrived]);
+
+  async function runAllSheetsAsBatch() {
+    const allSheets = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
+    setSheets(allSheets); saveSimSheets(allSheets);
+
+    const specs = allSheets
+      .filter(s => s.config?.origin && s.config?.dest)
+      .map(s => ({
+        id: s.id,
+        label: s.name,
+        mode: 'route_metrics',
+        origin: s.config.origin,
+        dest: s.config.dest,
+        vehicle_count: s.config.vehicleCount || 1,
+        algorithm_config: s.config.selectedAlgorithms || {},
+        simulation_config: {
+          ...(s.config.simConfig || {}),
+          policy_options: { ...(s.config.simConfig?.policy_options || {}), network_mode: (s.config.networkGen || '5g').toUpperCase() },
+        },
+      }));
+    if (specs.length === 0) { setBatchError('출발지/도착지가 설정된 시트가 없습니다.'); return; }
+
+    setBatchRunning(true); setBatchError(null);
+    try {
+      const res = await fetch(`${api}/api/scenarios/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: '시뮬레이션 시트 비교', scenarios: specs }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      pollSheetBatch(data.batch_id);
+    } catch (e) {
+      setBatchRunning(false);
+      setBatchError(e.message || '배치 실행 중 오류가 발생했습니다.');
+    }
+  }
+
+  function pollSheetBatch(batchId) {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${api}/api/scenarios/batch/${batchId}`);
+        const data = await res.json();
+        if (data.status === 'completed') {
+          clearInterval(timer);
+          setBatchRunning(false);
+          const saved = scbLoadBatches();
+          saved.push({ batch_id: batchId, label: data.label, started_at: data.started_at, ended_at: data.ended_at, results: data.results });
+          scbSaveBatches(saved);
+        }
+      } catch {}
+    }, 1200);
+  }
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
@@ -110,6 +415,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     groups.current.network = L.layerGroup().addTo(map);
     groups.current.blocks = L.layerGroup().addTo(map);
     groups.current.stations = L.layerGroup().addTo(map);
+    // 다중차량 실험군 — 배경 차량용 캔버스 렌더러 (N=1000에서도 가벼움)
+    groups.current.bgVeh = L.layerGroup().addTo(map);
+    groups.current.bgVehRenderer = L.canvas({ padding: 0.5 });
     mapObj.current = map;
     return () => { map.remove(); mapObj.current = null; groups.current = {}; };
   }, []);
@@ -205,6 +513,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   useEffect(() => {
     const g = groups.current.stations; if (!g) return;
     g.clearLayers();
+    if (!showLayers.stations) return;
     const deleteMode = mode === 'bs_delete';
     // latency lookup so label can include it when sim is running
     const latencyMap = {};
@@ -241,7 +550,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         });
       }
     });
-  }, [stations, mode, networkTelemetry]);
+  }, [stations, mode, networkTelemetry, showLayers.stations]);
 
   /* ── vehicle marker from WebSocket position ─────────────────── */
   useEffect(() => {
@@ -264,6 +573,42 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
     prevVehPos.current = vehiclePos;
   }, [vehiclePos, showLayers.vehicles]);
+
+  /* ── 다중차량 실험군 — 배경 차량 회색 점 (작게, 마커 풀 재사용) ─────── */
+  useEffect(() => {
+    const g = groups.current.bgVeh; if (!g) return;
+    const list = backgroundVehicles || [];
+    if (!showLayers.vehicles || list.length === 0) {
+      g.clearLayers();
+      bgVehMarkers.current = {};
+      return;
+    }
+    const seen = new Set();
+    list.forEach((v) => {
+      seen.add(v.id);
+      const existing = bgVehMarkers.current[v.id];
+      if (existing) {
+        existing.setLatLng([v.lat, v.lng]);
+      } else {
+        bgVehMarkers.current[v.id] = L.circleMarker([v.lat, v.lng], {
+          renderer: groups.current.bgVehRenderer,
+          radius: 3,
+          color: '#9AA5B1',
+          weight: 0,
+          fillColor: '#9AA5B1',
+          fillOpacity: 0.65,
+          interactive: false,
+        }).addTo(g);
+      }
+    });
+    // 더 이상 존재하지 않는 배경 차량 마커는 제거
+    Object.keys(bgVehMarkers.current).forEach((id) => {
+      if (!seen.has(id)) {
+        bgVehMarkers.current[id].remove();
+        delete bgVehMarkers.current[id];
+      }
+    });
+  }, [backgroundVehicles, showLayers.vehicles]);
 
   /* ── mode interaction handlers ───────────────────────────────── */
   useEffect(() => {
@@ -462,15 +807,22 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         body: JSON.stringify({
           origin,
           dest,
-          use_network_routing: NETWORK_ROUTING_ALGORITHMS.has(selectedAlgorithms.route),
           algorithm_config: selectedAlgorithms,
-          simulation_config: simConfig || null,
+          simulation_config: {
+            ...(simConfig || {}),
+            policy_options: { ...(simConfig?.policy_options || {}), network_mode: networkGen.toUpperCase() },
+          },
+          vehicle_count: vehicleCount,
+          // DB simulation_runs에 이 런을 시트별로 태깅 — 시트 이름으로 분리해서 조회/비교할 수 있게.
+          sheet_id: sheets[activeSheetIdx]?.id || null,
+          sheet_name: sheets[activeSheetIdx]?.name || null,
         }),
       });
       const body = await res.json();
       if (!res.ok) {
         throw new Error(body.detail || '시뮬레이션 시작 실패');
       }
+      currentRunIdRef.current = body.run_id ?? null;
       if (body.warning) setSimNotice(body.warning);
       dispatch({ type: 'start' });
     } catch (e) {
@@ -481,6 +833,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   async function handleStop() {
     await fetch(`${api}/api/simulation/stop`, { method: 'POST' });
     dispatch({ type: 'pause' });
+    if (vehiclePos) captureResultIntoActiveSheet(); // 도착 전 정지해도 그 시점 결과를 시트에 남김
   }
 
   async function clearAll() {
@@ -496,12 +849,30 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSimNotice(null);
     setNetworkTelemetry(null);
     setRouteCoords([]); setVehiclePos(null);
+    setVehicleCount(1);
+    prevArrived.current = false;
+    if (setBackgroundVehicles) setBackgroundVehicles([]);
+    // 현재 시트도 빈 draft 상태로 되돌린다 — 안 그러면 화면은 지워져도 시트에 저장된 이전
+    // config/result가 그대로 남아있어, 새로고침하거나 이 시트로 다시 돌아오면 방금 지운
+    // 결과(연결선·latency 등)가 되살아난다. 기지국 배치는 별도 자원이라 건드리지 않음.
+    setSheets(prev => {
+      const next = prev.map((s, i) => i === activeSheetIdx ? {
+        ...s,
+        config: { origin: null, dest: null, vehicleCount: 1, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig },
+        result: null,
+        status: 'draft',
+      } : s);
+      saveSimSheets(next);
+      return next;
+    });
     if (groups.current.areaRect) { groups.current.areaRect.remove(); groups.current.areaRect = null; }
     if (groups.current.veh)      { groups.current.veh.remove();      groups.current.veh = null; }
     if (groups.current.route)    { groups.current.route.clearLayers(); }
     if (groups.current.wp)       { groups.current.wp.clearLayers(); }
     if (groups.current.network)  { groups.current.network.clearLayers(); }
     if (groups.current.blocks)   { groups.current.blocks.clearLayers(); }
+    if (groups.current.bgVeh)    { groups.current.bgVeh.clearLayers(); }
+    bgVehMarkers.current = {};
     if (mapObj.current) mapObj.current.setView(KR_CENTER, KR_ZOOM);
     dispatch({ type: 'reset' });
   }
@@ -596,7 +967,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   setSelectedAlgorithms((prev) => ({ ...prev, [groupKey]: option }));
                 }}
               >
-                <span>{formatAlgorithmName(option)}</span>
+                <span className="row gap6">
+                  {formatAlgorithmName(option)}
+                  {UNIMPLEMENTED_ROUTE_ALGORITHMS.has(option) && (
+                    <span className="chip" style={{ fontSize: 9, padding: '1px 5px' }}>미구현</span>
+                  )}
+                </span>
                 {selected === option ? <Icon.check size={12} /> : null}
               </button>
             ))}
@@ -607,14 +983,20 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   };
 
   return (
-    <div className="fade" style={{ display: 'grid', gridTemplateColumns: '1fr 340px', height: '100%', overflow: 'hidden' }}>
-      {/* ── MAP ────────────────────────────────────────── */}
-      <div style={{ position: 'relative', overflow: 'hidden' }}>
+    <div className="fade" style={{ position: 'relative', height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ position: 'relative', flex: 1, overflow: 'hidden' }}>
+      {/* ── MAP — full width, panels float on top ───────── */}
+      <div style={{ position: 'absolute', inset: 0 }}>
         <div ref={mapRef} style={{ position: 'absolute', inset: 0 }} />
 
-        {/* legend top-left — display only (controls live in the right panel) */}
-        <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 600, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start', maxWidth: 'calc(100% - 28px)' }}>
-          <div style={{ background: '#fff', borderRadius: 12, boxShadow: 'var(--sh-2)', padding: '10px 14px', minWidth: 176 }}>
+        {/* legend top-left — display only (controls live in the right panel).
+            Wrapper itself has pointer-events:none so the dead space between/around
+            the boxes (its bounding rect is as wide as the widest child, e.g. the
+            "오른쪽 패널에서…" chip, even where the legend box above doesn't reach)
+            doesn't swallow clicks meant for the map underneath — each visible box
+            opts back in with pointer-events:auto. */}
+        <div style={{ position: 'absolute', top: 14, left: 14, zIndex: 600, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start', maxWidth: 'calc(100% - 28px)', pointerEvents: 'none' }}>
+          <div style={{ background: '#fff', borderRadius: 12, boxShadow: 'var(--sh-2)', padding: '10px 14px', minWidth: 176, pointerEvents: 'auto' }}>
             <div className="row gap8" style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 6, whiteSpace: 'nowrap' }}>
               <Icon.map size={13} /> 범례 <span className="en" style={{ fontFamily: 'var(--mono)', fontSize: 8.5, color: 'var(--ink-4)' }}>LEGEND</span>
             </div>
@@ -630,15 +1012,20 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             <LegendRow shape="circle" color="#1E88E5" label="기지국">
               <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.length}개</span>
             </LegendRow>
+            {vehicleCount > 1 && (
+              <LegendRow shape="circle" color="#9AA5B1" label="배경 차량">
+                <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{backgroundVehicles?.length || 0}대</span>
+              </LegendRow>
+            )}
           </div>
 
           {hint && (
-            <div className="chip brand" style={{ background: '#fff', boxShadow: 'var(--sh-2)', height: 34, padding: '0 12px' }}>
+            <div className="chip brand" style={{ background: '#fff', boxShadow: 'var(--sh-2)', height: 34, padding: '0 12px', pointerEvents: 'auto' }}>
               <Icon.pin size={13} /> {hint}
             </div>
           )}
           {!area && !mode && (
-            <div className="chip" style={{ background: '#fff', boxShadow: 'var(--sh-2)', height: 34, padding: '0 12px', color: 'var(--ink-3)' }}>
+            <div className="chip" style={{ background: '#fff', boxShadow: 'var(--sh-2)', height: 34, padding: '0 12px', color: 'var(--ink-3)', pointerEvents: 'auto' }}>
               <Icon.layers size={13} /> 오른쪽 패널에서 구역을 설정해 시작하세요
             </div>
           )}
@@ -651,6 +1038,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           </div>
           <Lp on={showLayers.vehicles} set={v => setShowLayers(s => ({ ...s, vehicles: v }))}>차량</Lp>
           <Lp on={showLayers.routes}   set={v => setShowLayers(s => ({ ...s, routes: v }))}>경로</Lp>
+          <Lp on={showLayers.stations} set={v => setShowLayers(s => ({ ...s, stations: v }))}>기지국</Lp>
         </div>
 
         {/* vehicle speed badge */}
@@ -719,19 +1107,46 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         )}
       </div>
 
-      {/* ── CONTROL PANEL ────────────────────────────── */}
-      <div style={{ borderLeft: '1px solid var(--border)', background: 'var(--surface)', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '16px 18px', borderBottom: '1px solid var(--border)' }}>
-          <div className="eyebrow">Control Panel</div>
-          <div className="row between" style={{ marginTop: 4 }}>
-            <b style={{ fontSize: 15, whiteSpace: 'nowrap' }}>시뮬레이션 제어</b>
-            <span className={'status-badge ' + (sim.running ? 'running' : sim.elapsed > 0 ? 'paused' : 'idle')}>
-              <span className="dot" />{sim.running ? '실행 중' : sim.elapsed > 0 ? '일시정지' : '대기'}
-            </span>
-          </div>
-        </div>
+      {/* ── FAB 스택 — 컨트롤 패널 / 시뮬레이션 챗봇을 지도 우상단에 아이콘으로 ─ */}
+      <div style={{ position: 'absolute', right: 14, top: 14, zIndex: 650, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <FabButton
+          icon="sliders"
+          active={openPanel === 'control'}
+          onClick={() => setOpenPanel(p => p === 'control' ? null : 'control')}
+          title="컨트롤 패널"
+        />
+        <FabButton
+          icon="spark"
+          active={openPanel === 'scenario'}
+          onClick={() => setOpenPanel(p => p === 'scenario' ? null : 'scenario')}
+          title="시뮬레이션 챗봇"
+        />
+      </div>
 
-        <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 18, flex: 1 }}>
+      {/* ── 플로팅 패널 — FAB 클릭 시 아이콘 옆에서 펼쳐짐 ──────────── */}
+      {openPanel && (
+        <div style={{
+          position: 'absolute', top: 14, bottom: 14, right: 64,
+          width: 360, zIndex: 660,
+          background: 'var(--surface)', borderRadius: 14, boxShadow: 'var(--sh-3)',
+          border: '1px solid var(--border)', display: 'flex', flexDirection: 'column',
+          overflow: 'hidden',
+        }}>
+          {openPanel === 'control' ? (
+            <>
+              <div style={{ padding: '16px 18px', borderBottom: '1px solid var(--border)', flex: '0 0 auto' }}>
+                <div className="eyebrow">Control Panel</div>
+                <div className="row between" style={{ marginTop: 4 }}>
+                  <b style={{ fontSize: 15, whiteSpace: 'nowrap' }}>시뮬레이션 제어</b>
+                  <div className="row gap8">
+                    <span className={'status-badge ' + (sim.running ? 'running' : sim.elapsed > 0 ? 'paused' : 'idle')}>
+                      <span className="dot" />{sim.running ? '실행 중' : sim.elapsed > 0 ? '일시정지' : '대기'}
+                    </span>
+                    <button className="btn icon sm" onClick={() => setOpenPanel(null)} title="닫기">✕</button>
+                  </div>
+                </div>
+              </div>
+              <div style={{ padding: 18, display: 'flex', flexDirection: 'column', gap: 18, flex: 1, overflowY: 'auto' }}>
           {/* step chips */}
           <div className="row gap8" style={{ flexWrap: 'wrap' }}>
             {[['구역', !!area], ['출발지', originDone], ['도착지', destDone]].map(([l, ok]) => (
@@ -779,6 +1194,38 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               <WayRow color="var(--m-dest)"   label="도착지" val={dest   ? coordStr(dest)   : '미지정'} done={destDone}   set={tryDest} />
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
+          </div>
+
+          {/* multi-vehicle experimental group — background vehicle count */}
+          <div className="field">
+            <label>다중 차량 대수 <span className="en">VEHICLE COUNT</span></label>
+            <input
+              className="input"
+              type="number"
+              min="1"
+              max="20000"
+              step="1"
+              value={vehicleCount}
+              onChange={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setVehicleCount(Number.isFinite(v) ? Math.max(1, v) : 1);
+              }}
+              onBlur={(e) => {
+                const v = parseInt(e.target.value, 10);
+                setVehicleCount(Number.isFinite(v) && v >= 1 ? v : 1);
+              }}
+              style={{ width: '100%' }}
+            />
+            {vehicleCount > 1 && (
+              <div className="muted" style={{ fontSize: 10.5, marginTop: 4 }}>
+                타겟 차량 1대 + 배경 차량 {vehicleCount - 1}대가 구역 안을 무작위로 이동하며 기지국 자원할당에 함께 반영됩니다.
+              </div>
+            )}
+            {vehicleCount > 2000 && (
+              <div className="muted" style={{ fontSize: 10.5, marginTop: 4, color: 'var(--warn)' }}>
+                대수가 많을수록 도로 규모에 비해 비현실적인 혼잡이 발생할 수 있습니다 (시작 시 서버가 안내 메시지를 표시합니다).
+              </div>
+            )}
           </div>
 
           {/* network generation — UI only (not wired to backend) */}
@@ -930,6 +1377,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           )}
 
+          {/* 이 시트의 로그 — 설계 B: 분석보고서 탭과는 별개로, 시트별 로그는 여기서만 읽기전용으로 보여준다 */}
+          {displayedSheetLogs.length > 0 && (
+            <div className="card" style={{ padding: 14, background: 'var(--surface-2)' }}>
+              <div className="row between" style={{ marginBottom: 8 }}>
+                <b style={{ fontSize: 13 }}>{sheets[activeSheetIdx]?.name || '시트'}의 로그</b>
+                <Chip>{displayedSheetLogs.length}건</Chip>
+              </div>
+              <div className="col gap6" style={{ maxHeight: 180, overflowY: 'auto' }}>
+                {[...displayedSheetLogs].reverse().slice(0, 30).map((l, i) => (
+                  <div key={i} className="row gap8" style={{ fontSize: 11, padding: '5px 8px', background: 'var(--surface)', borderRadius: 6 }}>
+                    <span className="num muted" style={{ fontSize: 10, flex: '0 0 auto' }}>{l.t}</span>
+                    <span style={{ flex: 1, lineHeight: 1.4 }}>{l.ko}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div style={{ flex: 1 }} />
 
           {/* controls */}
@@ -964,8 +1429,37 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               </div>
             )}
           </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ padding: '16px 18px', borderBottom: '1px solid var(--border)', flex: '0 0 auto' }}>
+                <div className="eyebrow">Simulation Chatbot</div>
+                <div className="row between" style={{ marginTop: 4 }}>
+                  <b style={{ fontSize: 15, whiteSpace: 'nowrap' }}>시뮬레이션 챗봇</b>
+                  <button className="btn icon sm" onClick={() => setOpenPanel(null)} title="닫기">✕</button>
+                </div>
+              </div>
+              <div style={{ flex: 1, overflow: 'hidden' }}>
+                <SimulationChatPanel simConfig={simConfig} setSimConfig={setSimConfig} />
+              </div>
+            </>
+          )}
         </div>
-      </div>
+      )}
+    </div>
+
+    <SheetTabBar
+      sheets={sheets}
+      activeIdx={activeSheetIdx}
+      onSwitch={switchToSheet}
+      onAdd={addSheet}
+      onRename={renameSheet}
+      onRemove={removeSheet}
+      onRunBatch={runAllSheetsAsBatch}
+      batchRunning={batchRunning}
+      batchError={batchError}
+    />
     </div>
   );
 }

@@ -39,9 +39,9 @@
   --m-dest:   #E0463C;
   --m-bs:     #2E75B6;
 
-  /* Type */
-  --sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
-  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+  /* Type — Nanum Gothic (Korean), Noto Sans fallback covers other scripts (CJK/Cyrillic/etc.) for multilingual text */
+  --sans: 'Nanum Gothic', 'Noto Sans', system-ui, -apple-system, sans-serif;
+  --mono: 'Nanum Gothic Coding', 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
 
   /* Radii & shadow */
   --r-sm: 6px;
@@ -166,6 +166,13 @@ input, select { font-family: inherit; }
 .chip.brand{ background: var(--brand-tint); color: var(--brand); }
 .chip.good .dot{ background: var(--good);} .chip.warn .dot{ background: var(--warn);} .chip.bad .dot{ background: var(--bad);}
 
+/* 시나리오 어시스턴트 챗봇 말풍선 */
+.chat-bubble { max-width: 78%; padding: 9px 12px; border-radius: 14px; font-size: 11.5px; line-height: 1.55; white-space: pre-wrap; }
+.chat-bubble.user { align-self: flex-end; background: var(--brand); color: #fff; border-bottom-right-radius: 4px; }
+.chat-bubble.assistant { align-self: flex-start; background: var(--surface-2); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+.chat-bubble.error { align-self: flex-start; background: var(--bad-tint); border: 1px solid var(--bad-line); color: var(--bad); }
+.chat-diff-chip { font-size: 10.5px; padding: 3px 8px; border-radius: 6px; margin-top: 6px; display: inline-flex; align-items: center; gap: 4px; }
+
 /* Buttons */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
@@ -206,7 +213,7 @@ input, select { font-family: inherit; }
   box-shadow: none !important;
   padding: 0 !important;
   color: #000 !important;
-  font-family: 'IBM Plex Sans KR', 'IBM Plex Sans', sans-serif !important;
+  font-family: 'Nanum Gothic', 'Noto Sans', sans-serif !important;
   font-size: 11px !important;
   font-weight: 600 !important;
   white-space: nowrap;
@@ -270,7 +277,7 @@ table.tbl td.r, table.tbl th.r { text-align: right; }
 /* utility flex */
 .row { display: flex; align-items: center; }
 .col { display: flex; flex-direction: column; }
-.gap8{ gap:8px } .gap12{ gap:12px } .gap16{ gap:16px } .gap20{ gap:20px }
+.gap6{ gap:6px } .gap8{ gap:8px } .gap10{ gap:10px } .gap12{ gap:12px } .gap16{ gap:16px } .gap20{ gap:20px }
 .between { justify-content: space-between; }
 .wrap { flex-wrap: wrap; }
 .grow { flex: 1 1 auto; }

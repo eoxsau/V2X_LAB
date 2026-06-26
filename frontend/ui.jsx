@@ -39,14 +39,9 @@ const Icon = {
 };
 
 const NAV = [
-  { id: 'dashboard',  ko: '대시보드',          en: 'Dashboard',  icon: 'dash' },
   { id: 'simulation', ko: '시뮬레이션',        en: 'Simulation', icon: 'map'  },
+  { id: 'dashboard',  ko: '대시보드',          en: 'Dashboard',  icon: 'dash' },
   { id: 'scenario',   ko: '시나리오 어시스턴트', en: 'Scenario',   icon: 'spark' },
-  { id: 'vehicles',   ko: '차량 (Fleet)',      en: 'Fleet',      icon: 'car'  },
-  { id: 'network',    ko: '네트워크',          en: 'Network',    icon: 'antenna' },
-  { id: 'routes',     ko: '경로',              en: 'Routes',     icon: 'route' },
-  { id: 'forecast',   ko: '예측/위험',         en: 'Forecast',   icon: 'radar' },
-  { id: 'comparison', ko: '비교',              en: 'Comparison', icon: 'compare' },
   { id: 'report',     ko: '분석 보고서',       en: 'Report',     icon: 'chart' },
   { id: 'settings',   ko: '설정',              en: 'Settings',   icon: 'sliders' },
 ];

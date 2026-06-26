@@ -193,16 +193,23 @@ def apply_allocation_to_network_nodes(
     """
     Write bs_load_after_allocation back to network_nodes in-place.
     After this call, all downstream callers (latency registry, route cost function,
-    RL environment) automatically use the updated load values.
+    RL environment, building_obstruction_analyzer's queuing model) automatically use
+    the updated load/deficit values.
 
     Sets node["load"] = load_ratio × capacity (absolute value).
+    Sets node["deficit_rb"] = unmet demand beyond capacity (0.0 when not overloaded) —
+    utilization_ratio alone is capped at 1.0 by _make_bs_alloc(), so a BS that's 5x
+    oversubscribed looks identical to one merely at capacity unless deficit_rb is
+    carried along separately.
     """
     load_after = alloc_out.bs_load_after_allocation
+    deficit_by_bs = alloc_out.resource_deficit_by_bs
     for node in network_nodes:
         nid = str(node.get("id") or node.get("name") or "")
         if nid in load_after:
             cap = float(node.get("capacity") or 100.0)
             node["load"] = round(load_after[nid] * cap, 4)
+        node["deficit_rb"] = round(deficit_by_bs.get(nid, 0.0), 4)
 
 
 # Singleton — populated when allocation_algorithms.py is imported via __init__.py

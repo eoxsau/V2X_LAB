@@ -14,7 +14,7 @@ function simReducer(s, a) {
 }
 
 function App() {
-  const [tab, setTab] = useState(() => location.hash.replace('#', '') || 'dashboard');
+  const [tab, setTab] = useState(() => location.hash.replace('#', '') || 'simulation');
   const [sim, dispatch] = React.useReducer(simReducer, { running: false, elapsed: 0, tick: 0, mode: '5G' });
   const [bootReady, setBootReady]      = useState(false);
 
@@ -25,7 +25,13 @@ function App() {
   const [simNotice, setSimNotice]       = useState(null);
   const [networkTelemetry, setNetworkTelemetry] = useState(null);
   const [routeEdges, setRouteEdges] = useState(null);
+  const [backgroundVehicles, setBackgroundVehicles] = useState([]); // 다중차량 실험군 — 배경 차량 [{id,lat,lng}]
   const wsRef = useRef(null);
+
+  // 시뮬레이션 시트 — App으로 끌어올림(tab-simulation.jsx에 있던 걸 옮김). 시뮬레이션 탭뿐 아니라
+  // 대시보드 탭도 "지금 실행 중인 시트가 몇 번인지"를 알아야 시트별로 분리해서 보여줄 수 있다.
+  const [sheets, setSheets] = useState(() => loadSimSheets());
+  const [activeSheetIdx, setActiveSheetIdx] = useState(0);
 
   // Stage-1 simulation config (persisted to localStorage)
   const DEFAULT_SIM_CONFIG = {
@@ -42,7 +48,7 @@ function App() {
     policy_options: {
       lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
       prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
-      traffic_lambda: 5.0, network_mode: '5G',
+      traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
     },
   };
   const [simConfig, setSimConfig] = useState(() => {
@@ -60,11 +66,12 @@ function App() {
   const [simHistory, setSimHistory] = useState([]);   // {t, speed, progress, latency, bs} per tick
   const [simLogs,    setSimLogs]    = useState([]);   // {t, target, kind, ko} event log
   const prevBsRef = useRef(null);
+  const lastLatencyWarnRef = useRef(null); // 마지막으로 '위험' 로그를 남긴 시각(elapsed) — 매 틱 중복 적재 방지
   const simElapsedRef = useRef(0);
 
   // hash routing
   useEffect(() => {
-    const onHash = () => setTab(location.hash.replace('#', '') || 'dashboard');
+    const onHash = () => setTab(location.hash.replace('#', '') || 'simulation');
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
   }, []);
@@ -90,9 +97,11 @@ function App() {
         setSimNotice(null);
         setNetworkTelemetry(null);
         setRouteEdges(null);
+        setBackgroundVehicles([]);
         setSimHistory([]);
         setSimLogs([]);
         prevBsRef.current = null;
+        lastLatencyWarnRef.current = null;
         dispatch({ type: 'reset' });
         setBootReady(true);
       }
@@ -157,6 +166,8 @@ function App() {
             t: fmtClock(simElapsedRef.current), target: 'EGO', kind: 'disconnect',
             ko: 'BS 커버리지 단절',
           }]);
+        } else if (msg.type === 'background_positions') {
+          setBackgroundVehicles(msg.vehicles || []);
         }
       };
     }
@@ -189,10 +200,18 @@ function App() {
       return next.length > 60 ? next.slice(1) : next;
     });
     if (latency !== null && latency > 20) {
-      setSimLogs(prev => [...prev, {
-        t: fmtClock(sim.elapsed), target: 'EGO', kind: 'warn',
-        ko: `Latency 위험: ${latency.toFixed(1)}ms (임계치 초과)`
-      }]);
+      // 위험 상태로 처음 진입했을 때만 로그를 남기고, 계속 지속되면 10초마다 한 번만
+      // 다시 남긴다 — 매 틱(1초)마다 똑같은 경고가 쌓여 이벤트 피드가 도배되는 것을 방지.
+      const last = lastLatencyWarnRef.current;
+      if (last === null || sim.elapsed - last >= 10) {
+        setSimLogs(prev => [...prev, {
+          t: fmtClock(sim.elapsed), target: 'EGO', kind: 'warn',
+          ko: `Latency 위험: ${latency.toFixed(1)}ms (임계치 초과)`
+        }]);
+        lastLatencyWarnRef.current = sim.elapsed;
+      }
+    } else {
+      lastLatencyWarnRef.current = null;
     }
     if (bs && prevBsRef.current && prevBsRef.current !== bs) {
       setSimLogs(prev => [...prev, {
@@ -227,6 +246,7 @@ function App() {
       setSimHistory([]);
       setSimLogs([]);
       prevBsRef.current = null;
+      lastLatencyWarnRef.current = null;
     }
   }, [sim.running, sim.elapsed]);
 
@@ -235,7 +255,7 @@ function App() {
   return (
     <div className="app">
       <header className="nav">
-        <div className="nav-brand" onClick={() => go('dashboard')} style={{ cursor: 'pointer' }} title="대시보드로 이동">
+        <div className="nav-brand" onClick={() => go('simulation')} style={{ cursor: 'pointer' }} title="시뮬레이션으로 이동">
           <div className="nav-logo"><Icon.route size={17} /></div>
           <div className="nav-title">
             <b>V2X AI Routing Lab</b>
@@ -267,7 +287,7 @@ function App() {
       </header>
 
       <main className="page" style={tab === 'simulation' ? { overflow: 'hidden' } : {}}>
-        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} simLogs={simLogs} simConfig={simConfig} routeEdges={routeEdges} />}
+        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} simLogs={simLogs} simConfig={simConfig} routeEdges={routeEdges} sheets={sheets} activeSheetIdx={activeSheetIdx} />}
         <div style={{ display: tab === 'simulation' ? 'block' : 'none', height: '100%' }}>
           <SimulationTab
             sim={sim}
@@ -282,16 +302,21 @@ function App() {
             networkTelemetry={networkTelemetry}
             setNetworkTelemetry={setNetworkTelemetry}
             simConfig={simConfig}
+            setSimConfig={saveSimConfig}
+            backgroundVehicles={backgroundVehicles}
+            setBackgroundVehicles={setBackgroundVehicles}
+            simLogs={simLogs}
+            simHistory={simHistory}
+            routeEdges={routeEdges}
+            sheets={sheets}
+            setSheets={setSheets}
+            activeSheetIdx={activeSheetIdx}
+            setActiveSheetIdx={setActiveSheetIdx}
             api={API}
           />
         </div>
         {tab === 'scenario'   && <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} />}
-        {tab === 'vehicles'   && <VehiclesTab sim={sim} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} />}
-        {tab === 'network'    && <NetworkTab networkTelemetry={networkTelemetry} routeEdges={routeEdges} vehiclePos={vehiclePos} />}
-        {tab === 'routes'     && <RoutesTab sim={sim} vehiclePos={vehiclePos} routeCoords={routeCoords} networkTelemetry={networkTelemetry} simHistory={simHistory} routeEdges={routeEdges} />}
-        {tab === 'forecast'   && <ForecastTab vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
-        {tab === 'comparison' && <ComparisonTab vehiclePos={vehiclePos} simConfig={simConfig} />}
-        {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} />}
+        {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} routeCoords={routeCoords} routeEdges={routeEdges} simHistory={simHistory} simConfig={simConfig} />}
         {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} />}
       </main>
     </div>

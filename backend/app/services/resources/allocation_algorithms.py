@@ -53,7 +53,7 @@ def _flat_demand_map(inp: AllocationInput) -> dict[str, dict]:
 def _bs_demand(bs_id: str, bs: dict, dm: dict, cfg: AllocationConfig) -> float:
     """Demand for bs_id: from demand_map or fall back to current load."""
     if bs_id in dm:
-        return float(dm[bs_id].get("demand_rb", 0.0))
+        return float(dm[bs_id].get("estimated_resource_demand", 0.0))
     return float(bs.get("load") or 0.0)
 
 

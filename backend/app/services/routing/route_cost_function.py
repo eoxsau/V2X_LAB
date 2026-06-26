@@ -241,18 +241,23 @@ def _find_best_bs_light(
     mid_lat: float,
     mid_lng: float,
     nodes: list[dict],
+    bs_selection_algo: Optional[str] = None,
 ) -> tuple[Optional[dict], float, float, float, bool]:
     """
     Fast BS selection: distance-penalty + congestion + edge_latency.
     No building intersection.
     Returns (node, dist_m, predicted_latency_ms, loss_db=0, within_coverage).
     Called during Dijkstra routing (skip_buildings=True).
+
+    bs_selection_algo: per-call override of the active BS-selection algorithm
+    (used by the algorithm-comparison sweep). Defaults to the module-global
+    _active_bs_selection — existing callers are unaffected.
     """
     best_node: Optional[dict] = None
     best_score = float("inf")
     best_dist_m = 0.0
 
-    algo = _active_bs_selection
+    algo = bs_selection_algo or _active_bs_selection
     for node in nodes:
         n_lat = float(node.get("lat") or 0)
         n_lng = float(node.get("lng") or 0)
@@ -287,19 +292,22 @@ def _find_best_bs_full(
     mid_lng: float,
     nodes: list[dict],
     buildings_gdf: Any,
+    bs_selection_algo: Optional[str] = None,
 ) -> tuple[Optional[dict], float, float, float, bool]:
     """
     Full BS selection using analyze_vehicle_to_node (building intersection).
     Called during post-route evaluation (skip_buildings=False).
     Returns (node, dist_m, predicted_latency_ms, loss_db, within_coverage).
     Falls back to _find_best_bs_light if geopandas is unavailable.
+
+    bs_selection_algo: per-call override, see _find_best_bs_light.
     """
     try:
         from app.services.buildings.building_obstruction_analyzer import analyze_vehicle_to_node
         import geopandas as gpd
         gdf = buildings_gdf if buildings_gdf is not None else gpd.GeoDataFrame()
     except ImportError:
-        return _find_best_bs_light(mid_lat, mid_lng, nodes)
+        return _find_best_bs_light(mid_lat, mid_lng, nodes, bs_selection_algo)
 
     best_node: Optional[dict] = None
     best_score = float("inf")
@@ -325,7 +333,7 @@ def _find_best_bs_full(
         edge_lat = float(node.get("edge_latency_ms") or 5.0)
         load = float(node.get("load") or 0.0)
         cap = float(node.get("capacity") or 100.0)
-        algo = _active_bs_selection
+        algo = bs_selection_algo or _active_bs_selection
         # For blockage-aware algorithms, add penetration loss to the score
         base_score = _bs_score(obs.distance_m, cov_r, cong, edge_lat, load, cap, algo)
         score = base_score + obs.estimated_penetration_loss_db * 0.8
@@ -360,6 +368,8 @@ def compute_edge_network_cost(
     weights: CostWeights = DEFAULT_WEIGHTS,
     norm_scales: NormScales = DEFAULT_NORM_SCALES,
     skip_buildings: bool = False,
+    bs_selection_algo: Optional[str] = None,
+    latency_algorithm_id: Optional[str] = None,
 ) -> EdgeCostResult:
     """
     Compute 6 independent per-edge cost components.
@@ -370,17 +380,20 @@ def compute_edge_network_cost(
     Args:
         skip_buildings: Use fast light BS selection without building intersection.
                         Set True during Dijkstra routing; False during evaluation.
+        bs_selection_algo: per-call BS-selection override (algorithm-comparison sweep).
+        latency_algorithm_id: per-call latency-algorithm override (same sweep).
+                        Both default to None — existing callers unaffected.
     """
     # Stage 1: BS selection — existing wrapper functions unchanged
     _latency_penalty_ms = 0.0
     if nodes:
         if skip_buildings or buildings_gdf is None:
             best_node, _bs_dist_m, latency_ms, loss_db, within_cov = _find_best_bs_light(
-                midpoint_lat, midpoint_lng, nodes
+                midpoint_lat, midpoint_lng, nodes, bs_selection_algo
             )
         else:
             best_node, _bs_dist_m, latency_ms, loss_db, within_cov = _find_best_bs_full(
-                midpoint_lat, midpoint_lng, nodes, buildings_gdf
+                midpoint_lat, midpoint_lng, nodes, buildings_gdf, bs_selection_algo
             )
             # latency_penalty_ms is embedded in latency_ms by _find_best_bs_full;
             # recover an approximation for the registry building_state
@@ -414,7 +427,7 @@ def compute_edge_network_cost(
                 handover=handover,
                 prev_bs_id=prev_best_node_id,
             )
-            _lat_out = LATENCY_REGISTRY.compute(_lat_inp)
+            _lat_out = LATENCY_REGISTRY.compute(_lat_inp, algorithm_id=latency_algorithm_id)
             latency_ms = _lat_out.latency
             _latency_components = _lat_out.to_dict()
         except Exception:
@@ -469,12 +482,19 @@ def evaluate_path(
     buildings_gdf: Any = None,
     weights: CostWeights = DEFAULT_WEIGHTS,
     norm_scales: NormScales = DEFAULT_NORM_SCALES,
+    bs_selection_algo: Optional[str] = None,
+    latency_algorithm_id: Optional[str] = None,
 ) -> PathCostResult:
     """
     Evaluate the full network cost of a route.
 
     Each item in edge_data_list must supply:
         edge_id, midpoint_lat, midpoint_lng, distance_m, travel_time_s
+
+    bs_selection_algo / latency_algorithm_id: optional per-call overrides used
+    by the algorithm-comparison sweep to re-score the same edges under a
+    different BS-selection or latency algorithm. Default None preserves
+    existing behaviour (module-global / registry-current algorithm) exactly.
     """
     if not edge_data_list:
         return PathCostResult(
@@ -501,6 +521,8 @@ def evaluate_path(
             weights=weights,
             norm_scales=norm_scales,
             skip_buildings=False,
+            bs_selection_algo=bs_selection_algo,
+            latency_algorithm_id=latency_algorithm_id,
         )
         edge_results.append(r)
         prev_node_id = r.best_node_id

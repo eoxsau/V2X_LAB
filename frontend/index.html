@@ -8,7 +8,8 @@
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <!-- Nanum Gothic (Korean) + Nanum Gothic Coding (mono/code) + Noto Sans (broad multilingual fallback for scripts Nanum Gothic doesn't cover) -->
+  <link href="https://fonts.googleapis.com/css2?family=Nanum+Gothic:wght@400;700;800&family=Nanum+Gothic+Coding:wght@400;700&family=Noto+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
   <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -16,13 +17,26 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 
-  <link rel="stylesheet" href="styles.css" />
+  <!-- Prism.js — code-mode syntax highlighting (Scenario Assistant) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+
+  <link rel="stylesheet" href="styles.css?v=20260624a" />
   <style>
-    :root { --sans: 'IBM Plex Sans', 'IBM Plex Sans KR', system-ui, sans-serif; }
+    :root { --sans: 'Nanum Gothic', 'Noto Sans', system-ui, sans-serif; }
     @keyframes slideIn { from { transform: translateX(30px); opacity: 0; } to { transform: none; opacity: 1; } }
     .spin { animation: spin 0.8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .fade { opacity: 1; }
+
+    /* Prism JSON token colors — matched to app CSS variables, not a stock theme */
+    .sc-code-layer .token.property  { color: var(--brand-2); }
+    .sc-code-layer .token.string    { color: var(--good); }
+    .sc-code-layer .token.boolean   { color: var(--warn); }
+    .sc-code-layer .token.number    { color: var(--warn); }
+    .sc-code-layer .token.null      { color: var(--ink-4); }
+    .sc-code-layer .token.punctuation { color: var(--ink-3); }
+    .sc-code-layer .token.operator  { color: var(--ink-3); }
   </style>
 
   <!-- React + Babel -->
@@ -34,18 +48,14 @@
   <div id="root"></div>
 
   <script src="data.js"></script>
-  <script type="text/babel" src="ui.jsx"></script>
-  <script type="text/babel" src="charts.jsx"></script>
-  <script type="text/babel" src="tab-dashboard.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-simulation.jsx?v=20260611c"></script>
-  <script type="text/babel" src="tab-scenario.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-vehicles.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-network.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-routes.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-forecast.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-comparison.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-report.jsx?v=20260620a"></script>
-  <script type="text/babel" src="tab-settings.jsx?v=20260619b"></script>
-  <script type="text/babel" src="app.jsx?v=20260620b"></script>
+  <script type="text/babel" src="ui.jsx?v=20260623a"></script>
+  <script type="text/babel" src="charts.jsx?v=20260621a"></script>
+  <script type="text/babel" src="tab-dashboard.jsx?v=20260626a"></script>
+  <script type="text/babel" src="tab-simulation.jsx?v=20260626b"></script>
+  <script type="text/babel" src="tab-scenario.jsx?v=20260624d"></script>
+  <script type="text/babel" src="tab-sim-chat.jsx?v=20260624a"></script>
+  <script type="text/babel" src="tab-report.jsx?v=20260625b"></script>
+  <script type="text/babel" src="tab-settings.jsx?v=20260620c"></script>
+  <script type="text/babel" src="app.jsx?v=20260626a"></script>
 </body>
 </html>

@@ -40,14 +40,18 @@ _WALL_SPACING_BY_USE: dict[str, float] = {
 # ── Technology parameters for the L_total latency model ───────────────────────
 # alpha calibrated so RSRP transitions at realistic urban coverage distances:
 #   4G: retransmissions begin ~400m, 5G ~500m, 6G ~700m
+# L_base는 "무부하(unloaded) 최선의 경우" 바닥값이 아니라 실측 상용망 평균 체감 지연
+# 기준으로 잡았다 — 4G LTE 실측 RTT는 약 30-50ms(편도 추정 ~25ms), 5G NSA 혼합망 실측은
+# 흔히 5-20ms대(보수적으로 ~15ms), 6G는 미상용이라 ITU-R IMT-2030 목표치 수준(~1ms) 유지.
 _TECH_PARAMS: dict[str, dict] = {
     # alpha calibrated so retransmissions begin at realistic distances:
     #   4G ~240m  (urban macro, 300-400m coverage radius)
     #   5G ~450m  (urban NR, 450m coverage radius)
     #   6G ~1000m (future, extended coverage)
-    "4G": dict(L_base=10.0, P_tx=43.0, alpha=45.0, beta=3.5, RSRP_thresh=-85.0,  RSRP_range=25.0, N_max=6, T_retx=8.0,  C_tech=100),
-    "5G": dict(L_base= 1.0, P_tx=46.0, alpha=55.0, beta=3.0, RSRP_thresh=-90.0,  RSRP_range=25.0, N_max=4, T_retx=1.0,  C_tech=500),
-    "6G": dict(L_base= 0.1, P_tx=48.0, alpha=68.0, beta=2.5, RSRP_thresh=-95.0,  RSRP_range=25.0, N_max=3, T_retx=0.1,  C_tech=2000),
+    # coverage_radius_m = 위 코멘트의 실제 커버리지 반경 — 하드 컷오프로 사용(아래 참고).
+    "4G": dict(L_base=25.0, P_tx=43.0, alpha=45.0, beta=3.5, RSRP_thresh=-85.0,  RSRP_range=25.0, N_max=6, T_retx=8.0,  C_tech=100,  coverage_radius_m=400.0),
+    "5G": dict(L_base=15.0, P_tx=46.0, alpha=55.0, beta=3.0, RSRP_thresh=-90.0,  RSRP_range=25.0, N_max=4, T_retx=1.0,  C_tech=500,  coverage_radius_m=450.0),
+    "6G": dict(L_base= 1.0, P_tx=48.0, alpha=68.0, beta=2.5, RSRP_thresh=-95.0,  RSRP_range=25.0, N_max=3, T_retx=0.1,  C_tech=2000, coverage_radius_m=1000.0),
 }
 
 
@@ -91,11 +95,32 @@ def _L_total(
     A_seg_db: float,
     n_vehicles: int,
     network_mode: str,
-) -> float:
+    deficit_ratio: float = 0.0,
+) -> tuple[float, float, float, float]:
     """Compute L_total = L_base + L_signal + L_queue (ms).
 
     L_signal uses the Log-Distance RSRP model + HARQ retransmission mapping.
-    L_queue uses the M/M/1 model with rho = n_vehicles / C_tech.
+    L_queue uses the M/M/1 model with rho = n_vehicles / C_tech, PLUS deficit_ratio.
+
+    deficit_ratio: connecting BS's RB allocation deficit_rb / capacity (0.0 when the
+    BS isn't oversubscribed). The resource-allocation system caps utilization_ratio
+    at 1.0 (a BS 5x oversubscribed looks the same as one merely at capacity once you
+    only look at load/capacity), so without this term a real RB shortage found by the
+    allocation algorithms would never show up as queuing delay here — the two systems
+    would keep estimating congestion independently and disagreeing.
+
+    deficit_ratio is added as a SEPARATE linear penalty on top of (not folded into) rho.
+    Earlier version added it directly to rho before the 0.99 cap — any BS with a large
+    enough deficit got clipped to the same rho≈0.99 ceiling, so distinct BSs with very
+    different oversubscription levels all produced the same ~L_base×99 latency (observed
+    as multiple candidates showing an identical, suspiciously round 1500.0ms — 2026-06-24
+    user report). Linear addition instead keeps L_queue strictly increasing in deficit_ratio
+    (no collision between different severities) and is exactly 0 when deficit_ratio=0, so
+    behavior is unchanged whenever the allocation system reports no deficit.
+
+    Returns (L_total, L_base, L_signal, L_queue) — the three components are
+    returned alongside the total so callers (e.g. the dashboard breakdown)
+    can display the model's actual terms instead of an ad-hoc approximation.
     """
     p = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])
     L_base = p["L_base"]
@@ -107,11 +132,12 @@ def _L_total(
     N_retx = p["N_max"] * max(0.0, min(1.0, (p["RSRP_thresh"] - RSRP) / p["RSRP_range"]))
     L_signal = N_retx * p["T_retx"]
 
-    # M/M/1 queuing latency
+    # M/M/1 queuing latency (background load only) + separate RB-deficit penalty
     rho = min(n_vehicles / p["C_tech"], 0.99)
-    L_queue = L_base * rho / (1.0 - rho)
+    L_queue = L_base * rho / (1.0 - rho) + L_base * max(0.0, deficit_ratio)
 
-    return round(L_base + L_signal + L_queue, 3)
+    total = round(L_base + L_signal + L_queue, 3)
+    return total, round(L_base, 3), round(L_signal, 3), round(L_queue, 3)
 
 
 def _is_blocked_3d(
@@ -187,7 +213,7 @@ def analyze_vehicle_to_node(
     A_seg_db, confidence, crossed_length_m = _material_a_seg_db(search_bl, search_bl_3857, line_3857)
 
     # latency_penalty_ms: building-only contribution shown on dashboard (ms)
-    latency_penalty_ms = round(A_seg_db * 0.45 + vehicle_density_penalty, 2)
+    latency_penalty_ms = round(A_seg_db * 0.45, 2)
     stability_score = round(max(0.0, exp(-(A_seg_db / 20.0)) - vehicle_density_penalty / 100.0), 3)
 
     highlighted_buildings = []
@@ -233,6 +259,7 @@ def analyze_candidates(
     vehicle_density_penalty: float = 0.0,
     network_mode: str = "5G",
 ) -> list[dict]:
+    coverage_radius_m = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])["coverage_radius_m"]
     results = []
     for node in candidate_nodes:
         obs = analyze_vehicle_to_node(
@@ -243,15 +270,33 @@ def analyze_candidates(
             buildings_gdf=buildings_gdf,
             vehicle_density_penalty=vehicle_density_penalty,
         )
-        # n_vehicles: ego vehicle + Poisson-sampled background at this BS
-        n_vehicles = 1 + int(node.get("n_background_vehicles", 0))
+        # 물리적 커버리지 반경 밖이면 latency가 아무리 낮게 계산돼도 후보에서 제외한다 —
+        # 컷오프 없이는 혼잡도가 낮은 먼 기지국이 가까운 혼잡 기지국보다 "낮은 latency"로
+        # 이겨서 지도 전체를 가로지르는 비현실적인 연결선이 그려지는 문제가 있었다.
+        if obs.distance_m > coverage_radius_m:
+            continue
+        # n_vehicles: ego + 배경 차량(실시간 또는 Poisson 기본값) + 차량 외 기기(폰/IoT, Poisson)
+        # + 실시간 ITS 교통량 환산 부하 — 같은 기지국 capacity를 공유하는 모든 활성 연결을
+        # 큐잉 모델 분모에 반영한다.
+        n_vehicles = (
+            1
+            + int(node.get("n_background_vehicles", 0))
+            + int(node.get("n_other_devices", 0))
+            + int(node.get("n_its_load", 0))
+        )
         edge_latency = float(node.get("edge_latency_ms", 5.0))
+        # RB 자원할당 시스템이 산출한 deficit_rb(용량 초과분)를 capacity 대비 비율로
+        # 환산해 큐잉 지연에 직접 반영한다 — apply_allocation_to_network_nodes()가
+        # 매 할당 주기마다 채워주는 필드(할당이 아직 안 됐으면 0.0, 즉 기존 동작과 동일).
+        cap = float(node.get("capacity") or 100.0)
+        deficit_ratio = float(node.get("deficit_rb", 0.0)) / max(cap, 1.0)
 
-        predicted_latency_ms = _L_total(
+        predicted_latency_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
             distance_m=obs.distance_m,
             A_seg_db=obs.estimated_penetration_loss_db,
             n_vehicles=n_vehicles,
             network_mode=network_mode,
+            deficit_ratio=deficit_ratio,
         )
         node_score = round(predicted_latency_ms + edge_latency * 0.5, 2)
 
@@ -265,6 +310,9 @@ def analyze_candidates(
             "stability_score": obs.stability_score,
             "confidence": obs.confidence,
             "predicted_latency_ms": predicted_latency_ms,
+            "l_base_ms": l_base_ms,
+            "l_signal_ms": l_signal_ms,
+            "l_queue_ms": l_queue_ms,
             "node_score": node_score,
             "highlighted_buildings": obs.highlighted_buildings,
         })

@@ -21,7 +21,7 @@ const DEFAULT_SIM_CONFIG = {
   policy_options: {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
-    traffic_lambda: 5.0, network_mode: '5G',
+    traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
   },
 };
 
@@ -60,6 +60,8 @@ function validateSimulationConfig(config) {
     errors.push('policy_options.max_handover_allowed: must be non-negative integer');
   if (pol.traffic_lambda !== undefined && (typeof pol.traffic_lambda !== 'number' || pol.traffic_lambda < 0 || pol.traffic_lambda > 200))
     errors.push('policy_options.traffic_lambda: must be a number 0–200');
+  if (pol.other_device_lambda !== undefined && (typeof pol.other_device_lambda !== 'number' || pol.other_device_lambda < 0 || pol.other_device_lambda > 2000))
+    errors.push('policy_options.other_device_lambda: must be a number 0–2000');
   if (pol.network_mode !== undefined && !['4G', '5G', '6G'].includes(pol.network_mode))
     errors.push('policy_options.network_mode: must be "4G", "5G", or "6G"');
 
@@ -100,6 +102,8 @@ function mergeWithDefaultConfig(userConfig) {
     if (typeof pol.avoid_disconnection === 'boolean') merged.policy_options.avoid_disconnection = pol.avoid_disconnection;
     if (typeof pol.traffic_lambda === 'number' && pol.traffic_lambda >= 0)
       merged.policy_options.traffic_lambda = Math.min(pol.traffic_lambda, 200);
+    if (typeof pol.other_device_lambda === 'number' && pol.other_device_lambda >= 0)
+      merged.policy_options.other_device_lambda = Math.min(pol.other_device_lambda, 2000);
     if (typeof pol.network_mode === 'string' && ['4G', '5G', '6G'].includes(pol.network_mode))
       merged.policy_options.network_mode = pol.network_mode;
   }
@@ -495,6 +499,16 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
                   <span className="sfx">v/km²</span>
                 </div></td>
                 <td><span className="muted" style={{ fontSize: 11 }}>배경 차량 밀도 — Poisson 배경 부하 기대치 (0.1–200)</span></td>
+              </tr>
+              <tr>
+                <td><b style={{ fontWeight: 600 }}>기타 기기 밀도 (λ)</b></td>
+                <td><div className="input-suffix" style={{ width: 130 }}>
+                  <input className="input" style={{ height: 32 }} type="number" min="0" max="2000" step="10"
+                    value={cfgDraft.policy_options.other_device_lambda ?? 300.0}
+                    onChange={e => setPolicy('other_device_lambda', Math.max(0, Math.min(2000, parseFloat(e.target.value) || 0)))} />
+                  <span className="sfx">대/km²</span>
+                </div></td>
+                <td><span className="muted" style={{ fontSize: 11 }}>차량 외 기기(폰·IoT) 밀도 — 같은 기지국 capacity를 나눠 쓰는 비차량 부하 (0–2000)</span></td>
               </tr>
               {[
                 ['저지연 우선',    'prefer_low_latency',  '지연시간 최소화 경로 선호'],

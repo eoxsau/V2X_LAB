@@ -80,6 +80,7 @@ class BottleneckSection:
     High load → increased latency and potential disconnection risk.
     """
     edge_id: str
+    street_name: str
     midpoint_lat: float
     midpoint_lng: float
     connected_bs: str                   # BS name or ID
@@ -110,6 +111,7 @@ class HandoverSection:
     Frequent handovers indicate overlapping coverage zones or network instability.
     """
     edge_id: str
+    street_name: str
     from_bs_name: str
     to_bs_name: str
     latency_ms: float
@@ -122,6 +124,7 @@ class HighLatencySection:
     A road edge where predicted latency exceeds the SLA threshold.
     """
     edge_id: str
+    street_name: str
     latency_ms: float
     connected_bs: str
     excess_ms: float                    # latency_ms − threshold
@@ -135,6 +138,7 @@ class CoverageRiskSection:
     Indicates potential disconnection risk on this segment.
     """
     edge_id: str
+    street_name: str
     midpoint_lat: float
     midpoint_lng: float
     nearest_bs_name: Optional[str]
@@ -233,6 +237,7 @@ def build_summary(
     bs_nodes: list[dict],
     scenario_id: str = "unknown",
     thresholds: Optional[SummaryThresholds] = None,
+    edge_names: Optional[dict] = None,  # _state["route_edge_names"] — edge_id → 도로명
 ) -> SimulationSummary:
     """
     Build a SimulationSummary from the current simulation state.
@@ -249,6 +254,11 @@ def build_summary(
     selected_edges = _get_edge_snaps(selected_alg, route_cost, k_candidates)
     baseline_edges = _get_edge_snaps(baseline_alg, route_cost, k_candidates)
 
+    # 매칭 안 되는 엣지(OSM에 도로명이 없거나 미수집)는 경로 순서상 직전 엣지의 도로명을
+    # 그대로 이어 써서 구간이 빠짐없이 도로명으로 보이게 한다 — tab-network.jsx의 같은
+    # 전파 로직을 백엔드 요약 쪽에도 동일하게 적용.
+    names = _fill_edge_names(selected_edges, edge_names or {})
+
     route_sum = _build_route_summary(selected_alg, selected_edges, route_cost, k_candidates)
     metric_sum = MetricSummary(
         algorithms={k: v for k, v in algorithm_metrics.items() if not k.startswith("_")},
@@ -256,11 +266,11 @@ def build_summary(
     )
     improvement = _compute_improvement(selected_alg, baseline_alg, algorithm_metrics)
 
-    bottlenecks = _extract_bottlenecks(selected_edges, thr)
+    bottlenecks = _extract_bottlenecks(selected_edges, thr, names)
     overloaded_bs = _extract_overloaded_bs(selected_edges, bs_nodes, thr)
-    handovers = _extract_handover_sections(selected_edges)
-    high_lat = _extract_high_latency_sections(selected_edges, thr)
-    cov_risk = _extract_coverage_risk_sections(selected_edges)
+    handovers = _extract_handover_sections(selected_edges, names)
+    high_lat = _extract_high_latency_sections(selected_edges, thr, names)
+    cov_risk = _extract_coverage_risk_sections(selected_edges, names)
 
     rec_seed = _build_recommendation_seed(
         selected_alg, baseline_alg, improvement,
@@ -352,6 +362,30 @@ def _get_edge_snaps(
         raw = route_cost.get("per_edge", [])
 
     return [_snap(d) for d in raw]
+
+
+def _fill_edge_names(edges: list[SimpleNamespace], raw_names: dict) -> dict[str, str]:
+    """경로 순서를 따라 도로명을 전파한다.
+
+    OSM에 이름이 없거나 도로명 매칭에 실패한 엣지는 직전 엣지의 도로명을 그대로
+    물려받고(정방향 전파), 경로 맨 앞부터 이름이 없는 경우에는 다음 엣지의 이름을
+    당겨온다(역방향 전파) — 두 전파를 다 거쳐도 이름이 없는 엣지만 edge_id로 남는다.
+    """
+    filled: dict[str, str] = {eid: name for e in edges if (eid := e.edge_id) and (name := raw_names.get(eid))}
+    ordered_ids = [e.edge_id for e in edges]
+    last = None
+    for eid in ordered_ids:
+        if eid in filled:
+            last = filled[eid]
+        elif last:
+            filled[eid] = last
+    nxt = None
+    for eid in reversed(ordered_ids):
+        if eid in filled:
+            nxt = filled[eid]
+        elif nxt:
+            filled[eid] = nxt
+    return filled
 
 
 def _snap(d: dict) -> SimpleNamespace:
@@ -454,6 +488,7 @@ def _compute_improvement(
 def _extract_bottlenecks(
     edges: list[SimpleNamespace],
     thr: SummaryThresholds,
+    edge_names: dict,
 ) -> list[BottleneckSection]:
     out: list[BottleneckSection] = []
     for e in edges:
@@ -461,6 +496,7 @@ def _extract_bottlenecks(
             sev = "critical" if e.load_ratio >= 0.90 else "high"
             out.append(BottleneckSection(
                 edge_id=e.edge_id,
+                street_name=edge_names.get(e.edge_id) or e.edge_id,
                 midpoint_lat=e.midpoint_lat,
                 midpoint_lng=e.midpoint_lng,
                 connected_bs=e.best_node_name,
@@ -510,13 +546,14 @@ def _extract_overloaded_bs(
     return sorted(out, key=lambda x: x.load_ratio, reverse=True)
 
 
-def _extract_handover_sections(edges: list[SimpleNamespace]) -> list[HandoverSection]:
+def _extract_handover_sections(edges: list[SimpleNamespace], edge_names: dict) -> list[HandoverSection]:
     out: list[HandoverSection] = []
     prev_bs = ""
     for e in edges:
         if e.handover and prev_bs:
             out.append(HandoverSection(
                 edge_id=e.edge_id,
+                street_name=edge_names.get(e.edge_id) or e.edge_id,
                 from_bs_name=prev_bs,
                 to_bs_name=e.best_node_name,
                 latency_ms=round(e.latency_ms, 2),
@@ -530,12 +567,14 @@ def _extract_handover_sections(edges: list[SimpleNamespace]) -> list[HandoverSec
 def _extract_high_latency_sections(
     edges: list[SimpleNamespace],
     thr: SummaryThresholds,
+    edge_names: dict,
 ) -> list[HighLatencySection]:
     out: list[HighLatencySection] = []
     for e in edges:
         if e.latency_ms > thr.latency_high_ms:
             out.append(HighLatencySection(
                 edge_id=e.edge_id,
+                street_name=edge_names.get(e.edge_id) or e.edge_id,
                 latency_ms=round(e.latency_ms, 2),
                 connected_bs=e.best_node_name,
                 excess_ms=round(e.latency_ms - thr.latency_high_ms, 2),
@@ -546,12 +585,14 @@ def _extract_high_latency_sections(
 
 def _extract_coverage_risk_sections(
     edges: list[SimpleNamespace],
+    edge_names: dict,
 ) -> list[CoverageRiskSection]:
     out: list[CoverageRiskSection] = []
     for e in edges:
         if not e.within_coverage:
             out.append(CoverageRiskSection(
                 edge_id=e.edge_id,
+                street_name=edge_names.get(e.edge_id) or e.edge_id,
                 midpoint_lat=e.midpoint_lat,
                 midpoint_lng=e.midpoint_lng,
                 nearest_bs_name=e.best_node_name if e.best_node_name != "—" else None,

@@ -70,19 +70,24 @@ class EpisodeResult:
 
 
 # ── Policy selector ───────────────────────────────────────────────────────────
-def _select_action(env: V2XRoutingEnv, policy: str) -> int:
+def _select_action(env: V2XRoutingEnv, policy: str, rng: random.Random) -> int:
     """
     Select an action index given the current env state and policy.
 
     Reads env._cached_edge_costs (populated by _build_state after every
     reset/step call) for cost-aware policies.
+
+    rng : a random.Random instance scoped to this episode — never the global
+          `random` module, so concurrent/sequential episodes (and unrelated
+          randomness elsewhere in the process, e.g. background-vehicle
+          sampling in main.py) can't leak into or be leaked into by this run.
     """
     valid = env.valid_actions()
     if not valid:
         return 0
 
     if policy == "random":
-        return random.choice(valid)
+        return rng.choice(valid)
 
     costs = env._cached_edge_costs  # pre-computed in _build_state, safe to read
 
@@ -107,7 +112,7 @@ def _select_action(env: V2XRoutingEnv, policy: str) -> int:
                 best_action = a
         return best_action
 
-    return random.choice(valid)
+    return rng.choice(valid)
 
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
@@ -133,8 +138,11 @@ def run_episode(
     """
     if policy not in SUPPORTED_POLICIES:
         raise ValueError(f"Unknown policy '{policy}'. Choose from {SUPPORTED_POLICIES}.")
-    if seed is not None:
-        random.seed(seed)
+    # Dedicated RNG instance per episode — never mutate the global `random`
+    # module (random.seed()), which would otherwise leak into/out of
+    # unrelated randomness elsewhere in the process (e.g. main.py's
+    # background-vehicle/Poisson sampling) on every call.
+    rng = random.Random(seed)
 
     env.reset()
     done = False
@@ -146,7 +154,7 @@ def run_episode(
     last_result: Optional[StepResult] = None
 
     while not done:
-        action = _select_action(env, policy)
+        action = _select_action(env, policy, rng)
         result = env.step(action)
         last_result = result
 

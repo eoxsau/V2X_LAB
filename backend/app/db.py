@@ -153,6 +153,14 @@ def ensure_postgis_schema() -> bool:
       ended_at TIMESTAMPTZ,
       metrics_json JSONB
     );
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS scenario_id TEXT;
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS seed BIGINT;
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS batch_id TEXT;
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS sheet_id TEXT;
+    ALTER TABLE simulation_runs ADD COLUMN IF NOT EXISTS sheet_name TEXT;
+    CREATE INDEX IF NOT EXISTS idx_simulation_runs_batch_id ON simulation_runs (batch_id);
+    CREATE INDEX IF NOT EXISTS idx_simulation_runs_started_at ON simulation_runs (started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_simulation_runs_sheet_id ON simulation_runs (sheet_id);
     """
     with engine.begin() as conn:
         conn.exec_driver_sql(ddl)
@@ -604,7 +612,17 @@ def delete_synthetic_network_nodes() -> int:
     return count
 
 
-def create_simulation_run(origin: dict, destination: dict, mode: str) -> int | None:
+def create_simulation_run(
+    origin: dict,
+    destination: dict,
+    mode: str,
+    *,
+    scenario_id: str | None = None,
+    seed: int | None = None,
+    batch_id: str | None = None,
+    sheet_id: str | None = None,
+    sheet_name: str | None = None,
+) -> int | None:
     if not postgis_available():
         return None
     ensure_postgis_schema()
@@ -613,22 +631,98 @@ def create_simulation_run(origin: dict, destination: dict, mode: str) -> int | N
         row = conn.execute(
             text(
                 """
-                INSERT INTO simulation_runs (origin, destination, mode)
-                VALUES (:origin, :destination, :mode)
+                INSERT INTO simulation_runs (origin, destination, mode, scenario_id, seed, batch_id, sheet_id, sheet_name)
+                VALUES (:origin, :destination, :mode, :scenario_id, :seed, :batch_id, :sheet_id, :sheet_name)
                 RETURNING id
                 """
             ),
-            {"origin": json.dumps(origin), "destination": json.dumps(destination), "mode": mode},
+            {
+                "origin": json.dumps(origin),
+                "destination": json.dumps(destination),
+                "mode": mode,
+                "scenario_id": scenario_id,
+                "seed": seed,
+                "batch_id": batch_id,
+                "sheet_id": sheet_id,
+                "sheet_name": sheet_name,
+            },
         ).first()
     return int(row[0]) if row else None
 
 
 def finish_simulation_run(run_id: int | None, metrics_json: dict) -> None:
+    """Merge (not overwrite) metrics_json and stamp ended_at.
+
+    This can be called more than once for the same run — e.g. once right at
+    vehicle-arrival time with sheet-tagged sim_logs/sim_history (frontend-only
+    data the backend has no other way to see), and again later from a generic
+    reset/stop path with whatever _state still holds. JSONB `||` concatenation
+    merges keys (new call's keys win on overlap) instead of clobbering whatever
+    an earlier, more specific call already saved.
+    """
     if not postgis_available() or not run_id:
         return
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(
-            text("UPDATE simulation_runs SET ended_at = now(), metrics_json = CAST(:metrics_json AS jsonb) WHERE id = :id"),
+            text(
+                """
+                UPDATE simulation_runs
+                SET ended_at = now(),
+                    metrics_json = COALESCE(metrics_json, '{}'::jsonb) || CAST(:metrics_json AS jsonb)
+                WHERE id = :id
+                """
+            ),
             {"id": run_id, "metrics_json": json.dumps(metrics_json)},
         )
+
+
+def list_simulation_runs(limit: int = 50, offset: int = 0) -> list[dict]:
+    """Most-recent-first page of past simulation runs (for team-shared run history).
+
+    Returns [] (not an error) when the DB isn't connected — callers should
+    check postgis_available() first to distinguish "no DB" from "no runs yet".
+    """
+    if not postgis_available():
+        return []
+    ensure_postgis_schema()
+    engine = get_engine()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, origin, destination, mode, scenario_id, seed, batch_id,
+                       sheet_id, sheet_name, started_at, ended_at, metrics_json
+                FROM simulation_runs
+                ORDER BY started_at DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"limit": limit, "offset": offset},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def list_simulation_runs_by_sheet(sheet_id: str, limit: int = 50) -> list[dict]:
+    """All past runs tagged with a given sheet_id, most-recent-first — lets the
+    Dashboard/Report tabs pull a sheet's durable DB history independent of
+    whatever happens to still be in this browser's localStorage."""
+    if not postgis_available():
+        return []
+    ensure_postgis_schema()
+    engine = get_engine()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, origin, destination, mode, scenario_id, seed, batch_id,
+                       sheet_id, sheet_name, started_at, ended_at, metrics_json
+                FROM simulation_runs
+                WHERE sheet_id = :sheet_id
+                ORDER BY started_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"sheet_id": sheet_id, "limit": limit},
+        ).mappings().all()
+    return [dict(r) for r in rows]

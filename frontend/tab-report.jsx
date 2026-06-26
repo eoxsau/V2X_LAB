@@ -16,6 +16,37 @@ const PROVIDER_LABELS = {
   bedrock: { name: 'Claude', color: 'var(--brand-2)' },
 };
 
+/* ---- ported from tab-routes.jsx ----------------------------- */
+const ALT_PATH_COLORS = ['#F6A623', '#A855F7', '#22C1A8', '#E45C8A', '#5B8DEF'];
+
+/* ---- ported from tab-comparison.jsx -------------------------- */
+const CMP_METRIC_COLS = [
+  { key: 'total_cost',              label: '총 비용',        fmt: v => v.toFixed(2) },
+  { key: 'average_latency_ms',      label: '평균 Latency',   fmt: v => v.toFixed(1) + 'ms' },
+  { key: 'handover_count',          label: '핸드오버',       fmt: v => v + '회' },
+  { key: 'disconnection_ratio',     label: '단절율',         fmt: v => (v * 100).toFixed(0) + '%' },
+  { key: 'average_bs_load',         label: '평균 BS 부하',   fmt: v => (v * 100).toFixed(0) + '%' },
+  { key: 'future_connectivity_risk', label: '미래 위험도',   fmt: v => (v * 100).toFixed(0) + '%' },
+  { key: 'edge_count',              label: '구간 수',        fmt: v => v + '개' },
+];
+const CMP_HISTORY_KEY = 'v2x_run_history';
+function loadRunHistory() {
+  try { return JSON.parse(localStorage.getItem(CMP_HISTORY_KEY) || '[]'); } catch { return []; }
+}
+function saveRunHistory(list) {
+  try { localStorage.setItem(CMP_HISTORY_KEY, JSON.stringify(list.slice(-20))); } catch {}
+}
+
+// 시나리오 어시스턴트 탭의 "시나리오 생성·배치" 모드(Phase 3/4)가 쓰는 키와 동일 —
+// 여기서는 읽기만 한다(쓰기는 tab-scenario.jsx의 scbSaveBatches가 담당).
+const SCB_BATCH_KEY = 'v2x_scenario_batches';
+function loadScenarioBatches() {
+  try { return JSON.parse(localStorage.getItem(SCB_BATCH_KEY) || '[]'); } catch { return []; }
+}
+function saveScenarioBatches(list) {
+  try { localStorage.setItem(SCB_BATCH_KEY, JSON.stringify(list)); } catch {}
+}
+
 function ReportSectionList({ title, items, render, empty }) {
   if (!items || items.length === 0) return null;
   return (
@@ -35,7 +66,8 @@ function ReportSectionList({ title, items, render, empty }) {
   );
 }
 
-function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
+function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, routeEdges, simHistory, simConfig }) {
+  const [subTab, setSubTab] = useState('compare'); // 'compare' | 'batch' | 'logs' — 한 화면에 다 펼치지 않고 묶음별로 분리
   const [analyzing, setAnalyzing] = useState(false);
   const [revealed, setRevealed] = useState(0);
   const [exported, setExported] = useState(false);
@@ -75,6 +107,212 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
     ?? networkTelemetry?.connected_node?.name ?? '--';
   const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
     ?? networkTelemetry?.latency_ms ?? null;
+
+  /* ====== ported from tab-routes.jsx — 최적 경로 비교 ====== */
+  const hasRoute = routeCoords && routeCoords.length >= 2;
+
+  // 경로 대안(K-path) — 시뮬레이션 시작 후 백그라운드에서 계산되므로, route가 잡힌
+  // 직후 바로 fetch하면 아직 준비 전일 수 있어 준비될 때까지 짧게 재시도한다.
+  const [kCandidates, setKCandidates] = useState(null);
+  const [visibleRanks, setVisibleRanks] = useState({});
+  useEffect(() => {
+    if (!hasRoute) return;
+    let stopped = false;
+    let tries = 0;
+    const tryFetch = () => {
+      fetch('http://127.0.0.1:8001/api/route/candidates')
+        .then(r => r.json())
+        .then(data => {
+          if (stopped) return;
+          if (data?.available) {
+            setKCandidates(data);
+            setVisibleRanks(Object.fromEntries((data.candidates || []).map(c => [c.rank, true])));
+          } else if (tries++ < 8) {
+            setTimeout(tryFetch, 2000);
+          }
+        })
+        .catch(() => {});
+    };
+    tryFetch();
+    return () => { stopped = true; };
+  }, [hasRoute, routeCoords]);
+
+  const currentEdgeId = vehiclePos?.current_edge_id ?? null;
+  const edgeNames = networkTelemetry?.route_edge_names ?? routeEdges?.edge_names ?? {};
+  const perEdge = routeEdges?.per_edge ?? [];
+
+  // Convert routeCoords [[lat,lng],...] for MiniMap (already correct format)
+  const livePath = hasRoute ? routeCoords : null;
+
+  // Base stations for map overlay from candidates
+  const bsPoints = (networkTelemetry?.candidate_nodes ?? [])
+    .filter(c => c.lat != null && c.lng != null)
+    .map(c => ({ lat: c.lat, lng: c.lng }));
+
+  // K-path 대안 — 보이기로 체크된 것만 지도에 겹쳐 그림
+  const kCandidateList = kCandidates?.candidates ?? [];
+  const altPaths = kCandidateList
+    .filter(c => visibleRanks[c.rank] && (c.per_edge?.length ?? 0) >= 2)
+    .map(c => ({
+      path: c.per_edge.map(e => [e.midpoint_lat, e.midpoint_lng]),
+      color: ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length],
+      rank: c.rank,
+    }));
+
+  /* ====== ported from tab-comparison.jsx — 알고리즘 비교 ====== */
+  const [metrics, setMetrics] = useState(null);
+  const [cmpLoading, setCmpLoading] = useState(false);
+  const [cmpError, setCmpError] = useState(null);
+  const [history, setHistory] = useState(() => loadRunHistory());
+  const [checkedRuns, setCheckedRuns] = useState([]);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [routeEval, setRouteEval] = useState(null);
+  const [cmp, setCmp] = useState(null);
+
+  /* ====== 시나리오 배치 비교 (Phase 3/4) ====== */
+  const [scenarioBatches, setScenarioBatches] = useState(() => loadScenarioBatches());
+  const [selectedBatch, setSelectedBatch] = useState(0); // index into reversed(most-recent-first) list
+
+  /* ====== 배치 비교 AI 분석 (Phase 6) — 단일 실행용 runAI()와 별개 ====== */
+  const [batchAiLoading, setBatchAiLoading] = useState(false);
+  const [batchAiError, setBatchAiError] = useState(null);
+  const [batchAiSections, setBatchAiSections] = useState([]);
+  const [batchAiProvider, setBatchAiProvider] = useState(null);
+  const [batchAiRevealed, setBatchAiRevealed] = useState(0);
+
+  async function runBatchAnalysis(batch) {
+    setBatchAiLoading(true); setBatchAiError(null); setBatchAiSections([]); setBatchAiRevealed(0); setBatchAiProvider(null);
+    try {
+      const res = await fetch('http://127.0.0.1:8001/api/analysis/llm/batch-compare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: batch.label, results: batch.results, provider: selectedProvider || null }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const sections = data.sections || [];
+      setBatchAiSections(sections);
+      setBatchAiProvider(data.provider || null);
+      setBatchAiLoading(false);
+      sections.forEach((_, i) => setTimeout(() => setBatchAiRevealed(i + 1), i * 450));
+    } catch (e) {
+      setBatchAiLoading(false);
+      setBatchAiError(e.message || '배치 비교 분석 중 오류가 발생했습니다.');
+    }
+  }
+
+  /* ====== 팀 공유 실행 기록 — DB 연동 (Phase 0.5/4) ====== */
+  const [dbRuns, setDbRuns] = useState([]);
+  const [dbRunsAvailable, setDbRunsAvailable] = useState(null); // null=확인중, true/false
+  const [dbRunsError, setDbRunsError] = useState(null);
+
+  useEffect(() => {
+    fetch('http://127.0.0.1:8001/api/simulation/runs?limit=20')
+      .then(r => r.json())
+      .then(data => {
+        setDbRunsAvailable(!!data.available);
+        setDbRuns(data.runs || []);
+        if (!data.available) setDbRunsError(data.reason || null);
+      })
+      .catch(e => { setDbRunsAvailable(false); setDbRunsError(e.message || 'DB 실행 기록을 불러오지 못했습니다.'); });
+  }, []);
+  const cmpPollRef = useRef(null);
+
+  function fetchMetrics() {
+    setCmpLoading(true); setCmpError(null);
+    fetch('http://127.0.0.1:8001/api/route/metrics')
+      .then(r => r.json())
+      .then(data => { setMetrics(data); setCmpLoading(false); })
+      .catch(e => { setCmpError(e.message || '불러오기 실패'); setCmpLoading(false); });
+    fetch('http://127.0.0.1:8001/api/route/evaluate')
+      .then(r => r.json())
+      .then(data => setRouteEval(data?.available ? data : null))
+      .catch(() => {});
+  }
+  useEffect(() => { fetchMetrics(); }, []);
+
+  // algo key("k_path_rank_2" 또는 baseline routing_mode)로 해당 후보의 도로명 시퀀스 조회
+  function streetNamesFor(algo) {
+    const m = /^k_path_rank_(\d+)$/.exec(algo || '');
+    if (m) {
+      const idx = parseInt(m[1], 10);
+      return kCandidates?.candidates?.[idx]?.street_names || null;
+    }
+    return routeEval?.street_names || null;
+  }
+
+  function pollCmp() {
+    fetch('http://127.0.0.1:8001/api/route/compare-algorithms')
+      .then(r => r.json())
+      .then(data => {
+        setCmp(data);
+        if (data.status !== 'running' && cmpPollRef.current) {
+          clearInterval(cmpPollRef.current);
+          cmpPollRef.current = null;
+        }
+      })
+      .catch(() => {});
+  }
+  useEffect(() => {
+    pollCmp();
+    return () => { if (cmpPollRef.current) clearInterval(cmpPollRef.current); };
+  }, []);
+  function runComparison() {
+    fetch('http://127.0.0.1:8001/api/route/compare-algorithms', { method: 'POST' })
+      .then(r => r.json())
+      .then(() => {
+        setCmp({ status: 'running' });
+        if (cmpPollRef.current) clearInterval(cmpPollRef.current);
+        cmpPollRef.current = setInterval(pollCmp, 2000);
+      })
+      .catch(() => {});
+  }
+
+  const algorithms = metrics?.available ? metrics.algorithms : {};
+  const algoEntries = Object.entries(algorithms);
+  const comparison = metrics?.available ? metrics.comparison : null;
+  const bestPerMetric = comparison?.best_per_metric || {};
+  const summaryRank = comparison?.summary_rank || {};
+
+  const sortedByCost = [...algoEntries].sort((a, b) => (a[1].total_cost ?? Infinity) - (b[1].total_cost ?? Infinity));
+  const rankItems = Object.entries(summaryRank)
+    .sort((a, b) => a[1] - b[1])
+    .map(([algo, score]) => ({ label: algo, value: score, display: score.toFixed(2) }));
+
+  function saveCurrentRun() {
+    if (!algoEntries.length) return;
+    const entry = {
+      timestamp: new Date().toISOString(),
+      config: simConfig ?? null,
+      algorithms,
+    };
+    const next = [...history, entry];
+    setHistory(next);
+    saveRunHistory(next);
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 1800);
+  }
+  function removeRun(idx) {
+    const next = history.filter((_, i) => i !== idx);
+    setHistory(next);
+    saveRunHistory(next);
+    setCheckedRuns(checkedRuns.filter(i => i !== idx));
+  }
+  function toggleCheck(idx) {
+    setCheckedRuns(prev => prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx].slice(-3));
+  }
+  const selectedRuns = checkedRuns.map(i => history[i]).filter(Boolean);
+
+  const reversedBatches = [...scenarioBatches].reverse(); // 최신 배치가 먼저 보이게
+  const currentBatch = reversedBatches[selectedBatch] || null;
+  useEffect(() => { setBatchAiSections([]); setBatchAiError(null); setBatchAiRevealed(0); }, [selectedBatch]);
+  function removeBatch(reversedIdx) {
+    const origIdx = scenarioBatches.length - 1 - reversedIdx;
+    const next = scenarioBatches.filter((_, i) => i !== origIdx);
+    setScenarioBatches(next);
+    saveScenarioBatches(next);
+    setSelectedBatch(0);
+  }
 
   async function runAI() {
     setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]); setUsedProvider(null);
@@ -177,20 +415,20 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
             )}
             <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14 }}>
               <ReportSectionList title="병목 구간" items={summary.bottleneck_sections} render={it => (
-                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span>{it.severity && <Chip tone="warn">{it.severity}</Chip>}</>
+                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span>{it.severity && <Chip tone="warn">{it.severity}</Chip>}</>
               )} />
               <ReportSectionList title="과부하 기지국" items={summary.overloaded_base_stations} render={it => (
                 <><span className="mono" style={{ fontWeight: 600 }}>{it.bs_name}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span></>
               )} />
               <ReportSectionList title="빈번한 핸드오버 구간" items={summary.frequent_handover_sections} render={it => (
-                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">{it.from_bs_name} → {it.to_bs_name}</span></>
+                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">{it.from_bs_name} → {it.to_bs_name}</span></>
               )} />
               <ReportSectionList title="고지연 구간" items={summary.high_latency_sections} render={it => (
-                <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span><span className="muted">{(it.latency_ms ?? 0).toFixed(1)}ms (+{(it.excess_ms ?? 0).toFixed(1)}ms)</span></>
+                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">{(it.latency_ms ?? 0).toFixed(1)}ms (+{(it.excess_ms ?? 0).toFixed(1)}ms)</span></>
               )} />
             </div>
             <ReportSectionList title="미래 연결 위험 구간" items={summary.future_connectivity_risk_sections} render={it => (
-              <><span className="mono" style={{ fontWeight: 600 }}>{it.edge_id}</span>{it.severity && <Chip tone="bad">{it.severity}</Chip>}</>
+              <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>{it.severity && <Chip tone="bad">{it.severity}</Chip>}</>
             )} />
             {seed && (seed.risk_factors?.length > 0 || seed.improvement_highlights?.length > 0) && (
               <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14, marginTop: 4 }}>
@@ -225,6 +463,440 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
         </div>
       )}
 
+      <div className="row gap8" style={{ marginBottom: 18 }}>
+        <Seg value={subTab} onChange={setSubTab} options={[
+          { v: 'compare', label: '경로·알고리즘 비교' },
+          { v: 'batch', label: '시나리오 배치 비교' },
+          { v: 'logs', label: '로그·AI분석' },
+        ]} />
+      </div>
+
+      {subTab === 'compare' && <>
+      {/* ════════════════════════════════════════════════════
+          최적 경로 비교 (ported from tab-routes.jsx)
+          ════════════════════════════════════════════════════ */}
+      <div style={{ margin: '8px 0 14px' }}>
+        <div className="eyebrow">Path Comparison</div>
+        <h2 style={{ fontSize: 17, fontWeight: 700, margin: '4px 0 2px' }}>
+          최적 경로 비교 <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>Routes</span>
+        </h2>
+        <div className="sub" style={{ fontSize: 12 }}>
+          {hasRoute ? '실시간 SUMO 경로 vs 대안 경로(K-path)' : '시뮬레이션 실행 후 실제 경로와 대안 경로를 비교합니다'}
+        </div>
+      </div>
+
+      {hasRoute ? (
+        <>
+          <Card title="실시간 경로" en="Live SUMO route" right={<Chip tone="good" dot>실시간</Chip>} style={{ marginBottom: 18 }}>
+            <MiniMap path={livePath} color="var(--brand-2)" bs={bsPoints} label="live" height={210} extraPaths={altPaths} />
+            <div className="row gap16" style={{ marginTop: 12, fontSize: 11, flexWrap: 'wrap' }}>
+              <span className="row gap8"><span style={{ width: 16, height: 3, background: 'var(--brand-2)', borderRadius: 2 }} /> 실제 경로</span>
+              {connNode !== '--' && <span className="row gap8"><span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--brand-2)' }} /> {connNode}</span>}
+              {latency !== null && <span className="row gap8" style={{ marginLeft: 'auto' }}>평균 <span className="num" style={{ fontWeight: 600 }}>{latency.toFixed(1)}</span>ms</span>}
+            </div>
+            {kCandidateList.length > 0 && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>
+                  경로 대안(K-path) — 점선으로 지도에 겹쳐 표시, 체크 해제 시 숨김
+                </div>
+                <div className="col gap6">
+                  {kCandidateList.map(c => {
+                    const names = c.street_names || [];
+                    const summary = names.length > 3
+                      ? `${names.slice(0, 2).join(' → ')} → … → ${names[names.length - 1]}`
+                      : names.join(' → ');
+                    const color = ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length];
+                    return (
+                      <label key={c.rank} className="row gap8" style={{ fontSize: 10.5, cursor: 'pointer', alignItems: 'center' }}>
+                        <input
+                          type="checkbox"
+                          checked={!!visibleRanks[c.rank]}
+                          onChange={() => setVisibleRanks(prev => ({ ...prev, [c.rank]: !prev[c.rank] }))}
+                        />
+                        <span style={{ width: 14, height: 3, background: color, borderRadius: 2, flex: '0 0 auto' }} />
+                        <span style={{ flex: '0 0 auto', fontWeight: 600 }}>대안 {c.rank + 1}</span>
+                        <span className="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{summary}</span>
+                        <span className="num muted" style={{ marginLeft: 'auto', flex: '0 0 auto' }}>{c.avg_latency_ms?.toFixed(1)}ms</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </Card>
+
+          {perEdge.length > 0 && (
+            <Card title="구간별 비용 분해" en="Edge cost breakdown" right={<Chip>{perEdge.length}개 구간</Chip>} style={{ marginBottom: 18 }}>
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>구간</th>
+                      <th className="r">거리</th>
+                      <th className="r">Latency</th>
+                      <th className="r">부하율</th>
+                      <th className="r">총 비용</th>
+                      <th>커버리지</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {perEdge.map((e, i) => {
+                      const isCurrent = e.edge_id === currentEdgeId;
+                      const name = e.best_node_name || edgeNames[e.edge_id] || e.edge_id;
+                      return (
+                        <tr key={e.edge_id || i} style={isCurrent ? { background: 'var(--brand-tint)', fontWeight: 500 } : {}}>
+                          <td>
+                            <span className="mono" style={{ fontSize: 11.5 }}>{name}</span>
+                            {isCurrent && <span className="chip" style={{ marginLeft: 6, fontSize: 9, background: 'var(--brand)', color: '#fff' }}>현재</span>}
+                          </td>
+                          <td className="r"><span className="num">{e.distance_m != null ? e.distance_m.toFixed(0) : '—'}</span><span className="muted" style={{ fontSize: 10 }}> m</span></td>
+                          <td className="r"><span className="num" style={{ color: `var(--${latencyTone(e.latency_ms || 0)})`, fontWeight: 600 }}>{(e.latency_ms || 0).toFixed(1)}</span><span className="muted" style={{ fontSize: 10 }}> ms</span></td>
+                          <td className="r">
+                            <div className="row gap8" style={{ justifyContent: 'flex-end' }}>
+                              <div className="pbar" style={{ width: 44 }}><i style={{ width: `${Math.min((e.load_ratio || 0) * 100, 100)}%`, background: 'var(--brand-2)' }} /></div>
+                              <span className="num" style={{ fontSize: 11 }}>{((e.load_ratio || 0) * 100).toFixed(0)}%</span>
+                            </div>
+                          </td>
+                          <td className="r"><span className="num" style={{ fontWeight: 600 }}>{(e.total_cost || 0).toFixed(2)}</span></td>
+                          <td>{e.within_coverage === false
+                            ? <Chip tone="bad" dot>미커버</Chip>
+                            : <Chip tone="good" dot>커버됨</Chip>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </>
+      ) : (
+        <div style={{ textAlign: 'center', padding: '40px 24px', color: 'var(--ink-4)', marginBottom: 18 }}>
+          <div style={{ fontSize: 28, opacity: 0.2, marginBottom: 10 }}>⇢</div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--ink-3)' }}>경로가 설정되지 않았습니다</div>
+          <div style={{ fontSize: 12 }}>시뮬레이션 탭에서 출발지와 도착지를 지정하고 시뮬레이션을 시작하세요</div>
+        </div>
+      )}
+
+      {/* ════════════════════════════════════════════════════
+          알고리즘 비교 (ported from tab-comparison.jsx)
+          ════════════════════════════════════════════════════ */}
+      <div style={{ margin: '8px 0 14px' }}>
+        <div className="eyebrow">Decision Support</div>
+        <h2 style={{ fontSize: 17, fontWeight: 700, margin: '4px 0 2px' }}>
+          알고리즘 비교 <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>Comparison</span>
+        </h2>
+        <div className="sub" style={{ fontSize: 12 }}>경로 대안 비교 · 자원할당/기지국 선택 알고리즘 비교 · 실행 이력 비교</div>
+      </div>
+
+      <Card title="경로 대안 비교" en="Path alternatives" right={algoEntries.length > 0 ? <Chip>{algoEntries.length}개 후보</Chip> : null} style={{ marginBottom: 18 }}>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+          같은 알고리즘 설정으로 찾은 대안 경로(K-path)들을 비교합니다. 도로망이 단순하면 대안 경로가
+          적게 나올 수 있습니다 — 서로 다른 알고리즘 설정을 비교하려면 아래 "알고리즘 설정 비교"를 사용하세요.
+          baseline 항목은 시뮬레이션 탭에서 실제로 선택한 경로 탐색 알고리즘(Dijkstra/A*/
+          K-shortest-path/Network-aware/Look-ahead)을 반영합니다. "경유 도로" 칸에서 각
+          후보가 실제로 어떤 도로를 지나는지 확인할 수 있습니다.
+        </div>
+        {cmpLoading && <div className="muted" style={{ padding: 16, fontSize: 12 }}>불러오는 중…</div>}
+        {!cmpLoading && cmpError && <div style={{ padding: 16, fontSize: 12, color: 'var(--bad)' }}>{cmpError}</div>}
+        {!cmpLoading && !cmpError && algoEntries.length === 0 && (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>시뮬레이션을 먼저 실행하면 후보 알고리즘 비교가 표시됩니다.</div>
+        )}
+        {algoEntries.length > 0 && (
+          <>
+            {rankItems.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>종합 순위 (낮을수록 우수)</div>
+                <BarChart items={rankItems} />
+              </div>
+            )}
+            <div className="tbl-wrap">
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>알고리즘</th>
+                    <th>경유 도로</th>
+                    {CMP_METRIC_COLS.map(c => <th key={c.key} className="r">{c.label}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedByCost.map(([algo, m]) => {
+                    const names = streetNamesFor(algo);
+                    const shown = names && names.length > 4
+                      ? [...names.slice(0, 3), '…', names[names.length - 1]]
+                      : names;
+                    return (
+                    <tr key={algo}>
+                      <td><span className="mono" style={{ fontWeight: 600 }}>{algo}</span></td>
+                      <td style={{ maxWidth: 260 }}>
+                        {shown
+                          ? <div className="row gap6 wrap">
+                              {shown.map((nm, i) => nm === '…'
+                                ? <span key={i} className="muted" style={{ fontSize: 11 }}>…</span>
+                                : <Chip key={i} style={{ fontSize: 10 }}>{nm}</Chip>)}
+                            </div>
+                          : <span className="muted">—</span>}
+                      </td>
+                      {CMP_METRIC_COLS.map(c => {
+                        const v = m[c.key];
+                        const isBest = bestPerMetric[c.key] === algo;
+                        return (
+                          <td key={c.key} className="r">
+                            <span className="num" style={{ fontWeight: isBest ? 700 : 400, color: isBest ? 'var(--good)' : 'inherit' }}>
+                              {v != null ? c.fmt(v) : '—'}
+                            </span>
+                            {isBest && <Chip tone="good" style={{ marginLeft: 6, fontSize: 9 }}>최적</Chip>}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="row gap8" style={{ marginTop: 14 }}>
+              <button className={'btn sm ' + (savedFlash ? 'good' : '')} onClick={saveCurrentRun}>
+                {savedFlash ? <><Icon.check size={13} /> 저장됨</> : <><Icon.download size={13} /> 현재 결과를 히스토리에 저장</>}
+              </button>
+            </div>
+          </>
+        )}
+      </Card>
+
+      <Card title="알고리즘 설정 비교" en="Algorithm settings"
+        right={<button className="btn sm" onClick={runComparison} disabled={cmp?.status === 'running' || !metrics?.available}>
+          {cmp?.status === 'running' ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : <><Icon.spark size={13} /> 비교 실행</>}
+        </button>}
+        style={{ marginBottom: 18 }}>
+        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+          같은 경로를 latency / 기지국 선택 / 자원할당 알고리즘별로 다시 평가해서 비교합니다. 자원할당
+          최적, 기지국 선택 최적 등 시뮬레이션 결과 기반 알고리즘 비교가 여기에 해당합니다.
+          경로 탐색 알고리즘(Dijkstra/A*)은 현재 SUMO 모드에서 A* 구현이 없어 비교 대상에서 제외했습니다.
+        </div>
+        {!metrics?.available && (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>시뮬레이션을 먼저 실행하세요.</div>
+        )}
+        {metrics?.available && !cmp?.by_latency && cmp?.status !== 'running' && (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>
+            {cmp?.status === 'error' ? (cmp.reason || '비교 실행에 실패했습니다.') : '"비교 실행"을 눌러 알고리즘 설정별 결과를 확인하세요.'}
+          </div>
+        )}
+        {cmp?.status === 'running' && !cmp?.by_latency && (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>비교 실행 중… (경로 길이에 따라 수 초~수십 초 걸릴 수 있습니다)</div>
+        )}
+        {cmp?.by_latency && (
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(3,1fr)', gap: 14 }}>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>지연시간 알고리즘별 (평균 ms) · <span style={{ color: 'var(--good)' }}>녹색 = 최저</span></div>
+              <BarChart items={Object.entries(cmp.by_latency).map(([id, v]) => {
+                const isLowest = v.avg_latency_ms === Math.min(...Object.values(cmp.by_latency).map(x => x.avg_latency_ms));
+                return {
+                  label: algoLabel(id),
+                  value: v.avg_latency_ms,
+                  display: `${v.avg_latency_ms.toFixed(1)}ms${isLowest ? ' · 최저' : ''}`,
+                  color: isLowest ? 'var(--good)' : (id === simConfig?.algorithm_selection?.latency_algorithm ? 'var(--brand)' : 'var(--brand-2)'),
+                };
+              })} />
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>기지국 선택 알고리즘별 (handover 수)</div>
+              <BarChart items={Object.entries(cmp.by_bs_selection || {}).map(([id, v]) => ({
+                label: algoLabel(id),
+                value: v.handover_count,
+                display: `${v.handover_count}회 · ${v.total_cost.toFixed(1)}`,
+                color: id === simConfig?.algorithm_selection?.base_station_selection_algorithm ? 'var(--brand)' : 'var(--brand-2)',
+              }))} />
+            </div>
+            <div>
+              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>자원할당 알고리즘별 (사용률 %)</div>
+              <BarChart items={Object.entries(cmp.by_allocation || {}).map(([id, v]) => ({
+                label: algoLabel(id),
+                value: v.total_utilization * 100,
+                display: `${(v.total_utilization * 100).toFixed(0)}%${v.overloaded_bs_count > 0 ? ` · 과부하 ${v.overloaded_bs_count}` : ''}`,
+                color: id === simConfig?.algorithm_selection?.resource_allocation_algorithm ? 'var(--brand)' : 'var(--brand-2)',
+              }))} max={100} />
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card title="실행 이력 비교" en="Run history" right={<Chip>{history.length}개 저장됨</Chip>} style={{ marginBottom: 18 }}>
+        {history.length === 0 ? (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>아직 저장된 실행이 없습니다. 위에서 "현재 결과를 히스토리에 저장"을 눌러 비교를 시작하세요.</div>
+        ) : (
+          <>
+            <div className="tbl-wrap" style={{ marginBottom: 14 }}>
+              <table className="tbl">
+                <thead>
+                  <tr><th></th><th>시각</th><th>알고리즘 수</th><th>네트워크 모드</th><th></th></tr>
+                </thead>
+                <tbody>
+                  {history.map((h, i) => (
+                    <tr key={i} className={checkedRuns.includes(i) ? 'selected' : ''}>
+                      <td><input type="checkbox" checked={checkedRuns.includes(i)} onChange={() => toggleCheck(i)} /></td>
+                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
+                      <td><span className="num">{Object.keys(h.algorithms || {}).length}</span></td>
+                      <td><Chip tone="brand">{h.config?.policy_options?.network_mode ?? '—'}</Chip></td>
+                      <td className="r"><button className="btn icon sm" onClick={() => removeRun(i)}>✕</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {selectedRuns.length >= 2 && (
+              <div className="tbl-wrap">
+                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>선택한 {selectedRuns.length}개 실행 비교 (각 실행의 최저 비용 알고리즘 기준)</div>
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>실행 시각</th>
+                      {CMP_METRIC_COLS.map(c => <th key={c.key} className="r">{c.label}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedRuns.map((h, i) => {
+                      const best = Object.values(h.algorithms || {}).sort((a, b) => (a.total_cost ?? Infinity) - (b.total_cost ?? Infinity))[0];
+                      return (
+                        <tr key={i}>
+                          <td><span className="num muted" style={{ fontSize: 11.5 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
+                          {CMP_METRIC_COLS.map(c => (
+                            <td key={c.key} className="r"><span className="num">{best && best[c.key] != null ? c.fmt(best[c.key]) : '—'}</span></td>
+                          ))}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {selectedRuns.length === 1 && (
+              <div className="muted" style={{ fontSize: 11.5, padding: '8px 2px' }}>비교하려면 2개 이상 선택하세요.</div>
+            )}
+          </>
+        )}
+
+        <div className="muted" style={{ fontSize: 10.5, marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+          팀 공유 실행 기록(DB) — {dbRunsAvailable === null ? '확인 중…' : dbRunsAvailable ? `${dbRuns.length}건` : (dbRunsError || 'DB가 연결되어 있지 않습니다')}
+        </div>
+        {dbRunsAvailable && dbRuns.length > 0 && (
+          <div className="tbl-wrap" style={{ marginTop: 8, maxHeight: 220, overflowY: 'auto' }}>
+            <table className="tbl">
+              <thead><tr><th>시각</th><th>모드</th><th>시나리오/배치</th><th className="r">seed</th></tr></thead>
+              <tbody>
+                {dbRuns.map(r => (
+                  <tr key={r.id}>
+                    <td><span className="num muted" style={{ fontSize: 11 }}>{r.started_at ? new Date(r.started_at).toLocaleString('ko-KR') : '—'}</span></td>
+                    <td><Chip tone={r.mode === 'sumo' ? 'brand' : ''}>{r.mode}</Chip></td>
+                    <td className="muted" style={{ fontSize: 11 }}>{r.scenario_id || '—'}{r.batch_id ? ` · ${r.batch_id.slice(0, 8)}` : ''}</td>
+                    <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      </>}
+
+      {subTab === 'batch' && <>
+      <Card title="시나리오 배치 비교" en="Scenario batch comparison" right={<Chip>{scenarioBatches.length}개 배치</Chip>} style={{ marginBottom: 18 }}>
+        {scenarioBatches.length === 0 ? (
+          <div className="muted" style={{ padding: 16, fontSize: 12 }}>
+            아직 저장된 배치가 없습니다. 시나리오 어시스턴트 탭의 "시나리오 생성·배치" 모드에서 배치를 실행하면 여기에 표시됩니다.
+          </div>
+        ) : (
+          <>
+            <div className="tbl-wrap" style={{ marginBottom: 14 }}>
+              <table className="tbl">
+                <thead><tr><th></th><th>레이블</th><th>시각</th><th className="r">시나리오 수</th><th></th></tr></thead>
+                <tbody>
+                  {reversedBatches.map((b, i) => (
+                    <tr key={b.batch_id} className={i === selectedBatch ? 'selected' : ''} style={{ cursor: 'pointer' }} onClick={() => setSelectedBatch(i)}>
+                      <td><input type="radio" name="scenarioBatchSelect" checked={i === selectedBatch} onChange={() => setSelectedBatch(i)} /></td>
+                      <td>{b.label || '(레이블 없음)'}</td>
+                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{b.started_at ? new Date(b.started_at).toLocaleString('ko-KR') : '—'}</span></td>
+                      <td className="r"><span className="num">{b.results?.length ?? 0}</span></td>
+                      <td className="r"><button className="btn icon sm" onClick={(e) => { e.stopPropagation(); removeBatch(i); }}>✕</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {currentBatch && currentBatch.results?.length > 0 && (
+              <>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                  성공한 시나리오의 점수 비교 — route_metrics는 총비용(낮을수록 좋음), rl_episode는 평균 reward(높을수록 좋음)
+                </div>
+                <BarChart items={currentBatch.results.filter(r => r.status === 'done').map(r => {
+                  const isRl = r.mode === 'rl_episode';
+                  const val = isRl ? (r.total_reward ?? r.mean_reward ?? 0) : (r.route_cost_result?.total_cost ?? 0);
+                  return {
+                    label: r.label || r.id,
+                    value: val,
+                    display: isRl ? `reward ${val.toFixed(2)}` : `비용 ${val.toFixed(1)}`,
+                    color: isRl ? 'var(--good)' : 'var(--brand-2)',
+                  };
+                })} />
+
+                <div className="tbl-wrap" style={{ marginTop: 14 }}>
+                  <table className="tbl">
+                    <thead>
+                      <tr><th>시나리오</th><th>모드</th><th className="r">차량 수</th><th className="r">seed</th><th className="r">결과</th></tr>
+                    </thead>
+                    <tbody>
+                      {currentBatch.results.map((r, i) => (
+                        <tr key={i}>
+                          <td>{r.label || r.id}</td>
+                          <td><Chip tone={r.status === 'done' ? 'brand' : 'bad'}>{r.mode}</Chip></td>
+                          <td className="r"><span className="num">{r.vehicle_count ?? '—'}</span></td>
+                          <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
+                          <td className="r">
+                            {r.status !== 'done' ? (
+                              <span style={{ color: 'var(--bad)' }}>{r.error || '실패'}</span>
+                            ) : r.mode === 'rl_episode' ? (
+                              <span className="num">reward {(r.total_reward ?? r.mean_reward ?? 0).toFixed(2)}</span>
+                            ) : (
+                              <span className="num">비용 {(r.route_cost_result?.total_cost ?? 0).toFixed(2)} · {(r.route_cost_result?.avg_latency_ms ?? 0).toFixed(1)}ms</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="row gap8" style={{ marginTop: 14 }}>
+                  <button className="btn sm primary" disabled={batchAiLoading} onClick={() => runBatchAnalysis(currentBatch)}>
+                    {batchAiLoading ? <><Icon.reset size={13} className="spin" /> 분석 중…</> : <><Icon.spark size={13} /> 배치 비교 AI 분석</>}
+                  </button>
+                  {batchAiProvider && <Chip style={{ color: PROVIDER_LABELS[batchAiProvider]?.color }}>{PROVIDER_LABELS[batchAiProvider]?.name || batchAiProvider}</Chip>}
+                </div>
+                {batchAiError && (
+                  <div style={{ marginTop: 10, fontSize: 11.5, color: 'var(--bad)', background: 'var(--bad-tint)', padding: '8px 10px', borderRadius: 8 }}>{batchAiError}</div>
+                )}
+                {batchAiRevealed > 0 && (
+                  <div className="col gap12" style={{ marginTop: 14 }}>
+                    {batchAiSections.slice(0, batchAiRevealed).map((t, i) => (
+                      <div key={i} className="fade row gap12" style={{ padding: '12px 13px', background: 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
+                        <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flex: '0 0 auto', marginTop: 1 }}>{String(i + 1).padStart(2, '0')}</span>
+                        <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </Card>
+      </>}
+
+      {subTab === 'logs' && <>
       <div className="grid" style={{ gridTemplateColumns: '1.35fr 1fr', alignItems: 'start' }}>
         {/* log table */}
         <Card
@@ -310,6 +982,7 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry }) {
           )}
         </Card>
       </div>
+      </>}
     </div>
   );
 }
