@@ -95,7 +95,9 @@ function HighlightedCodeInput({ value, onChange, placeholder }) {
   );
 }
 
-function ScenarioTab({ simConfig, setSimConfig }) {
+function ScenarioTab({ simConfig, setSimConfig, mode: appMode }) {
+  // 주의: 이 파일은 이미 로컬 state 이름으로 'mode'(config/generate 내부 모드 전환)를 쓰고
+  // 있어서, App에서 내려오는 Lite/Pro 모드 prop은 destructure 시 appMode로 리네임해서 받는다.
   const [mode, setMode] = useState('config'); // 'config' | 'generate'
   const [inputText, setInputText] = useState('');
   const [inputType, setInputType] = useState('nl');
@@ -116,6 +118,10 @@ function ScenarioTab({ simConfig, setSimConfig }) {
   const [batchId, setBatchId] = useState(null);
   const [batchInfo, setBatchInfo] = useState(null); // {status, total, completed, results, label}
   const [batchError, setBatchError] = useState(null);
+
+  // Lite는 '설정 변경 제안'의 자연어 입력만 노출 — Pro에서 보던 중 Lite로 전환되면 되돌린다.
+  useEffect(() => { if (appMode === 'lite' && mode !== 'config') setMode('config'); }, [appMode, mode]);
+  useEffect(() => { if (appMode === 'lite' && inputType !== 'nl') setInputType('nl'); }, [appMode, inputType]);
 
   useEffect(() => {
     if (!batchId || batchInfo?.status === 'completed') return;
@@ -244,13 +250,17 @@ function ScenarioTab({ simConfig, setSimConfig }) {
               : '자연어로 시나리오 묶음을 설명하면 LLM이 출발지·목적지·차량 수를 제안하고, 실제 도로망에 맞춰 자동 보정한 뒤 즉시 일괄 평가합니다'}
           </div>
         </div>
-        {mode === 'config'
+        {mode === 'config' && appMode === 'pro'
           ? <Seg value={inputType} onChange={setInputType} options={[{ v: 'nl', label: '자연어' }, { v: 'code', label: '코드/JSON' }]} />
           : null}
       </div>
 
       <div className="row gap8" style={{ marginBottom: 18 }}>
-        <Seg value={mode} onChange={setMode} options={[{ v: 'config', label: '설정 변경 제안' }, { v: 'generate', label: '시나리오 생성·배치' }]} />
+        <Seg value={mode} onChange={setMode} options={
+          appMode === 'pro'
+            ? [{ v: 'config', label: '설정 변경 제안' }, { v: 'generate', label: '시나리오 생성·배치' }]
+            : [{ v: 'config', label: '설정 변경 제안' }]
+        } />
       </div>
 
       {mode === 'config' && <>
@@ -333,7 +343,7 @@ function ScenarioTab({ simConfig, setSimConfig }) {
       </Card>
       </>}
 
-      {mode === 'generate' && <>
+      {mode === 'generate' && appMode === 'pro' && <>
       <Card title="시나리오 생성" en="LLM scenario generation" style={{ marginBottom: 18 }}>
         <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
           구역이 설정되어 있어야 합니다(snap-to-road에 실제 도로 그래프가 필요). 생성된 좌표는

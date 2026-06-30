@@ -25,10 +25,18 @@ const CMP_METRIC_COLS = [
   { key: 'average_latency_ms',      label: '평균 Latency',   fmt: v => v.toFixed(1) + 'ms' },
   { key: 'handover_count',          label: '핸드오버',       fmt: v => v + '회' },
   { key: 'disconnection_ratio',     label: '단절율',         fmt: v => (v * 100).toFixed(0) + '%' },
+  { key: 'prr_approx',              label: 'PRR(시간가중근사)', fmt: v => (v * 100).toFixed(1) + '%' },
   { key: 'average_bs_load',         label: '평균 BS 부하',   fmt: v => (v * 100).toFixed(0) + '%' },
   { key: 'future_connectivity_risk', label: '미래 위험도',   fmt: v => (v * 100).toFixed(0) + '%' },
   { key: 'edge_count',              label: '구간 수',        fmt: v => v + '개' },
 ];
+
+// P50/P90/P95/P99 — 정렬된 숫자 배열에서 선형보간 없는 nearest-rank 백분위수
+function percentile(sortedNums, p) {
+  if (!sortedNums || sortedNums.length === 0) return null;
+  const idx = Math.min(sortedNums.length - 1, Math.ceil((p / 100) * sortedNums.length) - 1);
+  return sortedNums[Math.max(0, idx)];
+}
 const CMP_HISTORY_KEY = 'v2x_run_history';
 function loadRunHistory() {
   try { return JSON.parse(localStorage.getItem(CMP_HISTORY_KEY) || '[]'); } catch { return []; }
@@ -45,6 +53,47 @@ function loadScenarioBatches() {
 }
 function saveScenarioBatches(list) {
   try { localStorage.setItem(SCB_BATCH_KEY, JSON.stringify(list)); } catch {}
+}
+
+// 배치 레이블 prefix(각 생성처에서 고정 문구로 시작)로 종류를 추정 — 카드에 종류 Chip을 달아
+// 스윕/RL비교/시트비교/생성배치를 한눈에 구분할 수 있게 한다.
+function inferBatchKind(batch) {
+  const label = batch.label || '';
+  if (label.startsWith('파라미터 스윕')) return { tone: 'brand', text: '파라미터 스윕' };
+  if (label.startsWith('RL 정책 비교')) return { tone: 'good', text: 'RL 정책 비교' };
+  if (label.startsWith('시뮬레이션 시트 비교')) return { tone: 'warn', text: '시트 비교' };
+  if ((batch.results || []).some(r => r.mode === 'rl_episode')) return { tone: 'good', text: 'RL 배치' };
+  return { tone: '', text: '시나리오 배치' };
+}
+
+// 배치/실행이력 등 "선택 가능한 카드 묶음" 공통 카드 — 클릭으로 선택, 우상단 ✕로 삭제.
+// 기존 테이블 기반 선택 목록(라디오/체크박스 + 테이블 행)을 대체해 한눈에 훑어보기 쉽게 한다.
+function PickerCard({ selected, onClick, onRemove, kindChip, title, metaLeft, metaRight }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        flex: '1 1 230px', maxWidth: 300, cursor: 'pointer', padding: '12px 14px', borderRadius: 12,
+        background: selected ? 'var(--brand-tint)' : 'var(--surface-2)',
+        border: '1.5px solid ' + (selected ? 'var(--brand-2)' : 'var(--border)'),
+        transition: 'border-color .15s, background .15s',
+      }}
+    >
+      <div className="row between" style={{ marginBottom: 7, alignItems: 'flex-start' }}>
+        {kindChip}
+        {onRemove && (
+          <button className="btn icon sm" onClick={(e) => { e.stopPropagation(); onRemove(); }} style={{ marginTop: -2, flex: '0 0 auto' }}>✕</button>
+        )}
+      </div>
+      <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {title}
+      </div>
+      <div className="row between" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+        <span>{metaLeft}</span>
+        <span className="num">{metaRight}</span>
+      </div>
+    </div>
+  );
 }
 
 function ReportSectionList({ title, items, render, empty }) {
@@ -66,8 +115,10 @@ function ReportSectionList({ title, items, render, empty }) {
   );
 }
 
-function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, routeEdges, simHistory, simConfig }) {
-  const [subTab, setSubTab] = useState('compare'); // 'compare' | 'batch' | 'logs' — 한 화면에 다 펼치지 않고 묶음별로 분리
+function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, routeEdges, simHistory, simConfig, mode }) {
+  const [subTab, setSubTab] = useState(() => mode === 'lite' ? 'logs' : 'compare'); // 'compare' | 'batch' | 'logs' — 한 화면에 다 펼치지 않고 묶음별로 분리
+  // Lite는 'logs'만 선택 가능 — Pro에서 'compare'/'batch'를 보던 중 Lite로 전환되면 되돌린다.
+  useEffect(() => { if (mode === 'lite' && subTab !== 'logs') setSubTab('logs'); }, [mode, subTab]);
   const [analyzing, setAnalyzing] = useState(false);
   const [revealed, setRevealed] = useState(0);
   const [exported, setExported] = useState(false);
@@ -268,7 +319,16 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
       .catch(() => {});
   }
 
-  const algorithms = metrics?.available ? metrics.algorithms : {};
+  // PRR(연결 유지율) 근사치 — 패킷 단위 시뮬레이션이 없어 실측 PRR은 계산할 수 없으므로,
+  // time_weighted_disconnection_ratio(구간 길이가 아니라 각 구간의 "이동 시간"으로 가중한
+  // 단절 비율)의 보수(1 - 비율)를 근사치로 쓴다 — edge 개수로 단순 평균하면 짧은 구간과 긴
+  // 고속도로 구간이 똑같이 취급되어 왜곡되므로, 시간 가중이 "연결 유지 시간 비율"에 더 가깝다.
+  // (구버전 백엔드 호환을 위해 필드가 없으면 disconnection_ratio로 폴백)
+  const algorithmsRaw = metrics?.available ? metrics.algorithms : {};
+  const algorithms = Object.fromEntries(Object.entries(algorithmsRaw).map(([k, v]) => {
+    const discRatio = v.time_weighted_disconnection_ratio ?? v.disconnection_ratio;
+    return [k, { ...v, prr_approx: discRatio != null ? 1 - discRatio : null }];
+  }));
   const algoEntries = Object.entries(algorithms);
   const comparison = metrics?.available ? metrics.comparison : null;
   const bestPerMetric = comparison?.best_per_metric || {};
@@ -380,6 +440,31 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
     setExported(true); setTimeout(() => setExported(false), 2200);
   }
 
+  const [jsonExported, setJsonExported] = useState(false);
+  function exportJSON() {
+    // CSV(exportCSV)는 실시간 스냅샷 1행 + 로그뿐 — 원시 시계열/배치 데이터를 그대로 보존해
+    // 외부 도구(노트북, R, Excel 피벗 등)에서 재분석하려는 대학원생 수요를 위해 전체를 묶어 내보낸다.
+    const payload = {
+      exported_at: new Date().toISOString(),
+      sim_elapsed_s: sim?.elapsed ?? 0,
+      vehicle_pos: vehiclePos ?? null,
+      sim_history: simHistory ?? [],
+      sim_logs: simLogs ?? [],
+      route_edges: routeEdges ?? null,
+      network_telemetry: networkTelemetry ?? null,
+      route_metrics: metrics?.available ? metrics : null,
+      algorithm_compare: cmp ?? null,
+      scenario_batches: scenarioBatches ?? [],
+      sim_config: simConfig ?? null,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `v2x_full_export_${fmtClock(sim?.elapsed ?? 0).replace(/:/g, '')}.json`;
+    a.click();
+    setJsonExported(true); setTimeout(() => setJsonExported(false), 2200);
+  }
+
   const seed = summary?.available ? summary.recommendation_text_seed : null;
 
   return (
@@ -395,6 +480,11 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
           <button className={'btn ' + (exported ? 'good' : 'accent')} onClick={exportCSV}>
             {exported ? <><Icon.check size={15} /> 저장됨</> : <><Icon.download size={15} /> CSV로 내보내기</>}
           </button>
+          {mode === 'pro' && (
+            <button className={'btn ' + (jsonExported ? 'good' : '')} onClick={exportJSON} title="시계열·배치·비교 원시 데이터를 통째로 JSON으로 내보냅니다">
+              {jsonExported ? <><Icon.check size={15} /> 저장됨</> : <><Icon.download size={15} /> 전체 JSON 다운로드</>}
+            </button>
+          )}
         </div>
       </div>
 
@@ -464,14 +554,14 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
       )}
 
       <div className="row gap8" style={{ marginBottom: 18 }}>
-        <Seg value={subTab} onChange={setSubTab} options={[
-          { v: 'compare', label: '경로·알고리즘 비교' },
-          { v: 'batch', label: '시나리오 배치 비교' },
-          { v: 'logs', label: '로그·AI분석' },
-        ]} />
+        <Seg value={subTab} onChange={setSubTab} options={
+          mode === 'pro'
+            ? [{ v: 'compare', label: '경로·알고리즘 비교' }, { v: 'batch', label: '시나리오 배치 비교' }, { v: 'logs', label: '로그·AI분석' }]
+            : [{ v: 'logs', label: '로그·AI분석' }]
+        } />
       </div>
 
-      {subTab === 'compare' && <>
+      {subTab === 'compare' && mode === 'pro' && <>
       {/* ════════════════════════════════════════════════════
           최적 경로 비교 (ported from tab-routes.jsx)
           ════════════════════════════════════════════════════ */}
@@ -570,6 +660,39 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
               </div>
             </Card>
           )}
+
+          {(perEdge.length > 0 || simHistory?.length > 0) && (() => {
+            // 시간축 반복측정(simHistory — 라이브 SUMO 실행 중 약 1Hz로 누적된 latency 샘플)이
+            // 충분하면 그걸 우선 쓴다 — "여러 번 측정값의 분포"라는 백분위수의 본래 정의에 더
+            // 가깝다. 표본이 부족하면(배치 평가 등 라이브 실행이 없던 경우) 구간(edge)별 공간
+            // 분포로 폴백 — 단, 이건 "반복 측정"이 아니라 "한 경로 안 구간 간 분포"이므로 출처를
+            // Chip으로 명확히 구분해서 표시한다(두 값을 섞어 같은 의미인 것처럼 보이지 않게).
+            const liveSamples = (simHistory || []).map(h => h.latency).filter(v => v !== null && v !== undefined);
+            const useLive = liveSamples.length >= 10;
+            const samples = useLive ? liveSamples : perEdge.map(e => e.latency_ms || 0);
+            const sortedLat = [...samples].sort((a, b) => a - b);
+            const p50 = percentile(sortedLat, 50);
+            const p90 = percentile(sortedLat, 90);
+            const p95 = percentile(sortedLat, 95);
+            const p99 = percentile(sortedLat, 99);
+            return (
+              <Card title="Latency 백분위수" en="Latency percentiles"
+                right={<Chip tone={useLive ? 'good' : ''}>{useLive ? `시간축 반복측정 ${sortedLat.length}건` : `구간(edge) 분포 ${sortedLat.length}건`}</Chip>}
+                style={{ marginBottom: 18 }}>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 12 }}>
+                  {useLive
+                    ? '라이브 실행 중 약 1Hz로 누적된 latency 시계열(최근 최대 60건)의 백분위수 — 평균만으로는 가려지는 꼬리 구간의 지연을 확인합니다.'
+                    : '시간축 반복측정 표본이 부족해(10건 미만) 현재 경로의 구간별(edge) latency 공간 분포로 대체했습니다 — "반복 측정"이 아닌 "구간 간 분포"이므로 인용 시 구분해서 표기하세요.'}
+                </div>
+                <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+                  <Stat label="P50 (중앙값)" icon="speed" value={p50 != null ? p50.toFixed(1) : '—'} unit="ms" />
+                  <Stat label="P90" icon="speed" value={p90 != null ? p90.toFixed(1) : '—'} unit="ms" />
+                  <Stat label="P95" icon="warn" value={p95 != null ? p95.toFixed(1) : '—'} unit="ms" />
+                  <Stat label="P99" icon="warn" value={p99 != null ? p99.toFixed(1) : '—'} unit="ms" accent />
+                </div>
+              </Card>
+            );
+          })()}
         </>
       ) : (
         <div style={{ textAlign: 'center', padding: '40px 24px', color: 'var(--ink-4)', marginBottom: 18 }}>
@@ -597,6 +720,9 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
           baseline 항목은 시뮬레이션 탭에서 실제로 선택한 경로 탐색 알고리즘(Dijkstra/A*/
           K-shortest-path/Network-aware/Look-ahead)을 반영합니다. "경유 도로" 칸에서 각
           후보가 실제로 어떤 도로를 지나는지 확인할 수 있습니다.
+          <br />PRR(근사)은 패킷 단위 시뮬레이션 없이 "이동 시간으로 가중한 단절 비율"의 보수
+          (1 - time_weighted_disconnection_ratio)로 근사한 값입니다 — 실측 패킷 수신율이 아니라
+          "연결 유지 시간 비율" proxy이므로, 인용 시 PRR이 아닌 "연결유지율(시간가중 근사)"으로 표기하세요.
         </div>
         {cmpLoading && <div className="muted" style={{ padding: 16, fontSize: 12 }}>불러오는 중…</div>}
         {!cmpLoading && cmpError && <div style={{ padding: 16, fontSize: 12, color: 'var(--bad)' }}>{cmpError}</div>}
@@ -802,7 +928,7 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
 
       </>}
 
-      {subTab === 'batch' && <>
+      {subTab === 'batch' && mode === 'pro' && <>
       <Card title="시나리오 배치 비교" en="Scenario batch comparison" right={<Chip>{scenarioBatches.length}개 배치</Chip>} style={{ marginBottom: 18 }}>
         {scenarioBatches.length === 0 ? (
           <div className="muted" style={{ padding: 16, fontSize: 12 }}>
@@ -810,35 +936,53 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
           </div>
         ) : (
           <>
-            <div className="tbl-wrap" style={{ marginBottom: 14 }}>
-              <table className="tbl">
-                <thead><tr><th></th><th>레이블</th><th>시각</th><th className="r">시나리오 수</th><th></th></tr></thead>
-                <tbody>
-                  {reversedBatches.map((b, i) => (
-                    <tr key={b.batch_id} className={i === selectedBatch ? 'selected' : ''} style={{ cursor: 'pointer' }} onClick={() => setSelectedBatch(i)}>
-                      <td><input type="radio" name="scenarioBatchSelect" checked={i === selectedBatch} onChange={() => setSelectedBatch(i)} /></td>
-                      <td>{b.label || '(레이블 없음)'}</td>
-                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{b.started_at ? new Date(b.started_at).toLocaleString('ko-KR') : '—'}</span></td>
-                      <td className="r"><span className="num">{b.results?.length ?? 0}</span></td>
-                      <td className="r"><button className="btn icon sm" onClick={(e) => { e.stopPropagation(); removeBatch(i); }}>✕</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="row gap10 wrap" style={{ marginBottom: 16 }}>
+              {reversedBatches.map((b, i) => {
+                const kind = inferBatchKind(b);
+                const successCount = (b.results || []).filter(r => r.status === 'done').length;
+                const total = b.results?.length ?? 0;
+                return (
+                  <PickerCard
+                    key={b.batch_id}
+                    selected={i === selectedBatch}
+                    onClick={() => setSelectedBatch(i)}
+                    onRemove={() => removeBatch(i)}
+                    kindChip={<Chip tone={kind.tone}>{kind.text}</Chip>}
+                    title={b.label || '(레이블 없음)'}
+                    metaLeft={b.started_at ? new Date(b.started_at).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
+                    metaRight={`${successCount}/${total} 성공`}
+                  />
+                );
+              })}
             </div>
 
-            {currentBatch && currentBatch.results?.length > 0 && (
+            {currentBatch && currentBatch.results?.length > 0 && (() => {
+              const doneResults = currentBatch.results.filter(r => r.status === 'done');
+              const isRlBatch = doneResults.some(r => r.mode === 'rl_episode');
+              // route_metrics는 비용 낮을수록, rl_episode는 reward 높을수록 좋음 — best 판정 방향이 반대
+              let bestIdx = -1;
+              if (doneResults.length > 0) {
+                bestIdx = doneResults.reduce((bestI, r, i) => {
+                  const cur = r.mode === 'rl_episode' ? (r.mean_reward ?? r.total_reward ?? -Infinity) : -(r.route_cost_result?.total_cost ?? Infinity);
+                  const best = doneResults[bestI];
+                  const bestVal = best.mode === 'rl_episode' ? (best.mean_reward ?? best.total_reward ?? -Infinity) : -(best.route_cost_result?.total_cost ?? Infinity);
+                  return cur > bestVal ? i : bestI;
+                }, 0);
+              }
+              const bestId = bestIdx >= 0 ? doneResults[bestIdx].id : null;
+              return (
               <>
                 <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
-                  성공한 시나리오의 점수 비교 — route_metrics는 총비용(낮을수록 좋음), rl_episode는 평균 reward(높을수록 좋음)
+                  {isRlBatch ? '평균 reward 비교(높을수록 좋음, 막대 위 ±는 표준편차)' : '총비용 비교(낮을수록 좋음)'} · 가장 좋은 결과에 "최적" 표시
                 </div>
-                <BarChart items={currentBatch.results.filter(r => r.status === 'done').map(r => {
+                <BarChart items={doneResults.map(r => {
                   const isRl = r.mode === 'rl_episode';
-                  const val = isRl ? (r.total_reward ?? r.mean_reward ?? 0) : (r.route_cost_result?.total_cost ?? 0);
+                  const val = isRl ? (r.mean_reward ?? r.total_reward ?? 0) : (r.route_cost_result?.total_cost ?? 0);
+                  const std = isRl && r.std_reward != null ? ` ±${r.std_reward.toFixed(2)}` : '';
                   return {
                     label: r.label || r.id,
                     value: val,
-                    display: isRl ? `reward ${val.toFixed(2)}` : `비용 ${val.toFixed(1)}`,
+                    display: isRl ? `reward ${val.toFixed(2)}${std}` : `비용 ${val.toFixed(1)}`,
                     color: isRl ? 'var(--good)' : 'var(--brand-2)',
                   };
                 })} />
@@ -846,26 +990,36 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
                 <div className="tbl-wrap" style={{ marginTop: 14 }}>
                   <table className="tbl">
                     <thead>
-                      <tr><th>시나리오</th><th>모드</th><th className="r">차량 수</th><th className="r">seed</th><th className="r">결과</th></tr>
+                      <tr><th>시나리오</th><th>모드</th><th className="r">차량수/정책</th><th className="r">seed</th><th className="r">결과</th></tr>
                     </thead>
                     <tbody>
-                      {currentBatch.results.map((r, i) => (
-                        <tr key={i}>
-                          <td>{r.label || r.id}</td>
-                          <td><Chip tone={r.status === 'done' ? 'brand' : 'bad'}>{r.mode}</Chip></td>
-                          <td className="r"><span className="num">{r.vehicle_count ?? '—'}</span></td>
+                      {currentBatch.results.map((r, i) => {
+                        const isRl = r.mode === 'rl_episode';
+                        const isBest = r.status === 'done' && r.id === bestId;
+                        return (
+                        <tr key={i} style={isBest ? { background: 'var(--good-tint)' } : {}}>
+                          <td style={{ borderLeft: `3px solid ${r.status !== 'done' ? 'var(--bad)' : isRl ? 'var(--good)' : 'var(--brand-2)'}`, paddingLeft: 9 }}>
+                            {r.label || r.id}
+                          </td>
+                          <td><Chip tone={r.status === 'done' ? (isRl ? 'good' : 'brand') : 'bad'}>{r.mode}</Chip></td>
+                          <td className="r"><span className="num">{isRl ? (r.policy || '—') : (r.vehicle_count ?? '—')}</span></td>
                           <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
                           <td className="r">
                             {r.status !== 'done' ? (
                               <span style={{ color: 'var(--bad)' }}>{r.error || '실패'}</span>
-                            ) : r.mode === 'rl_episode' ? (
-                              <span className="num">reward {(r.total_reward ?? r.mean_reward ?? 0).toFixed(2)}</span>
+                            ) : isRl ? (
+                              <span className="num">
+                                reward {(r.mean_reward ?? r.total_reward ?? 0).toFixed(2)}
+                                {r.std_reward != null && <span className="muted"> ±{r.std_reward.toFixed(2)} (n={r.n_episodes ?? 1})</span>}
+                              </span>
                             ) : (
                               <span className="num">비용 {(r.route_cost_result?.total_cost ?? 0).toFixed(2)} · {(r.route_cost_result?.avg_latency_ms ?? 0).toFixed(1)}ms</span>
                             )}
+                            {isBest && <Chip tone="good" style={{ marginLeft: 6, fontSize: 9 }}>최적</Chip>}
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -890,7 +1044,8 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
                   </div>
                 )}
               </>
-            )}
+              );
+            })()}
           </>
         )}
       </Card>
@@ -933,7 +1088,7 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
         {/* LLM panel */}
         <Card title="AI 자연어 분석" en="LLM summary" right={
           <div className="row gap8">
-            {llmProviders.length > 1 && (
+            {mode === 'pro' && llmProviders.length > 1 && (
               <select className="input" style={{ height: 28, fontSize: 11, minWidth: 110 }}
                 value={selectedProvider}
                 onChange={e => setSelectedProvider(e.target.value)}>

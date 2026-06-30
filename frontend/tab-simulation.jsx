@@ -161,12 +161,15 @@ function FabButton({ icon, active, onClick, title }) {
   );
 }
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, simHistory, routeEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api }) {
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, simHistory, routeEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
   const prevVehPos = useRef(null);
   const bgVehMarkers = useRef({}); // 다중차량 실험군 — 배경 차량 마커 풀 (id → circleMarker), setLatLng로 재사용
+  const stationMarkers = useRef({});   // 기지국 마커 풀 (id → circleMarker) — networkTelemetry가 초당 10회 들어와도 매번 재생성하지 않음
+  const candidateMarkers = useRef({}); // 후보 노드 마커 풀 (id → circleMarker), 위와 동일한 이유
+  const buildingsSigRef = useRef(null); // 직전에 그린 차폐 건물 집합의 서명 — 안 바뀌었으면 폴리곤 다시 안 그림
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
   const MAX_SETUP_AREA_KM2 = 25;
@@ -188,6 +191,18 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [selectedAlgorithms, setSelectedAlgorithms] = useState(DEFAULT_ALGORITHM_SELECTION);
   const [networkGen, setNetworkGen] = useState('5g'); // 4g · 5g · 6g — UI only, not wired to backend
   const [vehicleCount, setVehicleCount] = useState(1); // 다중차량 실험군 — 타겟 1대 + 배경 차량 (vehicleCount - 1)대
+
+  // ITS 첨두/비첨두 교통 — Pro 전용. 어느 버킷을 이번 시뮬레이션에 쓸지(트래픽 편향/배경차량 샘플링).
+  const [trafficPeriod, setTrafficPeriod] = useState(() => simConfig?.policy_options?.traffic_time_period || 'peak');
+  const [trafficSyncing, setTrafficSyncing] = useState(false);
+  const [trafficSyncInfo, setTrafficSyncInfo] = useState(null);
+  const [trafficSyncError, setTrafficSyncError] = useState(null);
+  // 시트 전환 시 loadSheetConfig가 simConfig를 통째로 교체하므로, 거기 실려온
+  // traffic_time_period로 셀렉터 표시를 맞춘다(없으면 기존 값 유지).
+  useEffect(() => {
+    const p = simConfig?.policy_options?.traffic_time_period;
+    if (p) setTrafficPeriod(p);
+  }, [simConfig?.policy_options?.traffic_time_period]);
   const [openPanel, setOpenPanel] = useState('control'); // null · 'control' · 'scenario' — 우측 FAB로 띄우는 플로팅 패널, 처음 열 때는 컨트롤 패널이 기본으로 열려있음
 
   // ── 시뮬레이션 시트 (Phase 5) ──────────────────────────────────
@@ -278,10 +293,13 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (groups.current.veh)     { groups.current.veh.remove(); groups.current.veh = null; }
     if (groups.current.route)   groups.current.route.clearLayers();
     if (groups.current.wp)      groups.current.wp.clearLayers();
-    if (groups.current.network) groups.current.network.clearLayers();
-    if (groups.current.blocks)  groups.current.blocks.clearLayers();
-    if (groups.current.bgVeh)   groups.current.bgVeh.clearLayers();
+    if (groups.current.network)   groups.current.network.clearLayers();
+    if (groups.current.connLines) groups.current.connLines.clearLayers();
+    if (groups.current.blocks)    groups.current.blocks.clearLayers();
+    if (groups.current.bgVeh)     groups.current.bgVeh.clearLayers();
     bgVehMarkers.current = {};
+    candidateMarkers.current = {};
+    buildingsSigRef.current = null;
   }
 
   function renameSheet(idx, name) {
@@ -386,6 +404,124 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }, 1200);
   }
 
+  // 시트 비교(runAllSheetsAsBatch)와 같은 배치 인프라(POST /api/scenarios/batch)를 재사용하는
+  // 범용 폴러 — 완료되면 분석보고서 탭의 "시나리오 배치 비교"가 읽는 SCB_BATCH_KEY에 동일하게
+  // 저장한다(별도 표시 UI를 새로 만들 필요 없음).
+  function pollScenarioBatch(batchId, onDone) {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${api}/api/scenarios/batch/${batchId}`);
+        const data = await res.json();
+        if (data.status === 'completed') {
+          clearInterval(timer);
+          const saved = scbLoadBatches();
+          saved.push({ batch_id: batchId, label: data.label, started_at: data.started_at, ended_at: data.ended_at, results: data.results });
+          scbSaveBatches(saved);
+          onDone(data);
+        }
+      } catch {}
+    }, 1200);
+  }
+
+  // ── 파라미터 스윕(민감도 분석) — Pro 전용. 현재 출발/도착/차량수/알고리즘은 고정하고
+  // 비용가중치·정책옵션 중 하나만 N단계로 바꿔가며 배치 평가 → 분석보고서에서 비교.
+  const SWEEP_PARAMS = [
+    { key: 'w_latency',  label: 'Latency 가중치',   section: 'cost_weights',   path: 'w_latency',   defaultFrom: 1,   defaultTo: 5, step: 0.1 },
+    { key: 'w_load',     label: '부하 가중치',       section: 'cost_weights',   path: 'w_load',      defaultFrom: 0.5, defaultTo: 3, step: 0.1 },
+    { key: 'w_handover', label: '핸드오버 가중치',   section: 'cost_weights',   path: 'w_handover',  defaultFrom: 0.5, defaultTo: 3, step: 0.1 },
+    { key: 'lookahead_k', label: 'Lookahead K',     section: 'policy_options', path: 'lookahead_k', defaultFrom: 1,   defaultTo: 8, step: 1, integer: true },
+  ];
+  const [sweepParam, setSweepParam] = useState(SWEEP_PARAMS[0].key);
+  const [sweepFrom, setSweepFrom] = useState(SWEEP_PARAMS[0].defaultFrom);
+  const [sweepTo, setSweepTo] = useState(SWEEP_PARAMS[0].defaultTo);
+  const [sweepSteps, setSweepSteps] = useState(5);
+  const [sweepRunning, setSweepRunning] = useState(false);
+  const [sweepError, setSweepError] = useState(null);
+  const [sweepDone, setSweepDone] = useState(false);
+
+  function selectSweepParam(key) {
+    const def = SWEEP_PARAMS.find(p => p.key === key);
+    setSweepParam(key);
+    setSweepFrom(def.defaultFrom);
+    setSweepTo(def.defaultTo);
+  }
+
+  async function runParamSweep() {
+    if (!ready) { setSweepError('구역·출발지·도착지를 먼저 설정하세요.'); return; }
+    const def = SWEEP_PARAMS.find(p => p.key === sweepParam);
+    const steps = Math.max(2, Math.min(10, sweepSteps || 2));
+    const values = Array.from({ length: steps }, (_, i) => {
+      const raw = sweepFrom + (sweepTo - sweepFrom) * (steps === 1 ? 0 : i / (steps - 1));
+      return def.integer ? Math.round(raw) : Math.round(raw * 100) / 100;
+    });
+    const specs = values.map((v, i) => {
+      const cfgOverride = {
+        ...(simConfig || {}),
+        [def.section]: { ...(simConfig?.[def.section] || {}), [def.path]: v },
+      };
+      cfgOverride.policy_options = { ...(cfgOverride.policy_options || {}), network_mode: (networkGen || '5g').toUpperCase() };
+      return {
+        id: `sweep-${def.key}-${i}-${Date.now()}`,
+        label: `${def.label}=${v}`,
+        mode: 'route_metrics',
+        source: 'param_batch',
+        origin, dest,
+        vehicle_count: vehicleCount,
+        algorithm_config: selectedAlgorithms,
+        simulation_config: cfgOverride,
+      };
+    });
+    setSweepRunning(true); setSweepError(null); setSweepDone(false);
+    try {
+      const res = await fetch(`${api}/api/scenarios/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: `파라미터 스윕 — ${def.label}`, scenarios: specs }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      pollScenarioBatch(data.batch_id, () => { setSweepRunning(false); setSweepDone(true); setTimeout(() => setSweepDone(false), 3500); });
+    } catch (e) {
+      setSweepRunning(false);
+      setSweepError(e.message || '스윕 실행 중 오류가 발생했습니다.');
+    }
+  }
+
+  // ── RL 정책 비교(실험적) — Pro 전용. 동일 출발/도착에 대해 random/greedy/coverage 베이스라인
+  // 정책을 각각 평가해 배치로 비교(/api/rl/episode와 동일 로직, 배치 인프라로 일괄 실행).
+  const RL_POLICIES = ['random', 'greedy', 'coverage'];
+  const [rlRunning, setRlRunning] = useState(false);
+  const [rlError, setRlError] = useState(null);
+  const [rlDone, setRlDone] = useState(false);
+
+  async function runRLComparison() {
+    if (!ready) { setRlError('구역·출발지·도착지를 먼저 설정하세요.'); return; }
+    const specs = RL_POLICIES.map((policy, i) => ({
+      id: `rl-${policy}-${Date.now()}`,
+      label: `RL ${policy}`,
+      mode: 'rl_episode',
+      source: 'param_batch',
+      origin, dest,
+      policy,
+      n_episodes: 20, // 평균만으로는 정책 간 우열을 통계적으로 말할 수 없어, 표준편차를 같이 보고할 수 있을 만큼 충분히 반복
+      max_steps: 200,
+    }));
+    setRlRunning(true); setRlError(null); setRlDone(false);
+    try {
+      const res = await fetch(`${api}/api/scenarios/batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: 'RL 정책 비교', scenarios: specs }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      pollScenarioBatch(data.batch_id, () => { setRlRunning(false); setRlDone(true); setTimeout(() => setRlDone(false), 3500); });
+    } catch (e) {
+      setRlRunning(false);
+      setRlError(e.message || 'RL 비교 실행 중 오류가 발생했습니다.');
+    }
+  }
+
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
 
@@ -413,13 +549,17 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     groups.current.wp    = L.layerGroup().addTo(map);
     groups.current.route = L.layerGroup().addTo(map);
     groups.current.network = L.layerGroup().addTo(map);
+    groups.current.connLines = L.layerGroup().addTo(map);
     groups.current.blocks = L.layerGroup().addTo(map);
     groups.current.stations = L.layerGroup().addTo(map);
     // 다중차량 실험군 — 배경 차량용 캔버스 렌더러 (N=1000에서도 가벼움)
     groups.current.bgVeh = L.layerGroup().addTo(map);
     groups.current.bgVehRenderer = L.canvas({ padding: 0.5 });
     mapObj.current = map;
-    return () => { map.remove(); mapObj.current = null; groups.current = {}; };
+    return () => {
+      map.remove(); mapObj.current = null; groups.current = {};
+      stationMarkers.current = {}; candidateMarkers.current = {}; buildingsSigRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -458,31 +598,55 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }, [routeCoords, showLayers.routes]);
 
+  /* networkTelemetry는 시뮬레이션 중 초당 10회 들어온다 — 예전엔 이 effect가 매번
+     ng.clearLayers()로 후보 노드 마커/툴팁을 통째로 지우고 새로 만들어서, 마커 수가 늘수록
+     지도가 버벅였다. 이제 마커는 id로 풀링해 재사용(setLatLng/setTooltipContent만 갱신)하고,
+     접속선은 개수가 적어(0~2개) 그대로 다시 그리되 별도 레이어(connLines)에 둬서 후보 마커
+     풀을 건드리지 않는다. 차폐 건물 폴리곤은 같은 건물 집합이면 다시 그리지 않는다. */
   useEffect(() => {
     const ng = groups.current.network;
+    const cl = groups.current.connLines;
     const bg = groups.current.blocks;
     const map = mapObj.current;
-    if (!ng || !bg || !map) return;
-    ng.clearLayers();
-    bg.clearLayers();
-    if (!networkTelemetry) return;
+    if (!ng || !cl || !bg || !map) return;
+    if (!networkTelemetry) {
+      ng.clearLayers(); cl.clearLayers(); bg.clearLayers();
+      candidateMarkers.current = {};
+      buildingsSigRef.current = null;
+      return;
+    }
 
     const selected = networkTelemetry.connected_node;
+
+    // ── 후보 노드 마커 — id로 풀링 ──────────────────────────────
+    const seenIds = new Set();
     (networkTelemetry.candidate_nodes || []).forEach((node, idx) => {
       // user_created: already rendered by the stations layer (avoid overlap)
       // synthetic: auto-generated placeholders — hidden when user has real stations
       if (node.source === 'user_created' || node.source === 'synthetic') return;
+      const id = node.id || node.name || `cand-${idx}`;
+      seenIds.add(id);
+      const lat = node.lat || selected.lat, lng = node.lng || selected.lng;
       const base = idx === 0 ? '#1E88E5' : '#607D8B';
-      const marker = L.circleMarker([node.lat || selected.lat, node.lng || selected.lng], {
-        radius: idx === 0 ? 8 : 6,
-        color: '#fff',
-        weight: 2,
-        fillColor: base,
-        fillOpacity: 0.9,
-      }).addTo(ng);
-      marker.bindTooltip(`${node.name || node.id} · ${node.predicted_latency_ms.toFixed(1)}ms`, { direction: 'top' });
+      const radius = idx === 0 ? 8 : 6;
+      const tooltipText = `${node.name || node.id} · ${node.predicted_latency_ms.toFixed(1)}ms`;
+      let marker = candidateMarkers.current[id];
+      if (!marker) {
+        marker = L.circleMarker([lat, lng], { radius, color: '#fff', weight: 2, fillColor: base, fillOpacity: 0.9 }).addTo(ng);
+        marker.bindTooltip(tooltipText, { direction: 'top' });
+        candidateMarkers.current[id] = marker;
+      } else {
+        marker.setLatLng([lat, lng]);
+        marker.setStyle({ radius, fillColor: base });
+        marker.setTooltipContent(tooltipText);
+      }
+    });
+    Object.keys(candidateMarkers.current).forEach((id) => {
+      if (!seenIds.has(id)) { candidateMarkers.current[id].remove(); delete candidateMarkers.current[id]; }
     });
 
+    // ── 접속선 — 개수가 적어 그대로 다시 그림 ───────────────────
+    cl.clearLayers();
     const lines = networkTelemetry.connection_lines?.length
       ? networkTelemetry.connection_lines.map(l => [[l.from.lat, l.from.lng], [l.to.lat, l.to.lng]])
       : (selected && networkTelemetry.connection_line?.length === 2)
@@ -492,17 +656,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       const loss = networkTelemetry.estimated_penetration_loss_db || 0;
       const color = loss >= 20 ? '#E0463C' : loss >= 10 ? '#B97B11' : '#1F9D57';
       lines.forEach(coords => {
-        L.polyline(coords, { color, weight: 3, opacity: 0.85, dashArray: loss >= 10 ? '8 6' : undefined }).addTo(ng);
+        L.polyline(coords, { color, weight: 3, opacity: 0.85, dashArray: loss >= 10 ? '8 6' : undefined }).addTo(cl);
       });
     }
 
-    (networkTelemetry.highlighted_buildings || []).forEach((b) => {
-      if (!b.geometry || b.geometry.length < 3) return;
-      L.polygon(
-        b.geometry.map(p => [p.lat, p.lng]),
-        { color: '#E0463C', weight: 1.5, fillColor: '#E0463C', fillOpacity: 0.18 }
-      ).addTo(bg);
-    });
+    // ── 차폐 건물 폴리곤 — 같은 건물 집합이면 다시 그리지 않음 ─────
+    const buildings = networkTelemetry.highlighted_buildings || [];
+    const sig = buildings.map(b => b.id ?? b.ufid ?? `${b.geometry?.[0]?.lat},${b.geometry?.[0]?.lng}`).join('|');
+    if (sig !== buildingsSigRef.current) {
+      buildingsSigRef.current = sig;
+      bg.clearLayers();
+      buildings.forEach((b) => {
+        if (!b.geometry || b.geometry.length < 3) return;
+        L.polygon(
+          b.geometry.map(p => [p.lat, p.lng]),
+          { color: '#E0463C', weight: 1.5, fillColor: '#E0463C', fillOpacity: 0.18 }
+        ).addTo(bg);
+      });
+    }
   }, [networkTelemetry]);
 
   /* ── user-created base station markers ──────────────────────────
@@ -510,47 +681,59 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
      Delete-hover: gray (#9AA5B1) to indicate the target being removed.
      Label always visible below marker.
   ── */
+  /* 기지국 마커 본체 — stations/삭제모드/레이어 표시 여부가 바뀔 때만 다시 만든다(id로 풀링).
+     networkTelemetry(초당 10회)는 더 이상 이 effect의 의존성이 아니다 — 아래 별도 effect가
+     기존 마커의 툴팁 텍스트만 갱신해서, 시뮬레이션 중에도 마커를 통째로 지웠다 새로 만들지
+     않는다(이게 예전 지도 렌더링이 느려지던 주된 원인). */
   useEffect(() => {
     const g = groups.current.stations; if (!g) return;
-    g.clearLayers();
-    if (!showLayers.stations) return;
+    if (!showLayers.stations) {
+      g.clearLayers();
+      stationMarkers.current = {};
+      return;
+    }
     const deleteMode = mode === 'bs_delete';
-    // latency lookup so label can include it when sim is running
+    const seenIds = new Set();
+    stations.forEach((st) => {
+      seenIds.add(st.id);
+      let marker = stationMarkers.current[st.id];
+      if (!marker) {
+        marker = L.circleMarker([st.lat, st.lng], {
+          radius: 8, color: '#fff', weight: 2.5, fillColor: '#1E88E5', fillOpacity: 0.93, interactive: true,
+        }).addTo(g);
+        marker.bindTooltip(st.name, { permanent: true, direction: 'bottom', offset: [0, 6], className: 'bs-label' });
+        stationMarkers.current[st.id] = marker;
+      } else {
+        marker.setLatLng([st.lat, st.lng]);
+      }
+      // 삭제모드 핸들러는 모드가 바뀔 때마다 깨끗하게 다시 건다(중복 바인딩 방지)
+      marker.off('mouseover'); marker.off('mouseout'); marker.off('click');
+      marker.setStyle({ fillColor: '#1E88E5', color: '#fff' });
+      if (deleteMode) {
+        marker.on('mouseover', (e) => { e.target.setStyle({ fillColor: '#9AA5B1', color: '#5B6670' }); });
+        marker.on('mouseout',  (e) => { e.target.setStyle({ fillColor: '#1E88E5', color: '#fff' }); });
+        marker.on('click', (e) => { L.DomEvent.stopPropagation(e); deleteStation(st.id); });
+      }
+    });
+    Object.keys(stationMarkers.current).forEach((id) => {
+      if (!seenIds.has(id)) { stationMarkers.current[id].remove(); delete stationMarkers.current[id]; }
+    });
+  }, [stations, mode, showLayers.stations]);
+
+  /* 기지국 라벨의 latency 텍스트만 갱신 — 마커/툴팁 DOM을 새로 만들지 않고 텍스트만 바꿔서
+     초당 10회가 들어와도 가볍다. */
+  useEffect(() => {
+    if (!showLayers.stations) return;
     const latencyMap = {};
     (networkTelemetry?.candidate_nodes || []).forEach(n => { latencyMap[n.id] = n.predicted_latency_ms; });
     stations.forEach((st) => {
-      const marker = L.circleMarker([st.lat, st.lng], {
-        radius: 8,
-        color: '#fff',
-        weight: 2.5,
-        fillColor: '#1E88E5',
-        fillOpacity: 0.93,
-        interactive: true,
-      }).addTo(g);
-      // permanent label below marker — name only (latency shown in right panel Top 3)
+      const marker = stationMarkers.current[st.id];
+      if (!marker) return;
       const lat_ms = latencyMap[st.id];
       const labelText = lat_ms != null ? `${st.name} · ${lat_ms.toFixed(1)}ms` : st.name;
-      marker.bindTooltip(labelText, {
-        permanent: true,
-        direction: 'bottom',
-        offset: [0, 6],
-        className: 'bs-label',
-      });
-      if (deleteMode) {
-        // hover purely via Leaflet mouse events — no state update to avoid re-render mid-click
-        marker.on('mouseover', (e) => {
-          e.target.setStyle({ fillColor: '#9AA5B1', color: '#5B6670' });
-        });
-        marker.on('mouseout', (e) => {
-          e.target.setStyle({ fillColor: '#1E88E5', color: '#fff' });
-        });
-        marker.on('click', (e) => {
-          L.DomEvent.stopPropagation(e);
-          deleteStation(st.id);
-        });
-      }
+      marker.setTooltipContent(labelText);
     });
-  }, [stations, mode, networkTelemetry, showLayers.stations]);
+  }, [networkTelemetry, stations, showLayers.stations]);
 
   /* ── vehicle marker from WebSocket position ─────────────────── */
   useEffect(() => {
@@ -763,6 +946,30 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }
 
+  /* ── ITS 첨두/비첨두 교통 동기화 (Pro 전용) ───────────────────── */
+  async function syncTraffic() {
+    if (!area) return;
+    setTrafficSyncing(true);
+    setTrafficSyncError(null);
+    try {
+      const res = await fetch(`${api}/traffic/sync-its`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bbox: { minX: area.w, maxX: area.e, minY: area.s, maxY: area.n },
+          time_period: trafficPeriod,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || 'ITS 동기화 실패');
+      setTrafficSyncInfo(body);
+    } catch (e) {
+      setTrafficSyncError(e.message);
+    } finally {
+      setTrafficSyncing(false);
+    }
+  }
+
   /* ── button actions ──────────────────────────────────────────── */
   const tryArea   = () => setMode(mode === 'area' ? null : 'area');
   const tryOrigin = () => {
@@ -777,6 +984,25 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   };
   const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
   const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
+
+  // Lite 전용 예시 시나리오 프리셋 — 학부생이 출발지/도착지를 직접 찍지 않아도 현재 구역
+  // 안에서 바로 시작할 수 있게, 구역(area) 내부 좌표를 비율로 계산해 채운다(특정 도시
+  // 좌표를 하드코딩하지 않으므로 어떤 구역을 그려도 항상 동작한다).
+  function applyPreset(kind) {
+    if (!area) return;
+    const { s, w, n, e } = area;
+    const latSpan = n - s, lngSpan = e - w;
+    const pt = (fLat, fLng) => ({ lat: s + latSpan * fLat, lng: w + lngSpan * fLng });
+    if (kind === 'short') {
+      setOrigin(pt(0.35, 0.35)); setOriginDone(true);
+      setDest(pt(0.55, 0.55)); setDestDone(true);
+      setVehicleCount(1);
+    } else if (kind === 'congested') {
+      setOrigin(pt(0.15, 0.15)); setOriginDone(true);
+      setDest(pt(0.85, 0.85)); setDestDone(true);
+      setVehicleCount(40);
+    }
+  }
 
   async function handleStart() {
     if (!ready) return;
@@ -869,10 +1095,13 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (groups.current.veh)      { groups.current.veh.remove();      groups.current.veh = null; }
     if (groups.current.route)    { groups.current.route.clearLayers(); }
     if (groups.current.wp)       { groups.current.wp.clearLayers(); }
-    if (groups.current.network)  { groups.current.network.clearLayers(); }
+    if (groups.current.network)   { groups.current.network.clearLayers(); }
+    if (groups.current.connLines){ groups.current.connLines.clearLayers(); }
     if (groups.current.blocks)   { groups.current.blocks.clearLayers(); }
     if (groups.current.bgVeh)    { groups.current.bgVeh.clearLayers(); }
     bgVehMarkers.current = {};
+    candidateMarkers.current = {};
+    buildingsSigRef.current = null;
     if (mapObj.current) mapObj.current.setView(KR_CENTER, KR_ZOOM);
     dispatch({ type: 'reset' });
   }
@@ -1186,6 +1415,27 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             )}
           </div>
 
+          {/* ITS 첨두/비첨두 교통 동기화 — Pro 전용 (학부생 대상 Lite는 기본값 '첨두시'를 조용히 사용) */}
+          {appMode === 'pro' && (
+            <div className="field">
+              <label>실시간 교통 데이터 <span className="en">ITS TRAFFIC</span></label>
+              <Seg value={trafficPeriod} onChange={(v) => {
+                setTrafficPeriod(v);
+                setSimConfig(cfg => ({ ...(cfg || {}), policy_options: { ...(cfg?.policy_options || {}), traffic_time_period: v } }));
+              }} options={[{ v: 'peak', label: '첨두시' }, { v: 'off_peak', label: '비첨두시' }]} />
+              <div className="row gap8" style={{ marginTop: 8 }}>
+                <button className="btn sm" disabled={!area || trafficSyncing} onClick={syncTraffic}>
+                  {trafficSyncing ? '동기화 중…' : <><Icon.reset size={13} /> ITS 동기화</>}
+                </button>
+                {trafficSyncInfo?.last_sync_time && (
+                  <Chip tone="good" dot>마지막 동기화 {new Date(trafficSyncInfo.last_sync_time).toLocaleTimeString('ko-KR')}</Chip>
+                )}
+              </div>
+              {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 4 }}>먼저 구역을 설정하세요</div>}
+              {trafficSyncError && <div style={{ fontSize: 10.5, marginTop: 4, color: 'var(--bad)' }}>{trafficSyncError}</div>}
+            </div>
+          )}
+
           {/* waypoints */}
           <div className="field">
             <label>경로 지점 <span className="en">WAYPOINTS</span></label>
@@ -1195,6 +1445,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
           </div>
+
+          {/* 예시 시나리오 프리셋 — Lite 전용(Pro는 출발/도착지를 직접 지정하는 워크플로를 유지) */}
+          {appMode === 'lite' && (
+          <div className="field">
+            <label>예시 시나리오 <span className="en">EXAMPLE SCENARIOS</span></label>
+            <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
+              <button className="btn sm" disabled={!area} onClick={() => applyPreset('short')}>
+                <Icon.route size={13} /> 가벼운 예시 (차량 1대)
+              </button>
+              <button className="btn sm" disabled={!area} onClick={() => applyPreset('congested')}>
+                <Icon.route size={13} /> 혼잡한 예시 (차량 40대)
+              </button>
+              <div className="muted" style={{ fontSize: 10.5 }}>현재 구역 안에서 출발지·도착지를 자동으로 채웁니다. 직접 지도를 클릭해 바꿀 수도 있습니다.</div>
+            </div>
+            {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
+          </div>
+          )}
 
           {/* multi-vehicle experimental group — background vehicle count */}
           <div className="field">
@@ -1240,7 +1507,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           </div>
 
-          {/* base stations */}
+          {/* base stations — Pro 전용 (Lite는 자동 배치된 기지국을 그대로 사용) */}
+          {appMode === 'pro' && (
           <div className="field">
             <label>기지국 <span className="en">BASE STATIONS</span></label>
             <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
@@ -1271,8 +1539,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
           </div>
+          )}
 
-          {/* algorithms */}
+          {/* algorithms — Pro 전용 (Lite는 simConfig의 기본 알고리즘을 그대로 사용) */}
+          {appMode === 'pro' && (
           <div className="field">
             <label>알고리즘 <span className="en">ALGORITHMS</span></label>
             <div className="col gap8">
@@ -1282,6 +1552,47 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               <AlgorithmGroup groupKey="resource_allocation" label="자원할당 알고리즘" options={RESOURCE_ALLOCATION_ALGORITHMS} />
             </div>
           </div>
+          )}
+
+          {/* 파라미터 스윕(민감도 분석) — Pro 전용. 결과는 분석보고서 탭 "시나리오 배치 비교"에서 확인 */}
+          {appMode === 'pro' && (
+          <div className="field">
+            <label>파라미터 스윕 <span className="en">SENSITIVITY SWEEP</span></label>
+            <div className="col gap8" style={{ opacity: ready ? 1 : 0.5 }}>
+              <select className="input" value={sweepParam} onChange={e => selectSweepParam(e.target.value)} style={{ width: '100%' }}>
+                {SWEEP_PARAMS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
+              </select>
+              <div className="row gap8">
+                <input className="input" type="number" step={SWEEP_PARAMS.find(p => p.key === sweepParam)?.step ?? 0.1}
+                  value={sweepFrom} onChange={e => setSweepFrom(parseFloat(e.target.value) || 0)} style={{ flex: 1 }} placeholder="시작값" />
+                <input className="input" type="number" step={SWEEP_PARAMS.find(p => p.key === sweepParam)?.step ?? 0.1}
+                  value={sweepTo} onChange={e => setSweepTo(parseFloat(e.target.value) || 0)} style={{ flex: 1 }} placeholder="끝값" />
+                <input className="input" type="number" min="2" max="10" value={sweepSteps}
+                  onChange={e => setSweepSteps(parseInt(e.target.value, 10) || 2)} style={{ width: 56 }} title="구간 수" />
+              </div>
+              <button className={'btn sm ' + (sweepDone ? 'good' : '')} disabled={!ready || sweepRunning} onClick={runParamSweep}>
+                {sweepRunning ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : sweepDone ? <><Icon.check size={13} /> 완료 — 분석보고서에서 확인</> : <><Icon.compare size={13} /> 스윕 실행 ({Math.max(2, Math.min(10, sweepSteps || 2))}개)</>}
+              </button>
+              {!ready && <div className="muted" style={{ fontSize: 10.5 }}>구역·출발지·도착지를 먼저 설정하세요</div>}
+              {sweepError && <div style={{ fontSize: 10.5, color: 'var(--bad)' }}>{sweepError}</div>}
+            </div>
+          </div>
+          )}
+
+          {/* RL 정책 비교(실험적) — Pro 전용. 결과는 분석보고서 탭 "시나리오 배치 비교"에서 확인 */}
+          {appMode === 'pro' && (
+          <div className="field">
+            <label>RL 정책 비교 <span className="en">RL POLICY COMPARE (EXPERIMENTAL)</span></label>
+            <div className="col gap8" style={{ opacity: ready ? 1 : 0.5 }}>
+              <div className="muted" style={{ fontSize: 10.5 }}>random / greedy / coverage 베이스라인 정책을 같은 출발·도착지로 각 20회 평가해 평균±표준편차로 비교합니다.</div>
+              <button className={'btn sm ' + (rlDone ? 'good' : '')} disabled={!ready || rlRunning} onClick={runRLComparison}>
+                {rlRunning ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : rlDone ? <><Icon.check size={13} /> 완료 — 분석보고서에서 확인</> : <><Icon.spark size={13} /> RL 정책 비교 실행</>}
+              </button>
+              {!ready && <div className="muted" style={{ fontSize: 10.5 }}>구역·출발지·도착지를 먼저 설정하세요</div>}
+              {rlError && <div style={{ fontSize: 10.5, color: 'var(--bad)' }}>{rlError}</div>}
+            </div>
+          </div>
+          )}
 
           {/* progress bar */}
           {vehiclePos && (

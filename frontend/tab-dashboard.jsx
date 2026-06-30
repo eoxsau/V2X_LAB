@@ -250,8 +250,11 @@ function InfoRow({ networkTelemetry, routeEdges }) {
 }
 
 /* ---- Main Dashboard ---------------------------------------- */
-function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: liveNetworkTelemetry, simHistory: liveSimHistory, simLogs: liveSimLogs, simConfig: liveSimConfig, routeEdges: liveRouteEdges, sheets, activeSheetIdx }) {
+function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: liveNetworkTelemetry, simHistory: liveSimHistory, simLogs: liveSimLogs, simConfig: liveSimConfig, routeEdges: liveRouteEdges, sheets, activeSheetIdx, mode }) {
   const [subTab, setSubTab] = useState('summary'); // 'summary' | 'network' | 'forecast' — 한 화면에 다 펼치지 않고 묶음별로 분리
+  // Lite 모드에서는 'network'/'forecast'를 선택할 UI 자체가 없다 — 그 상태에서 Pro로
+  // 들어왔다가 다시 Lite로 바뀌는 경우를 대비해 강제로 'summary'로 되돌린다.
+  useEffect(() => { if (mode === 'lite' && subTab !== 'summary') setSubTab('summary'); }, [mode, subTab]);
 
   // 시트별 대시보드 분리 — 시뮬레이션 탭에서 "지금 실행 중인" 시트(activeSheetIdx)만 실시간
   // props를 쓰고, 다른 시트를 고르면 그 시트가 캡처해둔 result(읽기전용 스냅샷)를 보여준다.
@@ -368,6 +371,21 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
     const t = setInterval(poll, 3000);
     return () => { dead = true; clearInterval(t); };
   }, [isLiveSheet]);
+
+  // 커버리지 영역(중첩보정) — shapely union은 텔레메트리 tick(약 10Hz)마다 돌리기엔 무겁기 때문에,
+  // 'network' 서브탭에 처음 들어올 때 한 번만 불러오고 이후엔 수동 새로고침으로만 갱신한다.
+  const [coverageKpi, setCoverageKpi] = useState(null);
+  const [coverageKpiLoading, setCoverageKpiLoading] = useState(false);
+  function fetchCoverageKpi() {
+    setCoverageKpiLoading(true);
+    fetch('http://127.0.0.1:8001/network-nodes/coverage')
+      .then(r => r.json())
+      .then(data => { setCoverageKpi(data); setCoverageKpiLoading(false); })
+      .catch(() => setCoverageKpiLoading(false));
+  }
+  useEffect(() => {
+    if (mode === 'pro' && subTab === 'network') fetchCoverageKpi();
+  }, [mode, subTab]);
 
   const edgeStatsNet = networkTelemetry?.edge_stats || [];
   const perEdgeNet   = routeEdges?.per_edge || [];
@@ -646,7 +664,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
           <div className="eyebrow">Overview</div>
           <h1>대시보드 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Dashboard</span></h1>
           <div className="sub">V2X 통신 알고리즘 성능 실시간 모니터링</div>
-          {/* Algorithm badges */}
+          {/* Algorithm badges — Pro 전용 (Lite는 알고리즘 선택 자체를 노출하지 않으므로 뱃지도 의미가 없음) */}
+          {mode === 'pro' && (
           <div className="row gap8" style={{ marginTop: 10, flexWrap: 'wrap' }}>
             {routeAlgo && (
               <Chip tone="brand">
@@ -673,6 +692,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
               </Chip>
             )}
           </div>
+          )}
         </div>
         <div className="row gap12">
           {hasLive && !arrived && <Chip tone="good" dot>LIVE</Chip>}
@@ -699,11 +719,11 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
       )}
 
       <div className="row gap8" style={{ marginBottom: 18 }}>
-        <Seg value={subTab} onChange={setSubTab} options={[
-          { v: 'summary', label: '현황 요약' },
-          { v: 'network', label: '네트워크 상세' },
-          { v: 'forecast', label: '미래 위험' },
-        ]} />
+        <Seg value={subTab} onChange={setSubTab} options={
+          mode === 'pro'
+            ? [{ v: 'summary', label: '현황 요약' }, { v: 'network', label: '네트워크 상세' }, { v: 'forecast', label: '미래 위험' }]
+            : [{ v: 'summary', label: '현황 요약' }]
+        } />
       </div>
 
       {subTab === 'summary' && <>
@@ -734,6 +754,24 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
           </div>
         </div>
       )}
+
+      {/* ── 결과 1줄 해설 — Lite 전용(학부생이 숫자만 보고 좋은 결과인지 직접 판단하기 어려우므로,
+           이미 위 배너에 쓰인 동일 latency/handover/disconnect 임계값으로 한 줄 요약을 덧붙인다) ── */}
+      {mode === 'lite' && arrived && (() => {
+        const lat = avgLatency ?? 0;
+        const tone = (lat >= 20 || disconnCount > 0) ? 'bad' : (lat >= 12 || handoverCount > 3) ? 'warn' : 'good';
+        const text = tone === 'good'
+          ? `평균 지연 ${lat.toFixed(1)}ms로 안정적인 연결을 유지하며 목적지에 도착했습니다.`
+          : tone === 'warn'
+          ? `평균 지연 ${lat.toFixed(1)}ms · 핸드오버 ${handoverCount}회 — 일부 구간에서 다소 불안정했지만 정상적으로 도착했습니다.`
+          : `평균 지연 ${lat.toFixed(1)}ms · 단절 ${disconnCount}회 — 통신 품질이 좋지 않았던 구간이 있었습니다. 설정 탭에서 기지국 배치를 확인해보세요.`;
+        return (
+          <div className="row gap8" style={{ marginBottom: 14, padding: '10px 14px', background: 'var(--brand-tint)', borderRadius: 9, fontSize: 12.5, lineHeight: 1.5, alignItems: 'flex-start' }}>
+            <Icon.spark size={14} style={{ color: 'var(--brand-2)', flex: '0 0 auto', marginTop: 1 }} />
+            <span>{text}</span>
+          </div>
+        );
+      })()}
 
       {/* ── Stat row 1 ─────────────────────────────────────── */}
       <div className="grid" style={{ gridTemplateColumns: 'repeat(5, 1fr)', marginBottom: 14 }}>
@@ -847,11 +885,11 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
         </div>
       </div>
 
-      {/* ── Latency breakdown ──────────────────────────────── */}
+      {/* ── Latency breakdown + Info row — Pro 전용(알고리즘 내부 동작 진단용) ── */}
+      {mode === 'pro' && <>
       <LatencyBreakdown total={latency} lBase={lBase} lSignal={lSignal} lQueue={lQueue} />
-
-      {/* ── Info row ───────────────────────────────────────── */}
       <InfoRow networkTelemetry={networkTelemetry} routeEdges={routeEdges} />
+      </>}
 
       {/* ── Charts row ─────────────────────────────────────── */}
       <div className="grid" style={{ gridTemplateColumns: '1.4fr 1fr', gap: 14 }}>
@@ -911,7 +949,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
             )}
           </Card>
 
-          {/* BS 후보 비교 */}
+          {/* BS 후보 비교 — Pro 전용(기지국 선택 알고리즘 비교 개념) */}
+          {mode === 'pro' && (
           <Card
             title="BS 후보 비교"
             en={candidates.length > 0 ? `후보 ${candidates.length}개 · latency` : '후보 없음'}
@@ -925,11 +964,12 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
               </div>
             )}
           </Card>
+          )}
         </div>
       </div>
       </>}
 
-      {subTab === 'network' && <>
+      {subTab === 'network' && mode === 'pro' && <>
       {/* ════════════════════════════════════════════════════
           네트워크 상세 (ported from tab-network.jsx)
           ════════════════════════════════════════════════════ */}
@@ -1177,6 +1217,38 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
         </div>
       )}
 
+      {/* ── 커버리지 영역 추정 KPI — Pro 전용. 비용 데이터가 없으므로 ROI/비용 추정은 만들지 않고,
+           면적 추정만 보여준다. "합산 상한"(중첩 미보정, π×반경² 합)과 "중첩보정"(shapely union,
+           백엔드 /network-nodes/coverage)을 함께 보여줘 둘의 차이(overlap_fraction)까지 드러낸다. ── */}
+      {mode === 'pro' && hasLiveNet && (networkTelemetry?.network_nodes?.length > 0) && (() => {
+        const nodes = networkTelemetry.network_nodes;
+        const fallbackUpperKm2 = nodes.reduce((sum, n) => {
+          const r = n.coverage_radius_m || 0;
+          return sum + Math.PI * (r / 1000) * (r / 1000);
+        }, 0);
+        const avgRadius = nodes.reduce((s, n) => s + (n.coverage_radius_m || 0), 0) / nodes.length;
+        const kpi = coverageKpi?.available ? coverageKpi : null;
+        return (
+          <Card title="커버리지 영역 추정" en="Coverage area estimate"
+            right={<button className="btn sm" onClick={fetchCoverageKpi} disabled={coverageKpiLoading}>
+              {coverageKpiLoading ? <><Icon.reset size={13} className="spin" /> 계산 중…</> : <><Icon.reset size={13} /> 새로고침</>}
+            </button>}
+            style={{ marginBottom: 18 }}>
+            <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+              <Stat label="기지국 수" icon="antenna" value={nodes.length} unit="개" />
+              <Stat label="평균 커버리지 반경" icon="layers" value={avgRadius.toFixed(0)} unit="m" />
+              <Stat label="합산 면적 (상한, 중첩 미보정)" icon="route" value={(kpi?.upper_bound_km2 ?? fallbackUpperKm2).toFixed(2)} unit="km²" />
+              <Stat label="중첩보정 면적" icon="route" value={kpi ? kpi.union_km2.toFixed(2) : '—'} unit={kpi ? 'km²' : ''} accent />
+            </div>
+            <div className="muted" style={{ fontSize: 10.5, lineHeight: 1.6, marginTop: 12 }}>
+              {kpi
+                ? `중첩보정 면적은 shapely union 기반으로 기지국 커버리지 원들이 겹치는 부분을 한 번만 센 실제 면적입니다. 상한 대비 ${(kpi.overlap_fraction * 100).toFixed(0)}%가 중첩으로 줄어들었습니다.`
+                : '중첩보정 면적을 불러오지 못해 합산 상한값만 표시 중입니다 — "새로고침"을 눌러 다시 시도하세요.'}
+            </div>
+          </Card>
+        );
+      })()}
+
       {mergedEdges.length > 0 && (
         <div className="grid" style={{ gridTemplateColumns: '1.5fr 1fr', marginBottom: 18 }}>
           <Card title="엣지 혼잡도" en="Edge congestion"
@@ -1311,7 +1383,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
       )}
       </>}
 
-      {subTab === 'forecast' && <>
+      {subTab === 'forecast' && mode === 'pro' && <>
       {/* ════════════════════════════════════════════════════
           미래 위험 예측 (ported from tab-forecast.jsx)
           ════════════════════════════════════════════════════ */}

@@ -107,8 +107,10 @@ def ensure_postgis_schema() -> bool:
       collected_at TIMESTAMPTZ NOT NULL,
       raw_payload JSONB
     );
+    ALTER TABLE traffic_snapshots ADD COLUMN IF NOT EXISTS time_period TEXT NOT NULL DEFAULT 'peak';
     CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_link_id ON traffic_snapshots (link_id);
     CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_collected_at ON traffic_snapshots (collected_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_link_period ON traffic_snapshots (link_id, time_period, collected_at DESC);
 
     CREATE TABLE IF NOT EXISTS edge_mappings (
       id BIGSERIAL PRIMARY KEY,
@@ -351,7 +353,9 @@ def upsert_buildings(gdf: gpd.GeoDataFrame) -> int:
     return len(rows)
 
 
-def replace_traffic_snapshots(rows: list[dict]) -> int:
+def replace_traffic_snapshots(rows: list[dict], *, time_period: str) -> int:
+    """time_period은 호출부에서 명시("peak"/"off_peak") — 동기화 시점에 어느 버킷으로
+    저장할지 잘못 분류되는 걸 막기 위해 기본값을 두지 않고 매번 강제한다."""
     if not postgis_available():
         return 0
     ensure_postgis_schema()
@@ -363,6 +367,7 @@ def replace_traffic_snapshots(rows: list[dict]) -> int:
             float(item["congestion_score"]) if item.get("congestion_score") is not None else None,
             item["collected_at"],
             Json(item.get("raw_payload") or {}),
+            time_period,
         )
         for item in rows
     ]
@@ -373,11 +378,11 @@ def replace_traffic_snapshots(rows: list[dict]) -> int:
                 cur,
                 """
                 INSERT INTO traffic_snapshots
-                  (link_id, speed_kph, travel_time_s, congestion_score, collected_at, raw_payload)
+                  (link_id, speed_kph, travel_time_s, congestion_score, collected_at, raw_payload, time_period)
                 VALUES %s
                 """,
                 prepared,
-                template="(%s,%s,%s,%s,%s,%s)",
+                template="(%s,%s,%s,%s,%s,%s,%s)",
                 page_size=5000,
             )
         conn.commit()

@@ -22,6 +22,7 @@ const DEFAULT_SIM_CONFIG = {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
     traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
+    traffic_time_period: 'peak',
   },
 };
 
@@ -64,6 +65,8 @@ function validateSimulationConfig(config) {
     errors.push('policy_options.other_device_lambda: must be a number 0–2000');
   if (pol.network_mode !== undefined && !['4G', '5G', '6G'].includes(pol.network_mode))
     errors.push('policy_options.network_mode: must be "4G", "5G", or "6G"');
+  if (pol.traffic_time_period !== undefined && !['peak', 'off_peak'].includes(pol.traffic_time_period))
+    errors.push('policy_options.traffic_time_period: must be "peak" or "off_peak"');
 
   return { valid: errors.length === 0, errors, sanitized: mergeWithDefaultConfig(config) };
 }
@@ -106,6 +109,8 @@ function mergeWithDefaultConfig(userConfig) {
       merged.policy_options.other_device_lambda = Math.min(pol.other_device_lambda, 2000);
     if (typeof pol.network_mode === 'string' && ['4G', '5G', '6G'].includes(pol.network_mode))
       merged.policy_options.network_mode = pol.network_mode;
+    if (typeof pol.traffic_time_period === 'string' && ['peak', 'off_peak'].includes(pol.traffic_time_period))
+      merged.policy_options.traffic_time_period = pol.traffic_time_period;
   }
   return merged;
 }
@@ -188,7 +193,7 @@ function runCustomWeightedPolicy(policy, features) {
   return Math.max(0, score);
 }
 
-function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
+function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setAppMode }) {
   const [tech, setTech] = useState(sim.mode === '6G' ? '6G' : '5G');
   const [vals, setVals] = useState(() => {
     const o = {}; DATA.params.forEach(p => { if (p.type !== 'tech') o[p.v] = p.def; }); return o;
@@ -321,6 +326,17 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
         </button>
       </div>
 
+      {/* 모드 전환 — Lite/Professional, 항상 표시(처음 선택을 나중에 바꿀 수 있는 유일한 통로) */}
+      <Card title="모드" en="Lite / Professional" style={{ marginBottom: 18 }}>
+        <div className="row between" style={{ alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+          <div className="muted" style={{ fontSize: 12, maxWidth: 460, lineHeight: 1.5 }}>
+            Lite는 핵심 기능만 간단하게, Professional은 전체 알고리즘·실험 기능을 보여줍니다.
+            언제든 바꿀 수 있고, 시뮬레이션 결과는 그대로 유지됩니다.
+          </div>
+          <Seg value={mode} onChange={setAppMode} options={[{ v: 'lite', label: 'Lite' }, { v: 'pro', label: 'Professional' }]} />
+        </div>
+      </Card>
+
       {/* tech selector */}
       <Card title="네트워크 모드" en="Network technology" style={{ marginBottom: 18 }}>
         <div className="row gap12 wrap">
@@ -346,6 +362,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
         </div>
       </Card>
 
+      {mode === 'pro' && (
       <Card title="기술 파라미터" en="Technical parameters" right={<span className="mono muted" style={{ fontSize: 10 }}>{tech} 프리셋 적용됨</span>} style={{ padding: 0 }}>
         <div className="tbl-wrap">
           <table className="tbl">
@@ -369,8 +386,9 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
           </table>
         </div>
       </Card>
+      )}
 
-      {buildingStatus && (
+      {mode === 'pro' && buildingStatus && (
         <Card title="건물 데이터 상태" en="Building data status" style={{ marginTop: 18 }}>
           <div className="row between" style={{ marginBottom: 8 }}><span>처리 준비</span><b>{buildingStatus.processed_ready ? 'ready' : 'not ready'}</b></div>
           <div className="row between" style={{ marginBottom: 8 }}><span>건물 수</span><b className="num">{buildingStatus.building_count?.toLocaleString?.() || buildingStatus.building_count}</b></div>
@@ -382,7 +400,8 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
         </Card>
       )}
 
-      {/* ── Stage-1: Simulation Algorithm Config ─────────────────────────── */}
+      {/* ── Stage-1: Simulation Algorithm Config — Pro 전용 ──────────────── */}
+      {mode === 'pro' && (
       <Card title="시뮬레이션 알고리즘 설정" en="Simulation config (Stage 1)"
         right={
           <div className="row gap8">
@@ -525,8 +544,10 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
           </table>
         </div>
       </Card>
+      )}
 
-      {/* ── Stage-2: Custom Policy Editor ──────────────────────────────────── */}
+      {/* ── Stage-2: Custom Policy Editor — Pro 전용 ─────────────────────── */}
+      {mode === 'pro' && (
       <Card title="커스텀 정책" en="Custom Policy (Stage 2)"
         right={
           <div className="row gap8">
@@ -584,6 +605,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig }) {
           );
         })}
       </Card>
+      )}
     </div>
   );
 }

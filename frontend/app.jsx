@@ -18,6 +18,14 @@ function App() {
   const [sim, dispatch] = React.useReducer(simReducer, { running: false, elapsed: 0, tick: 0, mode: '5G' });
   const [bootReady, setBootReady]      = useState(false);
 
+  // Lite/Professional 모드 게이트 — 선택 전엔 LandingPage만 보여준다(아래 return 직전 분기).
+  // 페이지를 새로 열거나 새로고침할 때마다 다시 선택하게 한다(저장하지 않음) — 같은 로드 안에서
+  // 탭을 오가는 동안에는 메모리에 유지되므로 다시 묻지 않는다. 설정 탭에서도 언제든 바꿀 수 있음.
+  const [appMode, setAppMode] = useState(null);
+  function chooseMode(m) {
+    setAppMode(m);
+  }
+
   // Vehicle state from WebSocket
   const [vehiclePos, setVehiclePos]     = useState(null);
   const [routeCoords, setRouteCoords]   = useState([]);
@@ -49,6 +57,7 @@ function App() {
       lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
       prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
       traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
+      traffic_time_period: 'peak',
     },
   };
   const [simConfig, setSimConfig] = useState(() => {
@@ -252,6 +261,8 @@ function App() {
 
   const current = NAV.find(n => n.id === tab) || NAV[0];
 
+  if (!appMode) return <LandingPage onSelect={chooseMode} />;
+
   return (
     <div className="app">
       <header className="nav">
@@ -287,7 +298,7 @@ function App() {
       </header>
 
       <main className="page" style={tab === 'simulation' ? { overflow: 'hidden' } : {}}>
-        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} simLogs={simLogs} simConfig={simConfig} routeEdges={routeEdges} sheets={sheets} activeSheetIdx={activeSheetIdx} />}
+        {tab === 'dashboard'  && <Dashboard sim={sim} go={go} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} simHistory={simHistory} simLogs={simLogs} simConfig={simConfig} routeEdges={routeEdges} sheets={sheets} activeSheetIdx={activeSheetIdx} mode={appMode} />}
         <div style={{ display: tab === 'simulation' ? 'block' : 'none', height: '100%' }}>
           <SimulationTab
             sim={sim}
@@ -313,11 +324,12 @@ function App() {
             activeSheetIdx={activeSheetIdx}
             setActiveSheetIdx={setActiveSheetIdx}
             api={API}
+            mode={appMode}
           />
         </div>
-        {tab === 'scenario'   && <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} />}
-        {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} routeCoords={routeCoords} routeEdges={routeEdges} simHistory={simHistory} simConfig={simConfig} />}
-        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} />}
+        {tab === 'scenario'   && <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} mode={appMode} />}
+        {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} routeCoords={routeCoords} routeEdges={routeEdges} simHistory={simHistory} simConfig={simConfig} mode={appMode} />}
+        {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} mode={appMode} setAppMode={chooseMode} />}
       </main>
     </div>
   );

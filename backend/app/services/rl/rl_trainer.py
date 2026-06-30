@@ -247,6 +247,14 @@ def run_episodes(
         vals = [getattr(r, key) for r in results]
         return round(sum(vals) / n, 4) if n else 0.0
 
+    def _std(key):
+        # 표본표준편차(n-1) — 논문/보고서에서 평균과 함께 신뢰구간을 보고하려는 용도
+        vals = [getattr(r, key) for r in results]
+        if n < 2:
+            return 0.0
+        m = sum(vals) / n
+        return round((sum((v - m) ** 2 for v in vals) / (n - 1)) ** 0.5, 4)
+
     return {
         "policy": policy,
         "n_episodes": n,
@@ -255,9 +263,11 @@ def run_episodes(
         "n_dead_end": n_de,
         "arrival_rate": round(n_arrived / n, 4) if n else 0.0,
         "mean_reward": _mean("total_reward"),
+        "std_reward": _std("total_reward"),
         "mean_steps": _mean("steps"),
         "mean_handovers": _mean("handover_count"),
         "mean_latency_ms": _mean("avg_latency_ms"),
+        "std_latency_ms": _std("avg_latency_ms"),
         "mean_disconnection_steps": _mean("disconnection_steps"),
         "episodes": [r.to_dict() for r in results],
     }

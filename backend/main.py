@@ -438,6 +438,7 @@ class SimConfigPolicyOptions(BaseModel):
     traffic_lambda:       float = 5.0   # background vehicle density (vehicles/km²)
     other_device_lambda:  float = 300.0 # 차량 외 기기(폰/IoT) 밀도 (기기/km²) — _L_total의 n_vehicles에 가산
     network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
+    traffic_time_period:  str   = "peak"  # "peak" / "off_peak" — 어느 ITS 동기화 버킷을 시뮬레이션에 쓸지
 
 class SimulationConfigModel(BaseModel):
     cost_weights:        SimConfigCostWeights        = SimConfigCostWeights()
@@ -563,6 +564,7 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         "traffic_lambda":       max(0.1, min(float(pol.traffic_lambda), 200.0)),
         "other_device_lambda":  max(0.0, min(float(pol.other_device_lambda), 2000.0)),
         "network_mode":         pol.network_mode if pol.network_mode in ("4G", "5G", "6G") else "5G",
+        "traffic_time_period":  pol.traffic_time_period if pol.traffic_time_period in ("peak", "off_peak") else "peak",
     }
     _state["simulation_config"] = cfg.model_dump()
 
@@ -665,6 +667,7 @@ class AllocationAlgorithmRequest(BaseModel):
 class TrafficSyncRequest(BaseModel):
     bbox: dict
     type: str = "all"
+    time_period: Optional[str] = None  # "peak" | "off_peak" — None이면 동기화 시점 KST 기준 자동 분류
 
 
 class BuildingBBoxRequest(BaseModel):
@@ -893,7 +896,7 @@ def _seed_other_device_load(nodes: list[dict], other_device_lambda: float, rng: 
         node["n_other_devices"] = _poisson_sample(other_device_lambda * area_km2, rng)
 
 
-def _seed_its_congestion_load(nodes: list[dict]) -> None:
+def _seed_its_congestion_load(nodes: list[dict], time_period: str = "peak") -> None:
     """동기화된 실시간 ITS 교통량(/traffic/sync-its)을 기지국별 부하로 환산해
     node["n_its_load"]에 저장한다.
 
@@ -907,7 +910,7 @@ def _seed_its_congestion_load(nodes: list[dict]) -> None:
     ITS가 동기화되지 않은 상태(링크 없음)에서는 n_its_load=0으로 기존 동작과 동일하다.
     """
     try:
-        traffic = TRAFFIC_FUSION_ENGINE.current_traffic()
+        traffic = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=time_period)
     except Exception:
         traffic = {}
     links = traffic.get("links") or []
@@ -1162,6 +1165,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
                 "load": node.get("load", 0.0),
                 "antenna_height_m": node.get("antenna_height_m"),
                 "antenna_placement": node.get("antenna_placement"),
+                "coverage_radius_m": float(node.get("coverage_radius_m") or 400.0),
             }
             for node in nodes
         ],
@@ -1451,7 +1455,7 @@ def mock_route_coords(graph: dict, path: list[str]) -> list[list[float]]:
     return [[graph["nodes"][node_id]["lat"], graph["nodes"][node_id]["lng"]] for node_id in path]
 
 
-def _generate_background_vehicles(graph: dict, bbox: dict, count: int, rng: random.Random = random) -> list[dict]:
+def _generate_background_vehicles(graph: dict, bbox: dict, count: int, rng: random.Random = random, time_period: str = "peak") -> list[dict]:
     """다중차량 실험군 — bbox 안에서 무작위 출발/도착으로 배경 차량 `count`대의 경로를 생성한다.
 
     ITS 실시간 교통 동기화 데이터(`/traffic/sync-its`)가 해당 구역에 있으면 혼잡 도로
@@ -1474,7 +1478,7 @@ def _generate_background_vehicles(graph: dict, bbox: dict, count: int, rng: rand
 
     weights = None
     try:
-        traffic = TRAFFIC_FUSION_ENGINE.current_traffic()
+        traffic = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=time_period)
         hot_points = [
             (pt.get("lat"), pt.get("lng"), float(link.get("congestion_score") or 0.0))
             for link in (traffic.get("links") or [])
@@ -4075,7 +4079,10 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
         (_state.get("policy_options") or {}).get("other_device_lambda", 300.0),
         _rng,
     )
-    _seed_its_congestion_load(_state.get("network_nodes") or [])
+    _seed_its_congestion_load(
+        _state.get("network_nodes") or [],
+        (_state.get("policy_options") or {}).get("traffic_time_period", "peak"),
+    )
     # algorithm_config uses frontend key names (latency, resource_allocation) and
     # backend key names (latency_algorithm, allocation_algorithm) — accept both.
     _lat_alg = (
@@ -4159,7 +4166,8 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
     if req.vehicle_count and req.vehicle_count > 1 and _state.get("current_bbox"):
         try:
             _bg_vehicles = _generate_background_vehicles(
-                _state["mock_graph"], _state["current_bbox"], req.vehicle_count - 1, _rng
+                _state["mock_graph"], _state["current_bbox"], req.vehicle_count - 1, _rng,
+                (_state.get("policy_options") or {}).get("traffic_time_period", "peak"),
             )
         except Exception as _bg_exc:
             print(f"[BG-VEHICLES] generation failed: {_bg_exc}", flush=True)
@@ -4409,10 +4417,21 @@ def _evaluate_rl_scenario(spec: ScenarioSpec) -> dict:
         raise RuntimeError("도로 그래프가 아직 로드되지 않았습니다. 시뮬레이션을 먼저 설정하세요.")
     road_nodes = graph.get("nodes", {})
     bs_nodes = _state.get("network_nodes") or []
-    if not spec.origin_id or spec.origin_id not in road_nodes:
-        raise RuntimeError(f"출발 노드 '{spec.origin_id}'를 도로 그래프에서 찾을 수 없습니다.")
-    if not spec.dest_id or spec.dest_id not in road_nodes:
-        raise RuntimeError(f"목적지 노드 '{spec.dest_id}'를 도로 그래프에서 찾을 수 없습니다.")
+
+    # origin_id/dest_id(그래프 노드 ID)가 없고 origin/dest(lat/lng)만 있으면 스냅해서 채운다 —
+    # 프런트는 route_metrics 모드와 동일하게 lat/lng만 다루므로, rl_episode 모드도 같은 좌표
+    # 입력으로 쓸 수 있게 한다(이미 /api/scenarios/generate가 쓰는 nearest_mock_node 재사용).
+    origin_id = spec.origin_id
+    dest_id = spec.dest_id
+    if not origin_id and spec.origin:
+        origin_id = nearest_mock_node(graph, spec.origin.get("lat"), spec.origin.get("lng"))
+    if not dest_id and spec.dest:
+        dest_id = nearest_mock_node(graph, spec.dest.get("lat"), spec.dest.get("lng"))
+
+    if not origin_id or origin_id not in road_nodes:
+        raise RuntimeError(f"출발 노드 '{origin_id}'를 도로 그래프에서 찾을 수 없습니다.")
+    if not dest_id or dest_id not in road_nodes:
+        raise RuntimeError(f"목적지 노드 '{dest_id}'를 도로 그래프에서 찾을 수 없습니다.")
     if spec.policy not in SUPPORTED_POLICIES:
         raise RuntimeError(f"지원하지 않는 정책입니다. 선택 가능: {SUPPORTED_POLICIES}")
 
@@ -4420,8 +4439,8 @@ def _evaluate_rl_scenario(spec: ScenarioSpec) -> dict:
         graph=graph,
         road_nodes=road_nodes,
         bs_nodes=bs_nodes,
-        origin_id=spec.origin_id,
-        dest_id=spec.dest_id,
+        origin_id=origin_id,
+        dest_id=dest_id,
         max_steps=spec.max_steps,
         allocation_output=_state.get("last_allocation_result"),
     )
@@ -5400,6 +5419,45 @@ async def list_network_nodes():
     return {"nodes": [_network_node_response(row) for row in fetch_network_nodes()]}
 
 
+@app.get("/network-nodes/coverage")
+def network_nodes_coverage():
+    """
+    기지국 커버리지 면적 — 단순 합산(상한, 중첩 미보정)과 shapely unary_union 기반
+    중첩보정 면적을 함께 반환한다. 위경도는 평균 위도 기준 단순 equirectangular
+    근사로 미터 변환(이 앱의 구역 제한이 25km² 수준이라 그 오차는 무시할 만하다).
+    대시보드 'network' 서브탭에서 클릭 시에만 호출(텔레메트리 tick마다 호출하지 않음).
+    """
+    nodes = _state.get("network_nodes") or []
+    if not nodes:
+        return {"available": False, "reason": "기지국이 없습니다."}
+
+    from shapely.geometry import Point
+    from shapely.ops import unary_union
+    import math as _math
+
+    lat0 = sum(n["lat"] for n in nodes) / len(nodes)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lng = 111320.0 * _math.cos(_math.radians(lat0))
+
+    circles = []
+    upper_bound_m2 = 0.0
+    for n in nodes:
+        r = float(n.get("coverage_radius_m") or 400.0)
+        x = n["lng"] * m_per_deg_lng
+        y = n["lat"] * m_per_deg_lat
+        circles.append(Point(x, y).buffer(r, quad_segs=32))
+        upper_bound_m2 += _math.pi * r * r
+
+    union_m2 = unary_union(circles).area
+    return {
+        "available": True,
+        "node_count": len(nodes),
+        "upper_bound_km2": round(upper_bound_m2 / 1e6, 4),
+        "union_km2": round(union_m2 / 1e6, 4),
+        "overlap_fraction": round(1 - (union_m2 / upper_bound_m2), 4) if upper_bound_m2 > 0 else 0.0,
+    }
+
+
 @app.post("/network-nodes")
 async def create_network_node(req: NetworkNodeCreateRequest):
     if not postgis_available():
@@ -5489,7 +5547,7 @@ async def reapply_placement_to_existing_nodes():
 
 @app.post("/traffic/sync-its")
 async def sync_its_traffic(req: TrafficSyncRequest):
-    result = TRAFFIC_FUSION_ENGINE.sync_its(bbox=req.bbox)
+    result = TRAFFIC_FUSION_ENGINE.sync_its(bbox=req.bbox, time_period=req.time_period)
     _state["traffic_sync"] = {
         "last_sync_time": result["last_sync_time"],
         "records_count": result["records_count"],
@@ -5513,8 +5571,10 @@ async def sync_its_traffic(req: TrafficSyncRequest):
 
 
 @app.get("/traffic/current")
-def traffic_current():
-    return TRAFFIC_FUSION_ENGINE.current_traffic()
+def traffic_current(period: str = "peak"):
+    if period not in ("peak", "off_peak"):
+        period = "peak"
+    return TRAFFIC_FUSION_ENGINE.current_traffic(time_period=period)
 
 
 @app.get("/debug/its-link-match")

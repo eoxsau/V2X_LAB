@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import geopandas as gpd
@@ -14,6 +15,7 @@ from app.services.standard_link.standard_link_repository import StandardLinkRepo
 
 from .its_cache import ITS_CACHE
 from .its_client import fetch_its_traffic_info
+from .its_models import KST, classify_time_period
 from .its_parser import parse_its_traffic_xml
 from .its_standard_link_matcher import match_its_to_standard_links, matched_to_dict
 
@@ -75,7 +77,9 @@ class TrafficFusionEngine:
             "warnings": [],
         }
 
-    def sync_its(self, *, bbox: dict) -> dict:
+    def sync_its(self, *, bbox: dict, time_period: str | None = None) -> dict:
+        # 명시적 override가 없으면 동기화 시점의 실제 시계(KST) 기준으로 첨두/비첨두 자동 분류.
+        resolved_period = time_period if time_period in ("peak", "off_peak") else classify_time_period(datetime.now(KST))
         self.ensure_standard_links()
         xml_text = fetch_its_traffic_info(
             min_x=bbox["minX"],
@@ -141,7 +145,8 @@ class TrafficFusionEngine:
                         "raw_payload": item,
                     }
                     for item in enriched_links
-                ]
+                ],
+                time_period=resolved_period,
             )
         return {
             "records_count": len(records),
@@ -151,17 +156,20 @@ class TrafficFusionEngine:
             "last_sync_time": ITS_CACHE.last_sync_time,
             "sample_matches": enriched_links[:5],
             "warnings": warnings,
+            "time_period": resolved_period,
         }
 
-    def current_traffic(self) -> dict:
+    def current_traffic(self, *, time_period: str = "peak") -> dict:
         if postgis_available():
             links = fetch_all_dicts(
                 """
                 SELECT DISTINCT ON (link_id)
                        link_id, speed_kph, travel_time_s, congestion_score, collected_at, raw_payload
                 FROM traffic_snapshots
+                WHERE time_period = :time_period
                 ORDER BY link_id, collected_at DESC
-                """
+                """,
+                {"time_period": time_period},
             )
             return {
                 "links": [

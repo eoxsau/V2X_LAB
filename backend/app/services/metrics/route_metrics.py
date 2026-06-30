@@ -32,6 +32,13 @@ class RouteMetrics:
     max_latency_ms          Peak latency on any single edge.
     handover_count          Number of BS transitions along the route.
     disconnection_ratio     Fraction of edges outside all BS coverage radii  (0–1).
+    time_weighted_disconnection_ratio
+                            Same as disconnection_ratio but weighted by each edge's
+                            travel_time_s instead of counted per-edge — answers
+                            "fraction of *travel time* spent disconnected" rather than
+                            "fraction of *edges* disconnected" (edges vary widely in
+                            length/duration, so this is the more defensible basis for
+                            a PRR-style connection-retention ratio).
     average_bs_load         Mean BS load ratio across traversed edges  (0–1).
     bs_load_variance        Variance of BS load ratios (load consistency metric).
     resource_deficit_ratio  Fraction of BS nodes currently above capacity  (0–1).
@@ -52,6 +59,7 @@ class RouteMetrics:
     max_latency_ms: float
     handover_count: int
     disconnection_ratio: float
+    time_weighted_disconnection_ratio: float
     average_bs_load: float
     bs_load_variance: float
     resource_deficit_ratio: float
@@ -91,6 +99,7 @@ def compute_metrics(
             max_latency_ms=0.0,
             handover_count=0,
             disconnection_ratio=0.0,
+            time_weighted_disconnection_ratio=0.0,
             average_bs_load=0.0,
             bs_load_variance=0.0,
             resource_deficit_ratio=deficit,
@@ -114,6 +123,10 @@ def compute_metrics(
     )
     auto_cost = total_cost or sum(float(r.total_cost) for r in edge_results)
 
+    total_time_s = sum(float(r.travel_time_s) for r in edge_results)
+    disc_time_s = sum(float(r.travel_time_s) for r in edge_results if not r.within_coverage)
+    time_weighted_disc = (disc_time_s / total_time_s) if total_time_s > 0 else (n_disconnected / n)
+
     # future_connectivity_risk: coverage gap in the LAST 25% of the route.
     # Distinct from disconnection_ratio (whole-path average).
     quarter_start = max(0, n - max(1, n // 4))
@@ -129,6 +142,7 @@ def compute_metrics(
         max_latency_ms=round(max(latencies), 2),
         handover_count=sum(1 for r in edge_results if r.handover_occurred),
         disconnection_ratio=round(n_disconnected / n, 4),
+        time_weighted_disconnection_ratio=round(time_weighted_disc, 4),
         average_bs_load=round(avg_load, 4),
         bs_load_variance=round(load_var, 6),
         resource_deficit_ratio=round(deficit, 4),
@@ -194,6 +208,7 @@ def from_k_candidates(
                 max_latency_ms=c.max_latency_ms,
                 handover_count=c.handover_count,
                 disconnection_ratio=c.coverage_risk,
+                time_weighted_disconnection_ratio=c.coverage_risk,  # 폴백: edge_results 없이는 시간가중 계산 불가, edge 비율로 대체
                 average_bs_load=0.0,
                 bs_load_variance=0.0,
                 resource_deficit_ratio=deficit,
