@@ -66,6 +66,30 @@ function inferBatchKind(batch) {
   return { tone: '', text: '시나리오 배치' };
 }
 
+// 파라미터 스윕 배치 파싱 — runParamSweep()(tab-simulation.jsx)이 생성하는 라벨 포맷에 의존:
+// 배치 label = "파라미터 스윕 — {파라미터명}", 각 시나리오 label = "{파라미터명}={값}".
+// 이 포맷을 우리가 직접 만들었으므로 정규식 파싱이 안전하다 — 별도 백엔드 필드 추가 없이
+// 스윕 값(x축)을 복원해 추세 그래프를 그릴 수 있다.
+function parseSweepBatch(batch) {
+  const m = /^파라미터 스윕 — (.+)$/.exec(batch.label || '');
+  if (!m) return null;
+  const paramLabel = m[1];
+  const points = (batch.results || [])
+    .filter(r => r.status === 'done' && r.mode === 'route_metrics')
+    .map(r => {
+      const vm = /=(-?[\d.]+)$/.exec(r.label || '');
+      const x = vm ? parseFloat(vm[1]) : null;
+      return {
+        x,
+        totalCost: r.route_cost_result?.total_cost ?? null,
+        avgLatency: r.route_cost_result?.avg_latency_ms ?? null,
+      };
+    })
+    .filter(p => p.x !== null)
+    .sort((a, b) => a.x - b.x);
+  return points.length > 0 ? { paramLabel, points } : null;
+}
+
 // 배치/실행이력 등 "선택 가능한 카드 묶음" 공통 카드 — 클릭으로 선택, 우상단 ✕로 삭제.
 // 기존 테이블 기반 선택 목록(라디오/체크박스 + 테이블 행)을 대체해 한눈에 훑어보기 쉽게 한다.
 function PickerCard({ selected, onClick, onRemove, kindChip, title, metaLeft, metaRight }) {
@@ -959,6 +983,8 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
             {currentBatch && currentBatch.results?.length > 0 && (() => {
               const doneResults = currentBatch.results.filter(r => r.status === 'done');
               const isRlBatch = doneResults.some(r => r.mode === 'rl_episode');
+              const sweepData = parseSweepBatch(currentBatch);
+              const rlRows = isRlBatch ? doneResults.filter(r => r.mode === 'rl_episode') : null;
               // route_metrics는 비용 낮을수록, rl_episode는 reward 높을수록 좋음 — best 판정 방향이 반대
               let bestIdx = -1;
               if (doneResults.length > 0) {
@@ -972,22 +998,85 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
               const bestId = bestIdx >= 0 ? doneResults[bestIdx].id : null;
               return (
               <>
-                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
-                  {isRlBatch ? '평균 reward 비교(높을수록 좋음, 막대 위 ±는 표준편차)' : '총비용 비교(낮을수록 좋음)'} · 가장 좋은 결과에 "최적" 표시
-                </div>
-                <BarChart items={doneResults.map(r => {
-                  const isRl = r.mode === 'rl_episode';
-                  const val = isRl ? (r.mean_reward ?? r.total_reward ?? 0) : (r.route_cost_result?.total_cost ?? 0);
-                  const std = isRl && r.std_reward != null ? ` ±${r.std_reward.toFixed(2)}` : '';
-                  return {
-                    label: r.label || r.id,
-                    value: val,
-                    display: isRl ? `reward ${val.toFixed(2)}${std}` : `비용 ${val.toFixed(1)}`,
-                    color: isRl ? 'var(--good)' : 'var(--brand-2)',
-                  };
-                })} />
+                {sweepData ? (
+                  <div style={{ marginBottom: 18 }}>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+                      가로축 = {sweepData.paramLabel} 값. 두 지표가 서로 반대로 움직이면(예: 비용↓ Latency↑)
+                      그 구간이 트레이드오프 지점입니다.
+                    </div>
+                    <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>총 비용 추이</div>
+                        <LineChart series={[sweepData.points.map(p => p.totalCost ?? 0)]} height={150}
+                          labels={sweepData.points.map(p => String(p.x))} colors={['var(--brand-2)']} />
+                      </div>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Latency 추이</div>
+                        <LineChart series={[sweepData.points.map(p => p.avgLatency ?? 0)]} height={150} yUnit="ms"
+                          labels={sweepData.points.map(p => String(p.x))} colors={['var(--warn)']} />
+                      </div>
+                    </div>
+                  </div>
+                ) : rlRows ? (
+                  <div style={{ marginBottom: 18 }}>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+                      정책별 다중지표 비교 — reward만으로는 "도착했는지", "핸드오버가 잦은지"를 알 수 없어 4개 지표를 함께 봅니다.
+                    </div>
+                    <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Reward (±표준편차)</div>
+                        <BarChart items={rlRows.map(r => ({
+                          label: r.policy || r.label || r.id,
+                          value: r.mean_reward ?? r.total_reward ?? 0,
+                          display: `${(r.mean_reward ?? r.total_reward ?? 0).toFixed(2)}${r.std_reward != null ? ` ±${r.std_reward.toFixed(2)}` : ''}`,
+                          color: 'var(--good)',
+                        }))} />
+                      </div>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>목적지 도착률</div>
+                        <BarChart items={rlRows.map(r => ({
+                          label: r.policy || r.label || r.id,
+                          value: (r.arrival_rate ?? 0) * 100,
+                          display: `${((r.arrival_rate ?? 0) * 100).toFixed(0)}%`,
+                          color: 'var(--brand-2)',
+                        }))} max={100} />
+                      </div>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 핸드오버</div>
+                        <BarChart items={rlRows.map(r => ({
+                          label: r.policy || r.label || r.id,
+                          value: r.mean_handovers ?? 0,
+                          display: `${(r.mean_handovers ?? 0).toFixed(1)}회`,
+                          color: 'var(--warn)',
+                        }))} />
+                      </div>
+                      <div>
+                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Latency</div>
+                        <BarChart items={rlRows.map(r => ({
+                          label: r.policy || r.label || r.id,
+                          value: r.mean_latency_ms ?? 0,
+                          display: `${(r.mean_latency_ms ?? 0).toFixed(1)}ms${r.std_latency_ms != null ? ` ±${r.std_latency_ms.toFixed(1)}` : ''}`,
+                          color: 'var(--bad)',
+                        }))} />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ marginBottom: 18 }}>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                      총비용 비교(낮을수록 좋음) · 가장 좋은 결과에 "최적" 표시
+                    </div>
+                    <BarChart items={doneResults.map(r => ({
+                      label: r.label || r.id,
+                      value: r.route_cost_result?.total_cost ?? 0,
+                      display: `비용 ${(r.route_cost_result?.total_cost ?? 0).toFixed(1)}`,
+                      color: 'var(--brand-2)',
+                    }))} />
+                  </div>
+                )}
 
-                <div className="tbl-wrap" style={{ marginTop: 14 }}>
+                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>전체 시나리오 상세</div>
+                <div className="tbl-wrap">
                   <table className="tbl">
                     <thead>
                       <tr><th>시나리오</th><th>모드</th><th className="r">차량수/정책</th><th className="r">seed</th><th className="r">결과</th></tr>
