@@ -55,6 +55,36 @@ _TECH_PARAMS: dict[str, dict] = {
 }
 
 
+# ── RSU (Road Side Unit) coverage radii by network mode ───────────────────────
+# RSU는 교차로 폴에 4~8m 높이로 설치되는 PC5/사이드링크 전용 노드. 셀룰러 Uu 기지국보다
+# 커버리지 반경이 훨씬 작지만 도로 레벨 직접 통신이라 지연이 극히 낮다.
+# 출처: ETSI EN 302 663(ITS-G5), 3GPP TR 36.885(LTE-V2X), Rel-16 NR-V2X PC5 링크 예산
+_RSU_COVERAGE_RADIUS_M: dict[str, float] = {
+    "4G": 100.0,   # DSRC/LTE-V2X Mode 4 urban RSU, 실측 범위 50-150m
+    "5G": 150.0,   # NR-V2X PC5 urban RSU, 3GPP Rel-16 링크 예산 기준 ~150m
+    "6G": 250.0,   # IMT-2030 ultra-reliable V2X 확장 커버리지 목표
+}
+
+
+def _L_rsu(distance_m: float, coverage_radius_m: float) -> float:
+    """PC5 인터페이스(RSU–차량 직접 통신) 단방향 지연 (ms).
+
+    셀룰러 Uu(_L_total)와 달리 HARQ 재전송·큐잉 없음 — 브로드캐스트/유니캐스트 채널에서
+    재전송은 상위 레이어(V2X APP)가 독립적으로 처리하고, 단말 레벨 큐잉 지연이 사실상 없어
+    3ms 이하의 매우 짧은 지연이 특징이다.
+
+    모델: L_pc5 = L_access + L_proc (ms)
+      L_access  ≈ 0.5ms  (PC5 공중 인터페이스 — 슬롯 배정·전송 지연 합산)
+      L_proc    ≈ 0.5ms  (RSU 처리 지연)
+      거리 패널티: 커버리지 경계에 가까울수록 재전송 확률이 선형 증가 →
+                  1.0ms(중심) ~ 3.0ms(경계)의 선형 보간으로 근사한다.
+
+    출처: 3GPP TR 36.885 §A.1(E2E latency budget), ETSI TR 102 638 §4.3.
+    """
+    ratio = max(0.0, min(1.0, distance_m / max(coverage_radius_m, 1.0)))
+    return round(1.0 + ratio * 2.0, 3)
+
+
 def _material_a_seg_db(
     buildings_bl: "gpd.GeoDataFrame",
     buildings_bl_3857: "gpd.GeoDataFrame",
@@ -259,9 +289,17 @@ def analyze_candidates(
     vehicle_density_penalty: float = 0.0,
     network_mode: str = "5G",
 ) -> list[dict]:
-    coverage_radius_m = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])["coverage_radius_m"]
+    bs_global_radius = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])["coverage_radius_m"]
+    rsu_global_radius = _RSU_COVERAGE_RADIUS_M.get(network_mode, 150.0)
     results = []
     for node in candidate_nodes:
+        is_rsu = str(node.get("type") or "").lower() in ("rsu", "rsu_node")
+        # 노드 자신의 coverage_radius_m을 우선 사용하고, 없으면 기술 모드별 전역값으로 폴백.
+        # RSU는 150m, BS는 400~500m — 노드별 반경을 직접 쓰는 것이 더 정확하다.
+        node_coverage_radius = float(node.get("coverage_radius_m") or (
+            rsu_global_radius if is_rsu else bs_global_radius
+        ))
+
         obs = analyze_vehicle_to_node(
             vehicle_id=vehicle_id,
             vehicle_lat=vehicle_lat,
@@ -270,34 +308,38 @@ def analyze_candidates(
             buildings_gdf=buildings_gdf,
             vehicle_density_penalty=vehicle_density_penalty,
         )
-        # 물리적 커버리지 반경 밖이면 latency가 아무리 낮게 계산돼도 후보에서 제외한다 —
-        # 컷오프 없이는 혼잡도가 낮은 먼 기지국이 가까운 혼잡 기지국보다 "낮은 latency"로
-        # 이겨서 지도 전체를 가로지르는 비현실적인 연결선이 그려지는 문제가 있었다.
-        if obs.distance_m > coverage_radius_m:
+        # 물리적 커버리지 반경 밖이면 후보에서 제외 — 노드별 반경 사용(RSU/BS 각각 다름).
+        if obs.distance_m > node_coverage_radius:
             continue
-        # n_vehicles: ego + 배경 차량(실시간 또는 Poisson 기본값) + 차량 외 기기(폰/IoT, Poisson)
-        # + 실시간 ITS 교통량 환산 부하 — 같은 기지국 capacity를 공유하는 모든 활성 연결을
-        # 큐잉 모델 분모에 반영한다.
-        n_vehicles = (
-            1
-            + int(node.get("n_background_vehicles", 0))
-            + int(node.get("n_other_devices", 0))
-            + int(node.get("n_its_load", 0))
-        )
-        edge_latency = float(node.get("edge_latency_ms", 5.0))
-        # RB 자원할당 시스템이 산출한 deficit_rb(용량 초과분)를 capacity 대비 비율로
-        # 환산해 큐잉 지연에 직접 반영한다 — apply_allocation_to_network_nodes()가
-        # 매 할당 주기마다 채워주는 필드(할당이 아직 안 됐으면 0.0, 즉 기존 동작과 동일).
-        cap = float(node.get("capacity") or 100.0)
-        deficit_ratio = float(node.get("deficit_rb", 0.0)) / max(cap, 1.0)
 
-        predicted_latency_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
-            distance_m=obs.distance_m,
-            A_seg_db=obs.estimated_penetration_loss_db,
-            n_vehicles=n_vehicles,
-            network_mode=network_mode,
-            deficit_ratio=deficit_ratio,
-        )
+        edge_latency = float(node.get("edge_latency_ms", 5.0))
+
+        if is_rsu:
+            # RSU — PC5 사이드링크. HARQ·큐잉 없음, 건물 차폐 영향 최소(도로 레벨 직접 통신).
+            # L_rsu는 거리 기반 단순 선형 모델(1~3ms), 컴포넌트 분해: base+signal+queue 대신
+            # total=L_rsu, l_base=1.0ms(PC5 access), l_signal=비례 패널티, l_queue=0으로 표현.
+            predicted_latency_ms = _L_rsu(obs.distance_m, node_coverage_radius)
+            l_base_ms = 1.0
+            l_signal_ms = round(predicted_latency_ms - 1.0, 3)
+            l_queue_ms = 0.0
+        else:
+            # BS — 셀룰러 Uu 인터페이스.
+            n_vehicles = (
+                1
+                + int(node.get("n_background_vehicles", 0))
+                + int(node.get("n_other_devices", 0))
+                + int(node.get("n_its_load", 0))
+            )
+            cap = float(node.get("capacity") or 100.0)
+            deficit_ratio = float(node.get("deficit_rb", 0.0)) / max(cap, 1.0)
+            predicted_latency_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
+                distance_m=obs.distance_m,
+                A_seg_db=obs.estimated_penetration_loss_db,
+                n_vehicles=n_vehicles,
+                network_mode=network_mode,
+                deficit_ratio=deficit_ratio,
+            )
+
         node_score = round(predicted_latency_ms + edge_latency * 0.5, 2)
 
         results.append({

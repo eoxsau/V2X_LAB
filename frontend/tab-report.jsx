@@ -1,4 +1,10 @@
-/* ============================================================ Report tab */
+/* ============================================================ Report tab
+   5-section analysis report: Overview / Compare / Explain / Export / Metadata
+   ============================================================ */
+
+// ── constants ──────────────────────────────────────────────────────────────
+const API_BASE = 'http://127.0.0.1:8001';
+
 const LOG_STYLE = {
   info:       { tone: 'brand', ko: '정보',    ic: 'spark'    },
   handover:   { tone: 'brand', ko: '핸드오버', ic: 'antenna'  },
@@ -11,1161 +17,583 @@ const LOG_STYLE = {
 };
 
 const PROVIDER_LABELS = {
-  vertex:  { name: 'Gemini', color: 'var(--brand-2)' },
-  azure:   { name: 'GPT-5.4', color: '#0078d4' },
-  bedrock: { name: 'Claude', color: 'var(--brand-2)' },
+  vertex:  { name: 'Gemini',  color: 'var(--brand-2)' },
+  azure:   { name: 'GPT-5.4', color: '#0078d4'        },
+  bedrock: { name: 'Claude',  color: 'var(--brand-2)' },
 };
 
-/* ---- ported from tab-routes.jsx ----------------------------- */
 const ALT_PATH_COLORS = ['#F6A623', '#A855F7', '#22C1A8', '#E45C8A', '#5B8DEF'];
 
-/* ---- ported from tab-comparison.jsx -------------------------- */
-const CMP_METRIC_COLS = [
-  { key: 'total_cost',              label: '총 비용',        fmt: v => v.toFixed(2) },
-  { key: 'average_latency_ms',      label: '평균 Latency',   fmt: v => v.toFixed(1) + 'ms' },
-  { key: 'handover_count',          label: '핸드오버',       fmt: v => v + '회' },
-  { key: 'disconnection_ratio',     label: '단절율',         fmt: v => (v * 100).toFixed(0) + '%' },
-  { key: 'prr_approx',              label: 'PRR(시간가중근사)', fmt: v => (v * 100).toFixed(1) + '%' },
-  { key: 'average_bs_load',         label: '평균 BS 부하',   fmt: v => (v * 100).toFixed(0) + '%' },
-  { key: 'future_connectivity_risk', label: '미래 위험도',   fmt: v => (v * 100).toFixed(0) + '%' },
-  { key: 'edge_count',              label: '구간 수',        fmt: v => v + '개' },
-];
+const CMP_HISTORY_KEY  = 'v2x_run_history';
+const SCB_BATCH_KEY    = 'v2x_scenario_batches';
 
-// P50/P90/P95/P99 — 정렬된 숫자 배열에서 선형보간 없는 nearest-rank 백분위수
-function percentile(sortedNums, p) {
-  if (!sortedNums || sortedNums.length === 0) return null;
-  const idx = Math.min(sortedNums.length - 1, Math.ceil((p / 100) * sortedNums.length) - 1);
-  return sortedNums[Math.max(0, idx)];
-}
-const CMP_HISTORY_KEY = 'v2x_run_history';
-function loadRunHistory() {
-  try { return JSON.parse(localStorage.getItem(CMP_HISTORY_KEY) || '[]'); } catch { return []; }
-}
-function saveRunHistory(list) {
-  try { localStorage.setItem(CMP_HISTORY_KEY, JSON.stringify(list.slice(-20))); } catch {}
+function loadRunHistory()    { try { return JSON.parse(localStorage.getItem(CMP_HISTORY_KEY)  || '[]'); } catch { return []; } }
+function saveRunHistory(l)   { try { localStorage.setItem(CMP_HISTORY_KEY,  JSON.stringify(l.slice(-20))); } catch {} }
+function loadScenarioBatches() { try { return JSON.parse(localStorage.getItem(SCB_BATCH_KEY) || '[]'); } catch { return []; } }
+function saveScenarioBatches(l){ try { localStorage.setItem(SCB_BATCH_KEY, JSON.stringify(l));            } catch {} }
+
+// P-ile (nearest-rank, no interpolation)
+function pct(sortedNums, p) {
+  if (!sortedNums?.length) return null;
+  return sortedNums[Math.min(sortedNums.length - 1, Math.max(0, Math.ceil(p / 100 * sortedNums.length) - 1))];
 }
 
-// 시나리오 어시스턴트 탭의 "시나리오 생성·배치" 모드(Phase 3/4)가 쓰는 키와 동일 —
-// 여기서는 읽기만 한다(쓰기는 tab-scenario.jsx의 scbSaveBatches가 담당).
-const SCB_BATCH_KEY = 'v2x_scenario_batches';
-function loadScenarioBatches() {
-  try { return JSON.parse(localStorage.getItem(SCB_BATCH_KEY) || '[]'); } catch { return []; }
-}
-function saveScenarioBatches(list) {
-  try { localStorage.setItem(SCB_BATCH_KEY, JSON.stringify(list)); } catch {}
+function algoLabel(key) {
+  if (!key) return '—';
+  // Handle k_path_rank_N for any rank N ≥ 0
+  const km = /^k_path_rank_(\d+)$/.exec(key);
+  if (km) {
+    const r = parseInt(km[1], 10);
+    return r === 0 ? 'K-경로 최적' : `K-경로 ${r + 1}위`;
+  }
+  const MAP = {
+    dijkstra: 'Dijkstra', astar: 'A*', baseline_dijkstra: '기본 Dijkstra',
+    network_aware: '네트워크 가중치', network_weighted: '네트워크 가중치',
+    lowest_latency_bs: 'Lowest Latency', highest_confidence_bs: 'Highest Confidence',
+    load_balanced_bs: 'Load Balanced', nearest_bs: 'Nearest BS',
+    full_composite_latency: 'Full Composite', simple_distance_latency: 'Simple Distance',
+    distance_based_latency: 'Distance Based', load_aware_latency: 'Load Aware',
+    blockage_aware_latency: 'Blockage Aware', mec_aware_latency: 'MEC Aware',
+    traffic_aware_allocation: 'Traffic Aware', equal_allocation: 'Equal Alloc',
+    proportional_allocation: 'Proportional', load_balancing_allocation: 'Load Balancing',
+    latency_minimizing_allocation: 'Latency Minimizing', priority_based_allocation: 'Priority Based',
+    lookahead_resource_allocation: 'Look-ahead',
+  };
+  return MAP[key] ?? key;
 }
 
-// 배치 레이블 prefix(각 생성처에서 고정 문구로 시작)로 종류를 추정 — 카드에 종류 Chip을 달아
-// 스윕/RL비교/시트비교/생성배치를 한눈에 구분할 수 있게 한다.
 function inferBatchKind(batch) {
   const label = batch.label || '';
   if (label.startsWith('파라미터 스윕')) return { tone: 'brand', text: '파라미터 스윕' };
-  if (label.startsWith('RL 정책 비교')) return { tone: 'good', text: 'RL 정책 비교' };
+  if (label.startsWith('RL 정책 비교'))  return { tone: 'good',  text: 'RL 정책 비교'  };
   if (label.startsWith('시뮬레이션 시트 비교')) return { tone: 'warn', text: '시트 비교' };
   if ((batch.results || []).some(r => r.mode === 'rl_episode')) return { tone: 'good', text: 'RL 배치' };
   return { tone: '', text: '시나리오 배치' };
 }
 
-// 파라미터 스윕 배치 파싱 — runParamSweep()(tab-simulation.jsx)이 생성하는 라벨 포맷에 의존:
-// 배치 label = "파라미터 스윕 — {파라미터명}", 각 시나리오 label = "{파라미터명}={값}".
-// 이 포맷을 우리가 직접 만들었으므로 정규식 파싱이 안전하다 — 별도 백엔드 필드 추가 없이
-// 스윕 값(x축)을 복원해 추세 그래프를 그릴 수 있다.
 function parseSweepBatch(batch) {
   const m = /^파라미터 스윕 — (.+)$/.exec(batch.label || '');
   if (!m) return null;
   const paramLabel = m[1];
   const points = (batch.results || [])
     .filter(r => r.status === 'done' && r.mode === 'route_metrics')
-    .map(r => {
-      const vm = /=(-?[\d.]+)$/.exec(r.label || '');
-      const x = vm ? parseFloat(vm[1]) : null;
-      return {
-        x,
-        totalCost: r.route_cost_result?.total_cost ?? null,
-        avgLatency: r.route_cost_result?.avg_latency_ms ?? null,
-      };
-    })
-    .filter(p => p.x !== null)
-    .sort((a, b) => a.x - b.x);
+    .map(r => { const vm = /=(-?[\d.]+)$/.exec(r.label || ''); return { x: vm ? parseFloat(vm[1]) : null, totalCost: r.route_cost_result?.total_cost ?? null, avgLatency: r.route_cost_result?.avg_latency_ms ?? null }; })
+    .filter(p => p.x !== null).sort((a, b) => a.x - b.x);
   return points.length > 0 ? { paramLabel, points } : null;
 }
 
-// 배치/실행이력 등 "선택 가능한 카드 묶음" 공통 카드 — 클릭으로 선택, 우상단 ✕로 삭제.
-// 기존 테이블 기반 선택 목록(라디오/체크박스 + 테이블 행)을 대체해 한눈에 훑어보기 쉽게 한다.
-function PickerCard({ selected, onClick, onRemove, kindChip, title, metaLeft, metaRight }) {
+// ── math rendering helpers ─────────────────────────────────────────────────
+
+function MathFrac({ n, d }) {
   return (
-    <div
-      onClick={onClick}
-      style={{
-        flex: '1 1 230px', maxWidth: 300, cursor: 'pointer', padding: '12px 14px', borderRadius: 12,
-        background: selected ? 'var(--brand-tint)' : 'var(--surface-2)',
-        border: '1.5px solid ' + (selected ? 'var(--brand-2)' : 'var(--border)'),
-        transition: 'border-color .15s, background .15s',
-      }}
-    >
-      <div className="row between" style={{ marginBottom: 7, alignItems: 'flex-start' }}>
-        {kindChip}
-        {onRemove && (
-          <button className="btn icon sm" onClick={(e) => { e.stopPropagation(); onRemove(); }} style={{ marginTop: -2, flex: '0 0 auto' }}>✕</button>
-        )}
-      </div>
-      <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {title}
-      </div>
-      <div className="row between" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
-        <span>{metaLeft}</span>
-        <span className="num">{metaRight}</span>
-      </div>
+    <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', verticalAlign: 'middle', margin: '0 3px', lineHeight: 1.3 }}>
+      <span style={{ borderBottom: '1px solid currentColor', padding: '0 5px 2px', textAlign: 'center', whiteSpace: 'nowrap' }}>{n}</span>
+      <span style={{ padding: '2px 5px 0', textAlign: 'center', whiteSpace: 'nowrap' }}>{d}</span>
+    </span>
+  );
+}
+
+// ── shared helpers ─────────────────────────────────────────────────────────
+
+function fmt1(v)      { return v != null ? Number(v).toFixed(1) : '—'; }
+function fmt2(v)      { return v != null ? Number(v).toFixed(2) : '—'; }
+function fmtPct(v)    { return v != null ? (Number(v) * 100).toFixed(1) + '%' : '—'; }
+function fmtMs(v)     { return v != null ? Number(v).toFixed(1) + ' ms' : '—'; }
+function fmtKm(m)     { return m != null ? (Number(m) / 1000).toFixed(2) + ' km' : '—'; }
+
+function DeltaBadge({ value, unit = '', lowerBetter = true, digits = 1 }) {
+  if (value == null) return null;
+  const v = Number(value);
+  const good   = lowerBetter ? v < 0 : v > 0;
+  const neutral = Math.abs(v) < 1e-6;
+  const color   = neutral ? 'var(--ink-3)' : good ? 'var(--good)' : 'var(--bad)';
+  return (
+    <span style={{ fontWeight: 700, color, fontSize: 11.5 }}>
+      {v > 0 ? '+' : ''}{v.toFixed(digits)}{unit}
+    </span>
+  );
+}
+
+function SectionEmpty({ msg }) {
+  return (
+    <div style={{ padding: '28px 16px', textAlign: 'center', color: 'var(--ink-4)', fontSize: 12.5 }}>
+      {msg || '시뮬레이션을 먼저 실행하세요.'}
     </div>
   );
 }
 
-function ReportSectionList({ title, items, render, empty }) {
-  if (!items || items.length === 0) return null;
+function FindingRow({ tone, icon, label, detail, badge }) {
   return (
-    <div style={{ marginBottom: 14 }}>
-      <div className="row gap8" style={{ marginBottom: 6 }}>
-        <b style={{ fontSize: 12 }}>{title}</b>
-        <Chip>{items.length}건</Chip>
-      </div>
-      <div className="col gap6">
-        {items.slice(0, 6).map((it, i) => (
-          <div key={i} className="row gap8" style={{ fontSize: 11.5, padding: '6px 10px', background: 'var(--surface-2)', borderRadius: 7, border: '1px solid var(--border)' }}>
-            {render(it)}
-          </div>
-        ))}
-      </div>
+    <div className="row gap10" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', fontSize: 12 }}>
+      {icon && <Icon.warn size={13} style={{ color: tone === 'bad' ? 'var(--bad)' : tone === 'warn' ? 'var(--warn)' : 'var(--ink-3)', flexShrink: 0 }} />}
+      <span style={{ flex: 1 }}>{label}</span>
+      {detail && <span className="muted" style={{ fontSize: 11 }}>{detail}</span>}
+      {badge && badge}
     </div>
   );
 }
 
-function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, routeEdges, simHistory, simConfig, mode }) {
-  const [subTab, setSubTab] = useState(() => mode === 'lite' ? 'logs' : 'compare'); // 'compare' | 'batch' | 'logs' — 한 화면에 다 펼치지 않고 묶음별로 분리
-  // Lite는 'logs'만 선택 가능 — Pro에서 'compare'/'batch'를 보던 중 Lite로 전환되면 되돌린다.
-  useEffect(() => { if (mode === 'lite' && subTab !== 'logs') setSubTab('logs'); }, [mode, subTab]);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [revealed, setRevealed] = useState(0);
-  const [exported, setExported] = useState(false);
-  const [llmResult, setLlmResult] = useState([]);
-  const [llmError, setLlmError] = useState(null);
-  const [llmProviders, setLlmProviders] = useState([]);
-  const [selectedProvider, setSelectedProvider] = useState('');
-  const [usedProvider, setUsedProvider] = useState(null);
-  const [summary, setSummary] = useState(null);
-  const [summaryLoading, setSummaryLoading] = useState(false);
+// ── Overview section ───────────────────────────────────────────────────────
 
-  useEffect(() => {
-    fetch('http://127.0.0.1:8001/api/analysis/llm/providers')
-      .then(r => r.json())
-      .then(data => {
-        const ps = data.providers || [];
-        setLlmProviders(ps);
-        const active = ps.find(p => p.active);
-        if (active && !selectedProvider) setSelectedProvider(active.id);
-      })
-      .catch(() => {});
-  }, []);
-
-  function fetchSummary() {
-    setSummaryLoading(true);
-    fetch('http://127.0.0.1:8001/api/analysis/summary')
-      .then(r => r.json())
-      .then(data => { setSummary(data); setSummaryLoading(false); })
-      .catch(() => setSummaryLoading(false));
-  }
-  useEffect(() => { fetchSummary(); }, []);
-
-  const hasLiveLogs = simLogs && simLogs.length > 0;
-  const logs = hasLiveLogs ? [...simLogs].reverse() : [];
+function SectionOverview({ bundle, simLogs, vehiclePos, networkTelemetry, sim }) {
+  const rs   = bundle?.run_summary;
+  const summ = bundle?.simulation_summary;
+  const seed = summ?.recommendation_text_seed;
 
   const connNode = networkTelemetry?.ego_vehicle?.connected_network_node_name
-    ?? networkTelemetry?.connected_node?.name ?? '--';
-  const latency = networkTelemetry?.ego_vehicle?.current_latency_ms
+    ?? networkTelemetry?.connected_node?.name ?? '—';
+  const liveLat  = networkTelemetry?.ego_vehicle?.current_latency_ms
     ?? networkTelemetry?.latency_ms ?? null;
+  const hasLive  = simLogs?.length > 0;
 
-  /* ====== ported from tab-routes.jsx — 최적 경로 비교 ====== */
-  const hasRoute = routeCoords && routeCoords.length >= 2;
+  const imp = summ?.improvement_over_baseline;
 
-  // 경로 대안(K-path) — 시뮬레이션 시작 후 백그라운드에서 계산되므로, route가 잡힌
-  // 직후 바로 fetch하면 아직 준비 전일 수 있어 준비될 때까지 짧게 재시도한다.
+  if (!bundle?.available) {
+    return (
+      <Card title="개요" en="Overview" style={{ marginBottom: 18 }}>
+        <SectionEmpty msg="시뮬레이션을 실행하면 KPI 요약이 표시됩니다." />
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      {/* ── live stats strip (when simulation is running) ── */}
+      {hasLive && vehiclePos && (
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 16 }}>
+          <Stat label="경과 시간"  icon="clock"   value={fmtClock(sim?.elapsed ?? 0)} sub="시뮬레이션 시작 후" accent />
+          <Stat label="현재 속도"  icon="speed"   value={fmt1(vehiclePos.speed ?? 0)} unit="km/h" sub="EGO-001" />
+          <Stat label="연결 기지국" icon="antenna" value={connNode} sub={liveLat != null ? `Latency ${fmt1(liveLat)} ms` : '—'} />
+          <Stat label="이벤트 수"  icon="chart"   value={simLogs.length} unit="건" sub={`핸드오버 ${simLogs.filter(l => l.kind === 'handover').length}건`} />
+        </div>
+      )}
+
+      {/* ── primary finding banner ── */}
+      {seed?.primary_finding && (
+        <div style={{ padding: '12px 16px', background: 'var(--brand-tint)', borderRadius: 10, marginBottom: 16, fontSize: 13, lineHeight: 1.55, border: '1px solid var(--brand-tint2)' }}>
+          <b style={{ marginRight: 8, color: 'var(--brand-2)' }}>핵심 발견</b>{seed.primary_finding}
+        </div>
+      )}
+
+      {/* ── KPI grid ── */}
+      <Card title="핵심 지표" en="Key metrics" style={{ marginBottom: 16 }}>
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+          <Stat label="총 비용"      icon="chart"  value={fmt2(rs?.total_cost)}        accent />
+          <Stat label="평균 지연"    icon="speed"  value={fmtMs(rs?.avg_latency_ms)}   sub={`최대 ${fmtMs(rs?.max_latency_ms)}`} />
+          <Stat label="핸드오버"     icon="route"  value={rs?.handover_count ?? '—'}  unit="회" />
+          <Stat label="PRR (근사)"   icon="check"  value={rs?.prr_approx != null ? (rs.prr_approx * 100).toFixed(1) + '%' : '—'} sub="시간가중 연결유지율" />
+        </div>
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginTop: 12 }}>
+          <Stat label="이동 거리"    icon="route"  value={fmtKm(rs?.total_distance_m)}  sub={rs?.total_travel_time_s != null ? `${fmt1(rs.total_travel_time_s)} s` : ''} />
+          <Stat label="미커버 비율" icon="warn"   value={rs?.coverage_risk != null ? (rs.coverage_risk * 100).toFixed(1) + '%' : '—'} sub="단절 위험" />
+          <Stat label="커버리지"     icon="check"  value={rs?.covered_pct != null ? (rs.covered_pct * 100).toFixed(1) + '%' : '—'} />
+          <Stat label="BS 부하 결손" icon="sliders" value={rs?.resource_deficit_cost != null ? fmt2(rs.resource_deficit_cost) : '—'} />
+        </div>
+        {(rs?.hit_total_ms != null || rs?.cbr_avg != null || rs?.urllc_compliance_ratio != null) && (
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginTop: 12 }}>
+            <Stat label="HIT 합산" icon="route"
+              value={rs?.hit_total_ms != null ? rs.hit_total_ms + ' ms' : '—'}
+              sub="핸드오버 중단 시간 (IEEE 2023)" />
+            <Stat label="CBR 평균" icon="speed"
+              value={rs?.cbr_avg != null ? (rs.cbr_avg * 100).toFixed(1) + '%' : '—'}
+              tone={rs?.cbr_avg > 0.65 ? 'bad' : 'good'}
+              sub="채널 점유율 (임계 65%)" />
+            <Stat label="URLLC 준수율" icon="check"
+              value={rs?.urllc_compliance_ratio != null ? (rs.urllc_compliance_ratio * 100).toFixed(1) + '%' : '—'}
+              sub="P(L ≤ 10 ms) · 3GPP TS 22.261" />
+            <Stat label="PIR P99" icon="speed"
+              value={rs?.pir_p99_ms != null ? fmtMs(rs.pir_p99_ms) : '—'}
+              tone={rs?.pir_compliant === false ? 'bad' : 'good'}
+              sub="3GPP TR 37.885 (≤100 ms)" />
+          </div>
+        )}
+      </Card>
+
+      {/* ── algorithm identity + improvement ── */}
+      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        <Card title="알고리즘" en="Algorithm">
+          <div className="col gap8" style={{ fontSize: 12.5 }}>
+            <div className="row between">
+              <span className="muted">선택 알고리즘</span>
+              <span style={{ fontWeight: 700 }}>{algoLabel(rs?.selected_algorithm)}</span>
+            </div>
+            <div className="row between">
+              <span className="muted">기준 알고리즘</span>
+              <span>{algoLabel(rs?.baseline_algorithm)}</span>
+            </div>
+            <div className="row between">
+              <span className="muted">네트워크 모드</span>
+              <Chip tone="brand">{rs?.network_mode ?? '—'}</Chip>
+            </div>
+            <div className="row between">
+              <span className="muted">시뮬레이션 모드</span>
+              <Chip>{rs?.sim_mode ?? '—'}</Chip>
+            </div>
+          </div>
+        </Card>
+
+        <Card title="기준 대비 개선" en="vs Baseline">
+          {!imp ? (
+            <div className="muted" style={{ fontSize: 12, padding: '8px 0' }}>알고리즘 비교 데이터 없음</div>
+          ) : (
+            <div className="col gap8" style={{ fontSize: 12.5 }}>
+              <div className="row between">
+                <span className="muted">비용 개선</span>
+                <DeltaBadge value={imp.cost_improvement_pct} unit="%" lowerBetter={false} digits={1} />
+              </div>
+              <div className="row between">
+                <span className="muted">지연 변화</span>
+                <DeltaBadge value={imp.latency_delta_ms} unit=" ms" lowerBetter={true} digits={1} />
+              </div>
+              <div className="row between">
+                <span className="muted">거리 변화</span>
+                <DeltaBadge value={imp.distance_delta_m} unit=" m" lowerBetter={true} digits={0} />
+              </div>
+              <div className="row between">
+                <span className="muted">핸드오버 변화</span>
+                <DeltaBadge value={imp.handover_delta} unit="회" lowerBetter={true} digits={0} />
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* ── Chart 6: improvement-over-baseline delta bars ── */}
+      {imp && imp.cost_improvement_pct != null && (
+        <Card title="선택 알고리즘 vs 기준선 — 변화 비교" en="Δ vs baseline" style={{ marginBottom: 16 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+            선택 알고리즘 성능에서 기준 알고리즘 성능을 뺀 차이값. 초록 막대 = 개선, 빨간 막대 = 악화.
+            기준 알고리즘: <b>{algoLabel(rs?.baseline_algorithm)}</b>
+          </div>
+          <DeltaBarChart deltas={[
+            { label: '비용 개선%',  value: imp.cost_improvement_pct ?? 0,         unit: '%',  lowerBetter: false, digits: 1 },
+            { label: '지연 변화',   value: imp.latency_delta_ms ?? 0,              unit: ' ms', lowerBetter: true,  digits: 1 },
+            { label: '거리 변화',   value: (imp.distance_delta_m ?? 0) / 1000,     unit: ' km', lowerBetter: true,  digits: 2 },
+            { label: '핸드오버',    value: imp.handover_delta ?? 0,                unit: '회',  lowerBetter: true,  digits: 0 },
+          ]} />
+        </Card>
+      )}
+
+      {/* ── trade-offs + risk factors ── */}
+      {seed && (seed.trade_offs?.length > 0 || seed.risk_factors?.length > 0 || seed.improvement_highlights?.length > 0) && (
+        <Card title="주요 발견 사항" en="Key findings" style={{ marginBottom: 16 }}>
+          <div className="grid" style={{ gridTemplateColumns: '1fr 1fr 1fr', gap: 14 }}>
+            {seed.improvement_highlights?.length > 0 && (
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 11.5, marginBottom: 6, color: 'var(--good)' }}>개선 사항</div>
+                <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11.5, lineHeight: 1.7, listStyle: 'disc' }}>
+                  {seed.improvement_highlights.map((t, i) => <li key={i}>{t}</li>)}
+                </ul>
+              </div>
+            )}
+            {seed.trade_offs?.length > 0 && (
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 11.5, marginBottom: 6 }}>트레이드오프</div>
+                <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11.5, lineHeight: 1.7, listStyle: 'disc' }}>
+                  {seed.trade_offs.map((t, i) => <li key={i}>{t}</li>)}
+                </ul>
+              </div>
+            )}
+            {seed.risk_factors?.length > 0 && (
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 11.5, marginBottom: 6, color: 'var(--bad)' }}>위험 요인</div>
+                <ul style={{ margin: 0, paddingLeft: 16, fontSize: 11.5, lineHeight: 1.7, listStyle: 'disc', color: 'var(--bad)' }}>
+                  {seed.risk_factors.map((t, i) => <li key={i}>{t}</li>)}
+                </ul>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+    </>
+  );
+}
+
+// ── Compare section ────────────────────────────────────────────────────────
+
+const CMP_COLS = [
+  { key: 'total_cost',                          label: '총 비용',      fmt: v => Number(v).toFixed(2),                  lowerBetter: true  },
+  { key: 'average_latency_ms',                  label: '평균 지연',    fmt: v => Number(v).toFixed(1) + 'ms',           lowerBetter: true  },
+  { key: 'max_latency_ms',                      label: '최대 지연',    fmt: v => Number(v).toFixed(1) + 'ms',           lowerBetter: true  },
+  { key: 'handover_count',                      label: '핸드오버',     fmt: v => v + '회',                              lowerBetter: true  },
+  { key: 'disconnection_ratio',                 label: '단절율',       fmt: v => (Number(v) * 100).toFixed(0) + '%',    lowerBetter: true  },
+  { key: 'prr_approx',                          label: 'PRR(근사)',    fmt: v => (Number(v) * 100).toFixed(1) + '%',    lowerBetter: false },
+  { key: 'average_bs_load',                     label: 'BS 부하',     fmt: v => (Number(v) * 100).toFixed(0) + '%',    lowerBetter: true  },
+  { key: 'future_connectivity_risk',            label: '미래 위험',    fmt: v => (Number(v) * 100).toFixed(0) + '%',    lowerBetter: true  },
+  { key: 'resource_deficit_ratio',              label: '자원 결손',    fmt: v => (Number(v) * 100).toFixed(0) + '%',    lowerBetter: true  },
+  { key: 'edge_count',                          label: '구간 수',      fmt: v => v + '개',                              lowerBetter: null  },
+];
+
+function SectionCompare({ bundle, routeCoords, routeEdges, networkTelemetry, vehiclePos, simHistory, simConfig, mode }) {
+  const [cmp,        setCmp]        = useState(null);
+  const [cmpLoading, setCmpLoading] = useState(false);
   const [kCandidates, setKCandidates] = useState(null);
   const [visibleRanks, setVisibleRanks] = useState({});
+  const [history,    setHistory]    = useState(() => loadRunHistory());
+  const [checkedRuns, setCheckedRuns] = useState([]);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [routeEval,  setRouteEval]  = useState(null);
+  const [showAllCols, setShowAllCols] = useState(false);
+  const cmpPollRef = useRef(null);
+
+  const hasRoute = routeCoords?.length >= 2;
+
+  // fetch k-path candidates once route is ready
   useEffect(() => {
     if (!hasRoute) return;
-    let stopped = false;
-    let tries = 0;
+    let stopped = false, tries = 0;
     const tryFetch = () => {
-      fetch('http://127.0.0.1:8001/api/route/candidates')
+      fetch(`${API_BASE}/api/route/candidates`)
         .then(r => r.json())
         .then(data => {
           if (stopped) return;
           if (data?.available) {
             setKCandidates(data);
             setVisibleRanks(Object.fromEntries((data.candidates || []).map(c => [c.rank, true])));
-          } else if (tries++ < 8) {
-            setTimeout(tryFetch, 2000);
-          }
-        })
-        .catch(() => {});
+          } else if (tries++ < 8) setTimeout(tryFetch, 2000);
+        }).catch(() => {});
     };
     tryFetch();
     return () => { stopped = true; };
   }, [hasRoute, routeCoords]);
 
-  const currentEdgeId = vehiclePos?.current_edge_id ?? null;
-  const edgeNames = networkTelemetry?.route_edge_names ?? routeEdges?.edge_names ?? {};
-  const perEdge = routeEdges?.per_edge ?? [];
-
-  // Convert routeCoords [[lat,lng],...] for MiniMap (already correct format)
-  const livePath = hasRoute ? routeCoords : null;
-
-  // Base stations for map overlay from candidates
-  const bsPoints = (networkTelemetry?.candidate_nodes ?? [])
-    .filter(c => c.lat != null && c.lng != null)
-    .map(c => ({ lat: c.lat, lng: c.lng }));
-
-  // K-path 대안 — 보이기로 체크된 것만 지도에 겹쳐 그림
-  const kCandidateList = kCandidates?.candidates ?? [];
-  const altPaths = kCandidateList
-    .filter(c => visibleRanks[c.rank] && (c.per_edge?.length ?? 0) >= 2)
-    .map(c => ({
-      path: c.per_edge.map(e => [e.midpoint_lat, e.midpoint_lng]),
-      color: ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length],
-      rank: c.rank,
-    }));
-
-  /* ====== ported from tab-comparison.jsx — 알고리즘 비교 ====== */
-  const [metrics, setMetrics] = useState(null);
-  const [cmpLoading, setCmpLoading] = useState(false);
-  const [cmpError, setCmpError] = useState(null);
-  const [history, setHistory] = useState(() => loadRunHistory());
-  const [checkedRuns, setCheckedRuns] = useState([]);
-  const [savedFlash, setSavedFlash] = useState(false);
-  const [routeEval, setRouteEval] = useState(null);
-  const [cmp, setCmp] = useState(null);
-
-  /* ====== 시나리오 배치 비교 (Phase 3/4) ====== */
-  const [scenarioBatches, setScenarioBatches] = useState(() => loadScenarioBatches());
-  const [selectedBatch, setSelectedBatch] = useState(0); // index into reversed(most-recent-first) list
-
-  /* ====== 배치 비교 AI 분석 (Phase 6) — 단일 실행용 runAI()와 별개 ====== */
-  const [batchAiLoading, setBatchAiLoading] = useState(false);
-  const [batchAiError, setBatchAiError] = useState(null);
-  const [batchAiSections, setBatchAiSections] = useState([]);
-  const [batchAiProvider, setBatchAiProvider] = useState(null);
-  const [batchAiRevealed, setBatchAiRevealed] = useState(0);
-
-  async function runBatchAnalysis(batch) {
-    setBatchAiLoading(true); setBatchAiError(null); setBatchAiSections([]); setBatchAiRevealed(0); setBatchAiProvider(null);
-    try {
-      const res = await fetch('http://127.0.0.1:8001/api/analysis/llm/batch-compare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: batch.label, results: batch.results, provider: selectedProvider || null }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || res.statusText);
-      const sections = data.sections || [];
-      setBatchAiSections(sections);
-      setBatchAiProvider(data.provider || null);
-      setBatchAiLoading(false);
-      sections.forEach((_, i) => setTimeout(() => setBatchAiRevealed(i + 1), i * 450));
-    } catch (e) {
-      setBatchAiLoading(false);
-      setBatchAiError(e.message || '배치 비교 분석 중 오류가 발생했습니다.');
-    }
-  }
-
-  /* ====== 팀 공유 실행 기록 — DB 연동 (Phase 0.5/4) ====== */
-  const [dbRuns, setDbRuns] = useState([]);
-  const [dbRunsAvailable, setDbRunsAvailable] = useState(null); // null=확인중, true/false
-  const [dbRunsError, setDbRunsError] = useState(null);
-
   useEffect(() => {
-    fetch('http://127.0.0.1:8001/api/simulation/runs?limit=20')
-      .then(r => r.json())
-      .then(data => {
-        setDbRunsAvailable(!!data.available);
-        setDbRuns(data.runs || []);
-        if (!data.available) setDbRunsError(data.reason || null);
-      })
-      .catch(e => { setDbRunsAvailable(false); setDbRunsError(e.message || 'DB 실행 기록을 불러오지 못했습니다.'); });
-  }, []);
-  const cmpPollRef = useRef(null);
-
-  function fetchMetrics() {
-    setCmpLoading(true); setCmpError(null);
-    fetch('http://127.0.0.1:8001/api/route/metrics')
-      .then(r => r.json())
-      .then(data => { setMetrics(data); setCmpLoading(false); })
-      .catch(e => { setCmpError(e.message || '불러오기 실패'); setCmpLoading(false); });
-    fetch('http://127.0.0.1:8001/api/route/evaluate')
-      .then(r => r.json())
-      .then(data => setRouteEval(data?.available ? data : null))
-      .catch(() => {});
-  }
-  useEffect(() => { fetchMetrics(); }, []);
-
-  // algo key("k_path_rank_2" 또는 baseline routing_mode)로 해당 후보의 도로명 시퀀스 조회
-  function streetNamesFor(algo) {
-    const m = /^k_path_rank_(\d+)$/.exec(algo || '');
-    if (m) {
-      const idx = parseInt(m[1], 10);
-      return kCandidates?.candidates?.[idx]?.street_names || null;
-    }
-    return routeEval?.street_names || null;
-  }
-
-  function pollCmp() {
-    fetch('http://127.0.0.1:8001/api/route/compare-algorithms')
-      .then(r => r.json())
-      .then(data => {
-        setCmp(data);
-        if (data.status !== 'running' && cmpPollRef.current) {
-          clearInterval(cmpPollRef.current);
-          cmpPollRef.current = null;
-        }
-      })
-      .catch(() => {});
-  }
-  useEffect(() => {
+    fetch(`${API_BASE}/api/route/evaluate`).then(r => r.json()).then(d => setRouteEval(d?.available ? d : null)).catch(() => {});
     pollCmp();
     return () => { if (cmpPollRef.current) clearInterval(cmpPollRef.current); };
   }, []);
+
+  function pollCmp() {
+    fetch(`${API_BASE}/api/route/compare-algorithms`).then(r => r.json()).then(data => {
+      setCmp(data);
+      if (data.status !== 'running' && cmpPollRef.current) { clearInterval(cmpPollRef.current); cmpPollRef.current = null; }
+    }).catch(() => {});
+  }
   function runComparison() {
-    fetch('http://127.0.0.1:8001/api/route/compare-algorithms', { method: 'POST' })
-      .then(r => r.json())
-      .then(() => {
-        setCmp({ status: 'running' });
-        if (cmpPollRef.current) clearInterval(cmpPollRef.current);
-        cmpPollRef.current = setInterval(pollCmp, 2000);
-      })
+    fetch(`${API_BASE}/api/route/compare-algorithms`, { method: 'POST' })
+      .then(() => { setCmp({ status: 'running' }); if (cmpPollRef.current) clearInterval(cmpPollRef.current); cmpPollRef.current = setInterval(pollCmp, 2000); })
       .catch(() => {});
   }
 
-  // PRR(연결 유지율) 근사치 — 패킷 단위 시뮬레이션이 없어 실측 PRR은 계산할 수 없으므로,
-  // time_weighted_disconnection_ratio(구간 길이가 아니라 각 구간의 "이동 시간"으로 가중한
-  // 단절 비율)의 보수(1 - 비율)를 근사치로 쓴다 — edge 개수로 단순 평균하면 짧은 구간과 긴
-  // 고속도로 구간이 똑같이 취급되어 왜곡되므로, 시간 가중이 "연결 유지 시간 비율"에 더 가깝다.
-  // (구버전 백엔드 호환을 위해 필드가 없으면 disconnection_ratio로 폴백)
-  const algorithmsRaw = metrics?.available ? metrics.algorithms : {};
-  const algorithms = Object.fromEntries(Object.entries(algorithmsRaw).map(([k, v]) => {
-    const discRatio = v.time_weighted_disconnection_ratio ?? v.disconnection_ratio;
-    return [k, { ...v, prr_approx: discRatio != null ? 1 - discRatio : null }];
-  }));
-  const algoEntries = Object.entries(algorithms);
-  const comparison = metrics?.available ? metrics.comparison : null;
-  const bestPerMetric = comparison?.best_per_metric || {};
-  const summaryRank = comparison?.summary_rank || {};
-
-  const sortedByCost = [...algoEntries].sort((a, b) => (a[1].total_cost ?? Infinity) - (b[1].total_cost ?? Infinity));
-  const rankItems = Object.entries(summaryRank)
-    .sort((a, b) => a[1] - b[1])
-    .map(([algo, score]) => ({ label: algo, value: score, display: score.toFixed(2) }));
-
+  function streetNamesFor(algo) {
+    const m = /^k_path_rank_(\d+)$/.exec(algo || '');
+    if (m) return kCandidates?.candidates?.[parseInt(m[1], 10)]?.street_names || null;
+    return routeEval?.street_names || null;
+  }
   function saveCurrentRun() {
-    if (!algoEntries.length) return;
-    const entry = {
-      timestamp: new Date().toISOString(),
-      config: simConfig ?? null,
-      algorithms,
-    };
+    if (!bundle?.algorithm_compare?.length) return;
+    const entry = { timestamp: new Date().toISOString(), config: simConfig ?? null, algorithms: Object.fromEntries((bundle.algorithm_compare || []).map(r => [r.algorithm, r])) };
     const next = [...history, entry];
-    setHistory(next);
-    saveRunHistory(next);
-    setSavedFlash(true);
-    setTimeout(() => setSavedFlash(false), 1800);
+    setHistory(next); saveRunHistory(next); setSavedFlash(true); setTimeout(() => setSavedFlash(false), 1800);
   }
-  function removeRun(idx) {
-    const next = history.filter((_, i) => i !== idx);
-    setHistory(next);
-    saveRunHistory(next);
-    setCheckedRuns(checkedRuns.filter(i => i !== idx));
-  }
-  function toggleCheck(idx) {
-    setCheckedRuns(prev => prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx].slice(-3));
-  }
-  const selectedRuns = checkedRuns.map(i => history[i]).filter(Boolean);
+  function removeRun(idx) { const next = history.filter((_, i) => i !== idx); setHistory(next); saveRunHistory(next); setCheckedRuns(checkedRuns.filter(i => i !== idx)); }
 
-  const reversedBatches = [...scenarioBatches].reverse(); // 최신 배치가 먼저 보이게
-  const currentBatch = reversedBatches[selectedBatch] || null;
-  useEffect(() => { setBatchAiSections([]); setBatchAiError(null); setBatchAiRevealed(0); }, [selectedBatch]);
-  function removeBatch(reversedIdx) {
-    const origIdx = scenarioBatches.length - 1 - reversedIdx;
-    const next = scenarioBatches.filter((_, i) => i !== origIdx);
-    setScenarioBatches(next);
-    saveScenarioBatches(next);
-    setSelectedBatch(0);
-  }
+  const algoRows   = bundle?.algorithm_compare || [];
+  const comparison = bundle?.simulation_summary?.metric_summary?.comparison;
+  const bestPer    = comparison?.best_per_metric || {};
+  const summRank   = comparison?.summary_rank    || {};
+  const rankItems  = Object.entries(summRank).sort((a, b) => a[1] - b[1]).map(([a, s]) => ({ label: algoLabel(a), value: s, display: s.toFixed(2) }));
 
-  async function runAI() {
-    setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]); setUsedProvider(null);
-    try {
-      const payload = {
-        sim_elapsed: sim?.elapsed ?? 0,
-        vehicle_pos: vehiclePos ?? null,
-        edge_history: networkTelemetry?.edge_history ?? [],
-        edge_avg_speeds: networkTelemetry?.edge_avg_speeds ?? {},
-        route_edge_names: networkTelemetry?.route_edge_names ?? {},
-        sim_logs: simLogs ?? [],
-        algorithm: networkTelemetry?.routing_mode ?? null,
-        handover_count: (simLogs ?? []).filter(l => l.kind === 'handover').length,
-        latency_ms: networkTelemetry?.ego_vehicle?.current_latency_ms
-          ?? networkTelemetry?.latency_ms ?? null,
-        connected_node: networkTelemetry?.ego_vehicle?.connected_network_node_name
-          ?? networkTelemetry?.connected_node?.name ?? null,
-        provider: selectedProvider || null,
-      };
-      const res = await fetch('http://127.0.0.1:8001/api/analysis/llm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || res.statusText);
-      }
-      const data = await res.json();
-      const sections = data.sections || [];
-      setLlmResult(sections);
-      setUsedProvider(data.provider || null);
-      setAnalyzing(false);
-      sections.forEach((_, i) => setTimeout(() => setRevealed(i + 1), i * 450));
-    } catch (e) {
-      setAnalyzing(false);
-      setLlmError(e.message || 'AI 분석 중 오류가 발생했습니다.');
-    }
-  }
+  const kList = kCandidates?.candidates ?? [];
+  const altPaths = kList.filter(c => visibleRanks[c.rank] && c.per_edge?.length >= 2).map(c => ({
+    path: c.per_edge.map(e => [e.midpoint_lat, e.midpoint_lng]),
+    color: ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length], rank: c.rank,
+  }));
+  const bsPoints  = (networkTelemetry?.candidate_nodes ?? []).filter(c => c.lat != null).map(c => ({ lat: c.lat, lng: c.lng }));
+  const perEdge   = routeEdges?.per_edge ?? [];
+  const edgeNames = networkTelemetry?.route_edge_names ?? routeEdges?.edge_names ?? {};
+  const curEdgeId = vehiclePos?.current_edge_id ?? null;
 
-  function exportCSV() {
-    let csv;
-    if (hasLiveLogs && vehiclePos) {
-      const header = ['시각', '차량ID', '위치', '속도', '진행률', '연결기지국', 'Latency', '이벤트'];
-      const rows = [
-        [fmtClock(sim.elapsed), 'EGO-001',
-         `"${vehiclePos.lat.toFixed(5)},${vehiclePos.lng.toFixed(5)}"`,
-         (vehiclePos.speed ?? 0).toFixed(1),
-         ((vehiclePos.progress ?? 0) * 100).toFixed(0) + '%',
-         connNode,
-         latency !== null ? latency.toFixed(1) : '—',
-         vehiclePos.arrived ? '도착' : '이동 중'],
-      ];
-      const logRows = simLogs.map(l => [l.t, l.target, '—', '—', '—', '—', '—', l.ko]);
-      csv = [header.join(','), ...rows.map(r => r.join(',')), ...logRows.map(r => r.join(','))].join('\n');
-    } else {
-      const header = ['시각', '차량ID', '위치', '속도', '현재엣지', '연결기지국', 'Latency', '이벤트'];
-      csv = header.join(',');
-    }
-    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = hasLiveLogs ? `v2x_live_${fmtClock(sim.elapsed).replace(/:/g, '')}.csv` : 'v2x_simulation_log.csv';
-    a.click();
-    setExported(true); setTimeout(() => setExported(false), 2200);
-  }
+  const checkedSelected = checkedRuns.map(i => history[i]).filter(Boolean);
 
-  const [jsonExported, setJsonExported] = useState(false);
-  function exportJSON() {
-    // CSV(exportCSV)는 실시간 스냅샷 1행 + 로그뿐 — 원시 시계열/배치 데이터를 그대로 보존해
-    // 외부 도구(노트북, R, Excel 피벗 등)에서 재분석하려는 대학원생 수요를 위해 전체를 묶어 내보낸다.
-    const payload = {
-      exported_at: new Date().toISOString(),
-      sim_elapsed_s: sim?.elapsed ?? 0,
-      vehicle_pos: vehiclePos ?? null,
-      sim_history: simHistory ?? [],
-      sim_logs: simLogs ?? [],
-      route_edges: routeEdges ?? null,
-      network_telemetry: networkTelemetry ?? null,
-      route_metrics: metrics?.available ? metrics : null,
-      algorithm_compare: cmp ?? null,
-      scenario_batches: scenarioBatches ?? [],
-      sim_config: simConfig ?? null,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `v2x_full_export_${fmtClock(sim?.elapsed ?? 0).replace(/:/g, '')}.json`;
-    a.click();
-    setJsonExported(true); setTimeout(() => setJsonExported(false), 2200);
-  }
-
-  const seed = summary?.available ? summary.recommendation_text_seed : null;
+  // latency percentiles
+  const liveSamples = (simHistory || []).map(h => h.latency).filter(v => v != null);
+  const useLive = liveSamples.length >= 10;
+  const pSamples = useLive ? liveSamples : perEdge.map(e => e.latency_ms || 0);
+  const pSorted  = [...pSamples].sort((a, b) => a - b);
 
   return (
-    <div className="page-pad fade">
-      <div className="page-head">
-        <div>
-          <div className="eyebrow">Post-run Report</div>
-          <h1>분석 보고서 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Report</span></h1>
-          <div className="sub">구조화 요약 · 시뮬레이션 로그 · LLM 자연어 요약 · CSV 내보내기</div>
-        </div>
-        <div className="row gap8">
-          {hasLiveLogs && <Chip tone="good" dot>LIVE</Chip>}
-          <button className={'btn ' + (exported ? 'good' : 'accent')} onClick={exportCSV}>
-            {exported ? <><Icon.check size={15} /> 저장됨</> : <><Icon.download size={15} /> CSV로 내보내기</>}
-          </button>
-          {mode === 'pro' && (
-            <button className={'btn ' + (jsonExported ? 'good' : '')} onClick={exportJSON} title="시계열·배치·비교 원시 데이터를 통째로 JSON으로 내보냅니다">
-              {jsonExported ? <><Icon.check size={15} /> 저장됨</> : <><Icon.download size={15} /> 전체 JSON 다운로드</>}
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* ── 구조화 요약 ─────────────────────────────── */}
-      <Card title="구조화 요약" en="Structured summary" right={
-        <button className="btn sm" onClick={fetchSummary}><Icon.reset size={13} /> 새로고침</button>
-      } style={{ marginBottom: 18 }}>
-        {summaryLoading && <div className="muted" style={{ padding: 16, fontSize: 12 }}>불러오는 중…</div>}
-        {!summaryLoading && !summary?.available && (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>{summary?.reason || '시뮬레이션을 먼저 실행하세요.'}</div>
-        )}
-        {!summaryLoading && summary?.available && (
-          <>
-            {seed?.primary_finding && (
-              <div style={{ padding: '12px 14px', background: 'var(--brand-tint)', borderRadius: 9, marginBottom: 14, fontSize: 12.5, lineHeight: 1.5 }}>
-                <b style={{ marginRight: 6 }}>핵심 발견:</b>{seed.primary_finding}
-              </div>
-            )}
-            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-              <ReportSectionList title="병목 구간" items={summary.bottleneck_sections} render={it => (
-                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span>{it.severity && <Chip tone="warn">{it.severity}</Chip>}</>
-              )} />
-              <ReportSectionList title="과부하 기지국" items={summary.overloaded_base_stations} render={it => (
-                <><span className="mono" style={{ fontWeight: 600 }}>{it.bs_name}</span><span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span></>
-              )} />
-              <ReportSectionList title="빈번한 핸드오버 구간" items={summary.frequent_handover_sections} render={it => (
-                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">{it.from_bs_name} → {it.to_bs_name}</span></>
-              )} />
-              <ReportSectionList title="고지연 구간" items={summary.high_latency_sections} render={it => (
-                <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span><span className="muted">{(it.latency_ms ?? 0).toFixed(1)}ms (+{(it.excess_ms ?? 0).toFixed(1)}ms)</span></>
-              )} />
-            </div>
-            <ReportSectionList title="미래 연결 위험 구간" items={summary.future_connectivity_risk_sections} render={it => (
-              <><span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>{it.severity && <Chip tone="bad">{it.severity}</Chip>}</>
-            )} />
-            {seed && (seed.risk_factors?.length > 0 || seed.improvement_highlights?.length > 0) && (
-              <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14, marginTop: 4 }}>
-                {seed.improvement_highlights?.length > 0 && (
-                  <div>
-                    <b style={{ fontSize: 12 }}>개선 사항</b>
-                    <ul style={{ margin: '6px 0 0 16px', fontSize: 11.5, lineHeight: 1.6 }}>
-                      {seed.improvement_highlights.map((t, i) => <li key={i}>{t}</li>)}
-                    </ul>
-                  </div>
-                )}
-                {seed.risk_factors?.length > 0 && (
-                  <div>
-                    <b style={{ fontSize: 12 }}>위험 요인</b>
-                    <ul style={{ margin: '6px 0 0 16px', fontSize: 11.5, lineHeight: 1.6, color: 'var(--bad)' }}>
-                      {seed.risk_factors.map((t, i) => <li key={i}>{t}</li>)}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
-          </>
-        )}
-      </Card>
-
-      {hasLiveLogs && vehiclePos && (
-        <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', marginBottom: 18 }}>
-          <Stat label="경과 시간" icon="clock" value={fmtClock(sim.elapsed)} sub="시뮬레이션 시작 후" accent />
-          <Stat label="현재 속도" icon="speed" value={(vehiclePos.speed ?? 0).toFixed(1)} unit="km/h" sub="EGO-001" />
-          <Stat label="연결 기지국" icon="antenna" value={connNode} sub={latency !== null ? `Latency ${latency.toFixed(1)}ms` : '—'} />
-          <Stat label="이벤트 수" icon="chart" value={simLogs.length} unit="건" sub={`핸드오버 ${simLogs.filter(l => l.kind === 'handover').length}건`} />
-        </div>
-      )}
-
-      <div className="row gap8" style={{ marginBottom: 18 }}>
-        <Seg value={subTab} onChange={setSubTab} options={
-          mode === 'pro'
-            ? [{ v: 'compare', label: '경로·알고리즘 비교' }, { v: 'batch', label: '시나리오 배치 비교' }, { v: 'logs', label: '로그·AI분석' }]
-            : [{ v: 'logs', label: '로그·AI분석' }]
-        } />
-      </div>
-
-      {subTab === 'compare' && mode === 'pro' && <>
-      {/* ════════════════════════════════════════════════════
-          최적 경로 비교 (ported from tab-routes.jsx)
-          ════════════════════════════════════════════════════ */}
-      <div style={{ margin: '8px 0 14px' }}>
-        <div className="eyebrow">Path Comparison</div>
-        <h2 style={{ fontSize: 17, fontWeight: 700, margin: '4px 0 2px' }}>
-          최적 경로 비교 <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>Routes</span>
-        </h2>
-        <div className="sub" style={{ fontSize: 12 }}>
-          {hasRoute ? '실시간 SUMO 경로 vs 대안 경로(K-path)' : '시뮬레이션 실행 후 실제 경로와 대안 경로를 비교합니다'}
-        </div>
-      </div>
-
+    <>
+      {/* ── K-path map ── */}
       {hasRoute ? (
-        <>
-          <Card title="실시간 경로" en="Live SUMO route" right={<Chip tone="good" dot>실시간</Chip>} style={{ marginBottom: 18 }}>
-            <MiniMap path={livePath} color="var(--brand-2)" bs={bsPoints} label="live" height={210} extraPaths={altPaths} />
-            <div className="row gap16" style={{ marginTop: 12, fontSize: 11, flexWrap: 'wrap' }}>
-              <span className="row gap8"><span style={{ width: 16, height: 3, background: 'var(--brand-2)', borderRadius: 2 }} /> 실제 경로</span>
-              {connNode !== '--' && <span className="row gap8"><span style={{ width: 10, height: 10, borderRadius: '50%', background: 'var(--brand-2)' }} /> {connNode}</span>}
-              {latency !== null && <span className="row gap8" style={{ marginLeft: 'auto' }}>평균 <span className="num" style={{ fontWeight: 600 }}>{latency.toFixed(1)}</span>ms</span>}
+        <Card title="실시간 경로" en="Route map" right={<Chip tone="good" dot>실시간</Chip>} style={{ marginBottom: 16 }}>
+          <MiniMap path={routeCoords} color="var(--brand-2)" bs={bsPoints} label="live" height={200} extraPaths={altPaths} />
+          {kList.length > 0 && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+              <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>경로 대안(K-path) — 체크 해제 시 지도에서 숨김</div>
+              <div className="col gap5">
+                {kList.map(c => {
+                  const names = c.street_names || [];
+                  const shown = names.length > 3 ? [...names.slice(0, 2), '…', names[names.length - 1]] : names;
+                  return (
+                    <label key={c.rank} className="row gap8" style={{ fontSize: 10.5, cursor: 'pointer', alignItems: 'center' }}>
+                      <input type="checkbox" checked={!!visibleRanks[c.rank]} onChange={() => setVisibleRanks(p => ({ ...p, [c.rank]: !p[c.rank] }))} />
+                      <span style={{ width: 14, height: 3, background: ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length], borderRadius: 2, flexShrink: 0 }} />
+                      <span style={{ fontWeight: 600 }}>대안 {c.rank + 1}</span>
+                      <span className="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{shown.join(' → ')}</span>
+                      <span className="num muted" style={{ marginLeft: 'auto', flexShrink: 0 }}>{c.avg_latency_ms?.toFixed(1)} ms</span>
+                    </label>
+                  );
+                })}
+              </div>
             </div>
-            {kCandidateList.length > 0 && (
-              <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
-                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>
-                  경로 대안(K-path) — 점선으로 지도에 겹쳐 표시, 체크 해제 시 숨김
-                </div>
-                <div className="col gap6">
-                  {kCandidateList.map(c => {
-                    const names = c.street_names || [];
-                    const summary = names.length > 3
-                      ? `${names.slice(0, 2).join(' → ')} → … → ${names[names.length - 1]}`
-                      : names.join(' → ');
-                    const color = ALT_PATH_COLORS[c.rank % ALT_PATH_COLORS.length];
-                    return (
-                      <label key={c.rank} className="row gap8" style={{ fontSize: 10.5, cursor: 'pointer', alignItems: 'center' }}>
-                        <input
-                          type="checkbox"
-                          checked={!!visibleRanks[c.rank]}
-                          onChange={() => setVisibleRanks(prev => ({ ...prev, [c.rank]: !prev[c.rank] }))}
-                        />
-                        <span style={{ width: 14, height: 3, background: color, borderRadius: 2, flex: '0 0 auto' }} />
-                        <span style={{ flex: '0 0 auto', fontWeight: 600 }}>대안 {c.rank + 1}</span>
-                        <span className="muted" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{summary}</span>
-                        <span className="num muted" style={{ marginLeft: 'auto', flex: '0 0 auto' }}>{c.avg_latency_ms?.toFixed(1)}ms</span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </Card>
-
-          {perEdge.length > 0 && (
-            <Card title="구간별 비용 분해" en="Edge cost breakdown" right={<Chip>{perEdge.length}개 구간</Chip>} style={{ marginBottom: 18 }}>
-              <div className="tbl-wrap">
-                <table className="tbl">
-                  <thead>
-                    <tr>
-                      <th>구간</th>
-                      <th className="r">거리</th>
-                      <th className="r">Latency</th>
-                      <th className="r">부하율</th>
-                      <th className="r">총 비용</th>
-                      <th>커버리지</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {perEdge.map((e, i) => {
-                      const isCurrent = e.edge_id === currentEdgeId;
-                      const name = e.best_node_name || edgeNames[e.edge_id] || e.edge_id;
-                      return (
-                        <tr key={e.edge_id || i} style={isCurrent ? { background: 'var(--brand-tint)', fontWeight: 500 } : {}}>
-                          <td>
-                            <span className="mono" style={{ fontSize: 11.5 }}>{name}</span>
-                            {isCurrent && <span className="chip" style={{ marginLeft: 6, fontSize: 9, background: 'var(--brand)', color: '#fff' }}>현재</span>}
-                          </td>
-                          <td className="r"><span className="num">{e.distance_m != null ? e.distance_m.toFixed(0) : '—'}</span><span className="muted" style={{ fontSize: 10 }}> m</span></td>
-                          <td className="r"><span className="num" style={{ color: `var(--${latencyTone(e.latency_ms || 0)})`, fontWeight: 600 }}>{(e.latency_ms || 0).toFixed(1)}</span><span className="muted" style={{ fontSize: 10 }}> ms</span></td>
-                          <td className="r">
-                            <div className="row gap8" style={{ justifyContent: 'flex-end' }}>
-                              <div className="pbar" style={{ width: 44 }}><i style={{ width: `${Math.min((e.load_ratio || 0) * 100, 100)}%`, background: 'var(--brand-2)' }} /></div>
-                              <span className="num" style={{ fontSize: 11 }}>{((e.load_ratio || 0) * 100).toFixed(0)}%</span>
-                            </div>
-                          </td>
-                          <td className="r"><span className="num" style={{ fontWeight: 600 }}>{(e.total_cost || 0).toFixed(2)}</span></td>
-                          <td>{e.within_coverage === false
-                            ? <Chip tone="bad" dot>미커버</Chip>
-                            : <Chip tone="good" dot>커버됨</Chip>}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </Card>
           )}
-
-          {(perEdge.length > 0 || simHistory?.length > 0) && (() => {
-            // 시간축 반복측정(simHistory — 라이브 SUMO 실행 중 약 1Hz로 누적된 latency 샘플)이
-            // 충분하면 그걸 우선 쓴다 — "여러 번 측정값의 분포"라는 백분위수의 본래 정의에 더
-            // 가깝다. 표본이 부족하면(배치 평가 등 라이브 실행이 없던 경우) 구간(edge)별 공간
-            // 분포로 폴백 — 단, 이건 "반복 측정"이 아니라 "한 경로 안 구간 간 분포"이므로 출처를
-            // Chip으로 명확히 구분해서 표시한다(두 값을 섞어 같은 의미인 것처럼 보이지 않게).
-            const liveSamples = (simHistory || []).map(h => h.latency).filter(v => v !== null && v !== undefined);
-            const useLive = liveSamples.length >= 10;
-            const samples = useLive ? liveSamples : perEdge.map(e => e.latency_ms || 0);
-            const sortedLat = [...samples].sort((a, b) => a - b);
-            const p50 = percentile(sortedLat, 50);
-            const p90 = percentile(sortedLat, 90);
-            const p95 = percentile(sortedLat, 95);
-            const p99 = percentile(sortedLat, 99);
-            return (
-              <Card title="Latency 백분위수" en="Latency percentiles"
-                right={<Chip tone={useLive ? 'good' : ''}>{useLive ? `시간축 반복측정 ${sortedLat.length}건` : `구간(edge) 분포 ${sortedLat.length}건`}</Chip>}
-                style={{ marginBottom: 18 }}>
-                <div className="muted" style={{ fontSize: 11, marginBottom: 12 }}>
-                  {useLive
-                    ? '라이브 실행 중 약 1Hz로 누적된 latency 시계열(최근 최대 60건)의 백분위수 — 평균만으로는 가려지는 꼬리 구간의 지연을 확인합니다.'
-                    : '시간축 반복측정 표본이 부족해(10건 미만) 현재 경로의 구간별(edge) latency 공간 분포로 대체했습니다 — "반복 측정"이 아닌 "구간 간 분포"이므로 인용 시 구분해서 표기하세요.'}
-                </div>
-                <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
-                  <Stat label="P50 (중앙값)" icon="speed" value={p50 != null ? p50.toFixed(1) : '—'} unit="ms" />
-                  <Stat label="P90" icon="speed" value={p90 != null ? p90.toFixed(1) : '—'} unit="ms" />
-                  <Stat label="P95" icon="warn" value={p95 != null ? p95.toFixed(1) : '—'} unit="ms" />
-                  <Stat label="P99" icon="warn" value={p99 != null ? p99.toFixed(1) : '—'} unit="ms" accent />
-                </div>
-              </Card>
-            );
-          })()}
-        </>
+        </Card>
       ) : (
-        <div style={{ textAlign: 'center', padding: '40px 24px', color: 'var(--ink-4)', marginBottom: 18 }}>
-          <div style={{ fontSize: 28, opacity: 0.2, marginBottom: 10 }}>⇢</div>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--ink-3)' }}>경로가 설정되지 않았습니다</div>
-          <div style={{ fontSize: 12 }}>시뮬레이션 탭에서 출발지와 도착지를 지정하고 시뮬레이션을 시작하세요</div>
-        </div>
+        <Card title="실시간 경로" en="Route map" style={{ marginBottom: 16 }}>
+          <SectionEmpty msg="시뮬레이션 탭에서 경로를 설정하면 지도가 표시됩니다." />
+        </Card>
       )}
 
-      {/* ════════════════════════════════════════════════════
-          알고리즘 비교 (ported from tab-comparison.jsx)
-          ════════════════════════════════════════════════════ */}
-      <div style={{ margin: '8px 0 14px' }}>
-        <div className="eyebrow">Decision Support</div>
-        <h2 style={{ fontSize: 17, fontWeight: 700, margin: '4px 0 2px' }}>
-          알고리즘 비교 <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>Comparison</span>
-        </h2>
-        <div className="sub" style={{ fontSize: 12 }}>경로 대안 비교 · 자원할당/기지국 선택 알고리즘 비교 · 실행 이력 비교</div>
-      </div>
-
-      <Card title="경로 대안 비교" en="Path alternatives" right={algoEntries.length > 0 ? <Chip>{algoEntries.length}개 후보</Chip> : null} style={{ marginBottom: 18 }}>
-        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
-          같은 알고리즘 설정으로 찾은 대안 경로(K-path)들을 비교합니다. 도로망이 단순하면 대안 경로가
-          적게 나올 수 있습니다 — 서로 다른 알고리즘 설정을 비교하려면 아래 "알고리즘 설정 비교"를 사용하세요.
-          baseline 항목은 시뮬레이션 탭에서 실제로 선택한 경로 탐색 알고리즘(Dijkstra/A*/
-          K-shortest-path/Network-aware/Look-ahead)을 반영합니다. "경유 도로" 칸에서 각
-          후보가 실제로 어떤 도로를 지나는지 확인할 수 있습니다.
-          <br />PRR(근사)은 패킷 단위 시뮬레이션 없이 "이동 시간으로 가중한 단절 비율"의 보수
-          (1 - time_weighted_disconnection_ratio)로 근사한 값입니다 — 실측 패킷 수신율이 아니라
-          "연결 유지 시간 비율" proxy이므로, 인용 시 PRR이 아닌 "연결유지율(시간가중 근사)"으로 표기하세요.
-        </div>
-        {cmpLoading && <div className="muted" style={{ padding: 16, fontSize: 12 }}>불러오는 중…</div>}
-        {!cmpLoading && cmpError && <div style={{ padding: 16, fontSize: 12, color: 'var(--bad)' }}>{cmpError}</div>}
-        {!cmpLoading && !cmpError && algoEntries.length === 0 && (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>시뮬레이션을 먼저 실행하면 후보 알고리즘 비교가 표시됩니다.</div>
-        )}
-        {algoEntries.length > 0 && (
-          <>
-            {rankItems.length > 0 && (
-              <div style={{ marginBottom: 16 }}>
-                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>종합 순위 (낮을수록 우수)</div>
-                <BarChart items={rankItems} />
+      {/* ── algorithm comparison table ── */}
+      {(() => {
+        const ESSENTIAL_KEYS = ['total_cost', 'average_latency_ms', 'handover_count', 'prr_approx', 'average_bs_load', 'future_connectivity_risk'];
+        const visibleCols = showAllCols ? CMP_COLS : CMP_COLS.filter(c => ESSENTIAL_KEYS.includes(c.key));
+        return (
+          <Card title="알고리즘 비교" en="Algorithm comparison" style={{ marginBottom: 16 }}
+            right={
+              <div className="row gap8">
+                <Chip>{algoRows.length}개 알고리즘</Chip>
+                <button className="btn sm" onClick={() => setShowAllCols(v => !v)} style={{ fontSize: 10, padding: '2px 8px' }}>
+                  {showAllCols ? '간략 보기' : '전체 열 보기'}
+                </button>
               </div>
-            )}
-            <div className="tbl-wrap">
-              <table className="tbl">
-                <thead>
-                  <tr>
-                    <th>알고리즘</th>
-                    <th>경유 도로</th>
-                    {CMP_METRIC_COLS.map(c => <th key={c.key} className="r">{c.label}</th>)}
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedByCost.map(([algo, m]) => {
-                    const names = streetNamesFor(algo);
-                    const shown = names && names.length > 4
-                      ? [...names.slice(0, 3), '…', names[names.length - 1]]
-                      : names;
-                    return (
-                    <tr key={algo}>
-                      <td><span className="mono" style={{ fontWeight: 600 }}>{algo}</span></td>
-                      <td style={{ maxWidth: 260 }}>
-                        {shown
-                          ? <div className="row gap6 wrap">
-                              {shown.map((nm, i) => nm === '…'
-                                ? <span key={i} className="muted" style={{ fontSize: 11 }}>…</span>
-                                : <Chip key={i} style={{ fontSize: 10 }}>{nm}</Chip>)}
-                            </div>
-                          : <span className="muted">—</span>}
-                      </td>
-                      {CMP_METRIC_COLS.map(c => {
-                        const v = m[c.key];
-                        const isBest = bestPerMetric[c.key] === algo;
-                        return (
-                          <td key={c.key} className="r">
-                            <span className="num" style={{ fontWeight: isBest ? 700 : 400, color: isBest ? 'var(--good)' : 'inherit' }}>
-                              {v != null ? c.fmt(v) : '—'}
-                            </span>
-                            {isBest && <Chip tone="good" style={{ marginLeft: 6, fontSize: 9 }}>최적</Chip>}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <div className="row gap8" style={{ marginTop: 14 }}>
-              <button className={'btn sm ' + (savedFlash ? 'good' : '')} onClick={saveCurrentRun}>
-                {savedFlash ? <><Icon.check size={13} /> 저장됨</> : <><Icon.download size={13} /> 현재 결과를 히스토리에 저장</>}
-              </button>
-            </div>
-          </>
-        )}
-      </Card>
-
-      <Card title="알고리즘 설정 비교" en="Algorithm settings"
-        right={<button className="btn sm" onClick={runComparison} disabled={cmp?.status === 'running' || !metrics?.available}>
-          {cmp?.status === 'running' ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : <><Icon.spark size={13} /> 비교 실행</>}
-        </button>}
-        style={{ marginBottom: 18 }}>
-        <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
-          같은 경로를 latency / 기지국 선택 / 자원할당 알고리즘별로 다시 평가해서 비교합니다. 자원할당
-          최적, 기지국 선택 최적 등 시뮬레이션 결과 기반 알고리즘 비교가 여기에 해당합니다.
-          경로 탐색 알고리즘(Dijkstra/A*)은 현재 SUMO 모드에서 A* 구현이 없어 비교 대상에서 제외했습니다.
-        </div>
-        {!metrics?.available && (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>시뮬레이션을 먼저 실행하세요.</div>
-        )}
-        {metrics?.available && !cmp?.by_latency && cmp?.status !== 'running' && (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>
-            {cmp?.status === 'error' ? (cmp.reason || '비교 실행에 실패했습니다.') : '"비교 실행"을 눌러 알고리즘 설정별 결과를 확인하세요.'}
-          </div>
-        )}
-        {cmp?.status === 'running' && !cmp?.by_latency && (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>비교 실행 중… (경로 길이에 따라 수 초~수십 초 걸릴 수 있습니다)</div>
-        )}
-        {cmp?.by_latency && (
-          <div className="grid" style={{ gridTemplateColumns: 'repeat(3,1fr)', gap: 14 }}>
-            <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>지연시간 알고리즘별 (평균 ms) · <span style={{ color: 'var(--good)' }}>녹색 = 최저</span></div>
-              <BarChart items={Object.entries(cmp.by_latency).map(([id, v]) => {
-                const isLowest = v.avg_latency_ms === Math.min(...Object.values(cmp.by_latency).map(x => x.avg_latency_ms));
-                return {
-                  label: algoLabel(id),
-                  value: v.avg_latency_ms,
-                  display: `${v.avg_latency_ms.toFixed(1)}ms${isLowest ? ' · 최저' : ''}`,
-                  color: isLowest ? 'var(--good)' : (id === simConfig?.algorithm_selection?.latency_algorithm ? 'var(--brand)' : 'var(--brand-2)'),
-                };
-              })} />
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>기지국 선택 알고리즘별 (handover 수)</div>
-              <BarChart items={Object.entries(cmp.by_bs_selection || {}).map(([id, v]) => ({
-                label: algoLabel(id),
-                value: v.handover_count,
-                display: `${v.handover_count}회 · ${v.total_cost.toFixed(1)}`,
-                color: id === simConfig?.algorithm_selection?.base_station_selection_algorithm ? 'var(--brand)' : 'var(--brand-2)',
-              }))} />
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>자원할당 알고리즘별 (사용률 %)</div>
-              <BarChart items={Object.entries(cmp.by_allocation || {}).map(([id, v]) => ({
-                label: algoLabel(id),
-                value: v.total_utilization * 100,
-                display: `${(v.total_utilization * 100).toFixed(0)}%${v.overloaded_bs_count > 0 ? ` · 과부하 ${v.overloaded_bs_count}` : ''}`,
-                color: id === simConfig?.algorithm_selection?.resource_allocation_algorithm ? 'var(--brand)' : 'var(--brand-2)',
-              }))} max={100} />
-            </div>
-          </div>
-        )}
-      </Card>
-
-      <Card title="실행 이력 비교" en="Run history" right={<Chip>{history.length}개 저장됨</Chip>} style={{ marginBottom: 18 }}>
-        {history.length === 0 ? (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>아직 저장된 실행이 없습니다. 위에서 "현재 결과를 히스토리에 저장"을 눌러 비교를 시작하세요.</div>
-        ) : (
-          <>
-            <div className="tbl-wrap" style={{ marginBottom: 14 }}>
-              <table className="tbl">
-                <thead>
-                  <tr><th></th><th>시각</th><th>알고리즘 수</th><th>네트워크 모드</th><th></th></tr>
-                </thead>
-                <tbody>
-                  {history.map((h, i) => (
-                    <tr key={i} className={checkedRuns.includes(i) ? 'selected' : ''}>
-                      <td><input type="checkbox" checked={checkedRuns.includes(i)} onChange={() => toggleCheck(i)} /></td>
-                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
-                      <td><span className="num">{Object.keys(h.algorithms || {}).length}</span></td>
-                      <td><Chip tone="brand">{h.config?.policy_options?.network_mode ?? '—'}</Chip></td>
-                      <td className="r"><button className="btn icon sm" onClick={() => removeRun(i)}>✕</button></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {selectedRuns.length >= 2 && (
-              <div className="tbl-wrap">
-                <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>선택한 {selectedRuns.length}개 실행 비교 (각 실행의 최저 비용 알고리즘 기준)</div>
-                <table className="tbl">
-                  <thead>
-                    <tr>
-                      <th>실행 시각</th>
-                      {CMP_METRIC_COLS.map(c => <th key={c.key} className="r">{c.label}</th>)}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selectedRuns.map((h, i) => {
-                      const best = Object.values(h.algorithms || {}).sort((a, b) => (a.total_cost ?? Infinity) - (b.total_cost ?? Infinity))[0];
-                      return (
-                        <tr key={i}>
-                          <td><span className="num muted" style={{ fontSize: 11.5 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
-                          {CMP_METRIC_COLS.map(c => (
-                            <td key={c.key} className="r"><span className="num">{best && best[c.key] != null ? c.fmt(best[c.key]) : '—'}</span></td>
-                          ))}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {selectedRuns.length === 1 && (
-              <div className="muted" style={{ fontSize: 11.5, padding: '8px 2px' }}>비교하려면 2개 이상 선택하세요.</div>
-            )}
-          </>
-        )}
-
-        <div className="muted" style={{ fontSize: 10.5, marginTop: 14, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
-          팀 공유 실행 기록(DB) — {dbRunsAvailable === null ? '확인 중…' : dbRunsAvailable ? `${dbRuns.length}건` : (dbRunsError || 'DB가 연결되어 있지 않습니다')}
-        </div>
-        {dbRunsAvailable && dbRuns.length > 0 && (
-          <div className="tbl-wrap" style={{ marginTop: 8, maxHeight: 220, overflowY: 'auto' }}>
-            <table className="tbl">
-              <thead><tr><th>시각</th><th>모드</th><th>시나리오/배치</th><th className="r">seed</th></tr></thead>
-              <tbody>
-                {dbRuns.map(r => (
-                  <tr key={r.id}>
-                    <td><span className="num muted" style={{ fontSize: 11 }}>{r.started_at ? new Date(r.started_at).toLocaleString('ko-KR') : '—'}</span></td>
-                    <td><Chip tone={r.mode === 'sumo' ? 'brand' : ''}>{r.mode}</Chip></td>
-                    <td className="muted" style={{ fontSize: 11 }}>{r.scenario_id || '—'}{r.batch_id ? ` · ${r.batch_id.slice(0, 8)}` : ''}</td>
-                    <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
-
-      </>}
-
-      {subTab === 'batch' && mode === 'pro' && <>
-      <Card title="시나리오 배치 비교" en="Scenario batch comparison" right={<Chip>{scenarioBatches.length}개 배치</Chip>} style={{ marginBottom: 18 }}>
-        {scenarioBatches.length === 0 ? (
-          <div className="muted" style={{ padding: 16, fontSize: 12 }}>
-            아직 저장된 배치가 없습니다. 시나리오 어시스턴트 탭의 "시나리오 생성·배치" 모드에서 배치를 실행하면 여기에 표시됩니다.
-          </div>
-        ) : (
-          <>
-            <div className="row gap10 wrap" style={{ marginBottom: 16 }}>
-              {reversedBatches.map((b, i) => {
-                const kind = inferBatchKind(b);
-                const successCount = (b.results || []).filter(r => r.status === 'done').length;
-                const total = b.results?.length ?? 0;
-                return (
-                  <PickerCard
-                    key={b.batch_id}
-                    selected={i === selectedBatch}
-                    onClick={() => setSelectedBatch(i)}
-                    onRemove={() => removeBatch(i)}
-                    kindChip={<Chip tone={kind.tone}>{kind.text}</Chip>}
-                    title={b.label || '(레이블 없음)'}
-                    metaLeft={b.started_at ? new Date(b.started_at).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
-                    metaRight={`${successCount}/${total} 성공`}
-                  />
-                );
-              })}
-            </div>
-
-            {currentBatch && currentBatch.results?.length > 0 && (() => {
-              const doneResults = currentBatch.results.filter(r => r.status === 'done');
-              const isRlBatch = doneResults.some(r => r.mode === 'rl_episode');
-              const sweepData = parseSweepBatch(currentBatch);
-              const rlRows = isRlBatch ? doneResults.filter(r => r.mode === 'rl_episode') : null;
-              // route_metrics는 비용 낮을수록, rl_episode는 reward 높을수록 좋음 — best 판정 방향이 반대
-              let bestIdx = -1;
-              if (doneResults.length > 0) {
-                bestIdx = doneResults.reduce((bestI, r, i) => {
-                  const cur = r.mode === 'rl_episode' ? (r.mean_reward ?? r.total_reward ?? -Infinity) : -(r.route_cost_result?.total_cost ?? Infinity);
-                  const best = doneResults[bestI];
-                  const bestVal = best.mode === 'rl_episode' ? (best.mean_reward ?? best.total_reward ?? -Infinity) : -(best.route_cost_result?.total_cost ?? Infinity);
-                  return cur > bestVal ? i : bestI;
-                }, 0);
-              }
-              const bestId = bestIdx >= 0 ? doneResults[bestIdx].id : null;
-              return (
+            }>
+            {algoRows.length === 0 ? (
+              <SectionEmpty msg="시뮬레이션 실행 후 알고리즘 비교 데이터가 표시됩니다." />
+            ) : (
               <>
-                {sweepData ? (
-                  <div style={{ marginBottom: 18 }}>
-                    <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
-                      가로축 = {sweepData.paramLabel} 값. 두 지표가 서로 반대로 움직이면(예: 비용↓ Latency↑)
-                      그 구간이 트레이드오프 지점입니다.
-                    </div>
-                    <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>총 비용 추이</div>
-                        <LineChart series={[sweepData.points.map(p => p.totalCost ?? 0)]} height={150}
-                          labels={sweepData.points.map(p => String(p.x))} colors={['var(--brand-2)']} />
-                      </div>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Latency 추이</div>
-                        <LineChart series={[sweepData.points.map(p => p.avgLatency ?? 0)]} height={150} yUnit="ms"
-                          labels={sweepData.points.map(p => String(p.x))} colors={['var(--warn)']} />
-                      </div>
-                    </div>
-                  </div>
-                ) : rlRows ? (
-                  <div style={{ marginBottom: 18 }}>
-                    <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
-                      정책별 다중지표 비교 — reward만으로는 "도착했는지", "핸드오버가 잦은지"를 알 수 없어 4개 지표를 함께 봅니다.
-                    </div>
-                    <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Reward (±표준편차)</div>
-                        <BarChart items={rlRows.map(r => ({
-                          label: r.policy || r.label || r.id,
-                          value: r.mean_reward ?? r.total_reward ?? 0,
-                          display: `${(r.mean_reward ?? r.total_reward ?? 0).toFixed(2)}${r.std_reward != null ? ` ±${r.std_reward.toFixed(2)}` : ''}`,
-                          color: 'var(--good)',
-                        }))} />
-                      </div>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>목적지 도착률</div>
-                        <BarChart items={rlRows.map(r => ({
-                          label: r.policy || r.label || r.id,
-                          value: (r.arrival_rate ?? 0) * 100,
-                          display: `${((r.arrival_rate ?? 0) * 100).toFixed(0)}%`,
-                          color: 'var(--brand-2)',
-                        }))} max={100} />
-                      </div>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 핸드오버</div>
-                        <BarChart items={rlRows.map(r => ({
-                          label: r.policy || r.label || r.id,
-                          value: r.mean_handovers ?? 0,
-                          display: `${(r.mean_handovers ?? 0).toFixed(1)}회`,
-                          color: 'var(--warn)',
-                        }))} />
-                      </div>
-                      <div>
-                        <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>평균 Latency</div>
-                        <BarChart items={rlRows.map(r => ({
-                          label: r.policy || r.label || r.id,
-                          value: r.mean_latency_ms ?? 0,
-                          display: `${(r.mean_latency_ms ?? 0).toFixed(1)}ms${r.std_latency_ms != null ? ` ±${r.std_latency_ms.toFixed(1)}` : ''}`,
-                          color: 'var(--bad)',
-                        }))} />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div style={{ marginBottom: 18 }}>
-                    <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
-                      총비용 비교(낮을수록 좋음) · 가장 좋은 결과에 "최적" 표시
-                    </div>
-                    <BarChart items={doneResults.map(r => ({
-                      label: r.label || r.id,
-                      value: r.route_cost_result?.total_cost ?? 0,
-                      display: `비용 ${(r.route_cost_result?.total_cost ?? 0).toFixed(1)}`,
-                      color: 'var(--brand-2)',
-                    }))} />
+                {rankItems.length > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 7 }}>종합 순위 (낮을수록 우수)</div>
+                    <BarChart items={rankItems} />
                   </div>
                 )}
-
-                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>전체 시나리오 상세</div>
                 <div className="tbl-wrap">
                   <table className="tbl">
                     <thead>
-                      <tr><th>시나리오</th><th>모드</th><th className="r">차량수/정책</th><th className="r">seed</th><th className="r">결과</th></tr>
+                      <tr>
+                        <th>알고리즘</th>
+                        <th>경유 도로</th>
+                        {visibleCols.map(c => <th key={c.key} className="r">{c.label}</th>)}
+                      </tr>
                     </thead>
                     <tbody>
-                      {currentBatch.results.map((r, i) => {
-                        const isRl = r.mode === 'rl_episode';
-                        const isBest = r.status === 'done' && r.id === bestId;
+                      {algoRows.map(row => {
+                        const names = streetNamesFor(row.algorithm);
+                        const shown = names?.length > 4 ? [...names.slice(0, 3), '…', names[names.length - 1]] : names;
                         return (
-                        <tr key={i} style={isBest ? { background: 'var(--good-tint)' } : {}}>
-                          <td style={{ borderLeft: `3px solid ${r.status !== 'done' ? 'var(--bad)' : isRl ? 'var(--good)' : 'var(--brand-2)'}`, paddingLeft: 9 }}>
-                            {r.label || r.id}
-                          </td>
-                          <td><Chip tone={r.status === 'done' ? (isRl ? 'good' : 'brand') : 'bad'}>{r.mode}</Chip></td>
-                          <td className="r"><span className="num">{isRl ? (r.policy || '—') : (r.vehicle_count ?? '—')}</span></td>
-                          <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
-                          <td className="r">
-                            {r.status !== 'done' ? (
-                              <span style={{ color: 'var(--bad)' }}>{r.error || '실패'}</span>
-                            ) : isRl ? (
-                              <span className="num">
-                                reward {(r.mean_reward ?? r.total_reward ?? 0).toFixed(2)}
-                                {r.std_reward != null && <span className="muted"> ±{r.std_reward.toFixed(2)} (n={r.n_episodes ?? 1})</span>}
-                              </span>
-                            ) : (
-                              <span className="num">비용 {(r.route_cost_result?.total_cost ?? 0).toFixed(2)} · {(r.route_cost_result?.avg_latency_ms ?? 0).toFixed(1)}ms</span>
-                            )}
-                            {isBest && <Chip tone="good" style={{ marginLeft: 6, fontSize: 9 }}>최적</Chip>}
-                          </td>
-                        </tr>
+                          <tr key={row.algorithm}>
+                            <td><span className="mono" style={{ fontWeight: 600 }}>{algoLabel(row.algorithm)}</span></td>
+                            <td style={{ maxWidth: 220 }}>
+                              {shown
+                                ? <div className="row gap5 wrap">{shown.map((nm, i) => nm === '…' ? <span key={i} className="muted" style={{ fontSize: 11 }}>…</span> : <Chip key={i} style={{ fontSize: 10 }}>{nm}</Chip>)}</div>
+                                : <span className="muted">—</span>}
+                            </td>
+                            {visibleCols.map(c => {
+                              const v = row[c.key];
+                              const isBest = bestPer[c.key] === row.algorithm;
+                              return (
+                                <td key={c.key} className="r">
+                                  <span className="num" style={{ fontWeight: isBest ? 700 : 400, color: isBest ? 'var(--good)' : 'inherit' }}>
+                                    {v != null ? c.fmt(v) : '—'}
+                                  </span>
+                                  {isBest && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}
+                                </td>
+                              );
+                            })}
+                          </tr>
                         );
                       })}
                     </tbody>
                   </table>
                 </div>
-
-                <div className="row gap8" style={{ marginTop: 14 }}>
-                  <button className="btn sm primary" disabled={batchAiLoading} onClick={() => runBatchAnalysis(currentBatch)}>
-                    {batchAiLoading ? <><Icon.reset size={13} className="spin" /> 분석 중…</> : <><Icon.spark size={13} /> 배치 비교 AI 분석</>}
+                <div className="row gap8" style={{ marginTop: 12 }}>
+                  <button className={'btn sm ' + (savedFlash ? 'good' : '')} onClick={saveCurrentRun}>
+                    {savedFlash ? <><Icon.check size={13} /> 저장됨</> : <><Icon.download size={13} /> 현재 결과 히스토리 저장</>}
                   </button>
-                  {batchAiProvider && <Chip style={{ color: PROVIDER_LABELS[batchAiProvider]?.color }}>{PROVIDER_LABELS[batchAiProvider]?.name || batchAiProvider}</Chip>}
                 </div>
-                {batchAiError && (
-                  <div style={{ marginTop: 10, fontSize: 11.5, color: 'var(--bad)', background: 'var(--bad-tint)', padding: '8px 10px', borderRadius: 8 }}>{batchAiError}</div>
-                )}
-                {batchAiRevealed > 0 && (
-                  <div className="col gap12" style={{ marginTop: 14 }}>
-                    {batchAiSections.slice(0, batchAiRevealed).map((t, i) => (
-                      <div key={i} className="fade row gap12" style={{ padding: '12px 13px', background: 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
-                        <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flex: '0 0 auto', marginTop: 1 }}>{String(i + 1).padStart(2, '0')}</span>
-                        <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </>
-              );
-            })()}
-          </>
-        )}
-      </Card>
-      </>}
+            )}
+          </Card>
+        );
+      })()}
 
-      {subTab === 'logs' && <>
-      <div className="grid" style={{ gridTemplateColumns: '1.35fr 1fr', alignItems: 'start' }}>
-        {/* log table */}
-        <Card
-          title="시뮬레이션 로그"
-          en="Event log"
-          right={
-            <div className="row gap8">
-              {hasLiveLogs && <Chip tone="good" dot>실시간</Chip>}
-              <Chip>{logs.length}건</Chip>
+      {/* ── Chart 1: KPI radar — multi-algorithm multi-metric ── */}
+      {algoRows.length >= 2 && (() => {
+        const RADAR_AXES = [
+          { key: 'total_cost',               label: '비용',     lowerBetter: true  },
+          { key: 'average_latency_ms',        label: '지연(ms)', lowerBetter: true  },
+          { key: 'prr_approx',                label: 'PRR',      lowerBetter: false },
+          { key: 'handover_count',            label: '핸드오버', lowerBetter: true  },
+          { key: 'future_connectivity_risk',  label: '미래위험', lowerBetter: true  },
+          { key: 'average_bs_load',           label: 'BS부하',   lowerBetter: true  },
+        ];
+        // normalise each axis to [0,1] — higher on chart = better
+        const normVals = {};
+        RADAR_AXES.forEach(ax => {
+          const vals = algoRows.map(r => Number(r[ax.key] ?? 0));
+          const mn = Math.min(...vals), mx = Math.max(...vals), sp = mx - mn || 1;
+          algoRows.forEach(r => {
+            if (!normVals[r.algorithm]) normVals[r.algorithm] = {};
+            const raw = (Number(r[ax.key] ?? 0) - mn) / sp;
+            normVals[r.algorithm][ax.key] = ax.lowerBetter ? 1 - raw : raw;
+          });
+        });
+        const algoData = algoRows.map(r => ({ key: r.algorithm, label: algoLabel(r.algorithm), values: normVals[r.algorithm] }));
+        const PALETTE = ['var(--brand-2)', 'var(--good)', 'var(--warn)', 'var(--bad)', '#A855F7', '#F6A623'];
+        return (
+          <Card title="KPI 레이더 — 알고리즘 다축 비교" en="KPI radar" style={{ marginBottom: 16 }}>
+            <div className="row gap20" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+              <div style={{ flex: '0 0 210px', display: 'flex', justifyContent: 'center' }}>
+                <RadarChart algorithms={algoData} metrics={RADAR_AXES.map(a => ({ key: a.key, label: a.label }))} size={210} />
+              </div>
+              <div className="col gap6" style={{ flex: '1 1 140px' }}>
+                {algoData.map((a, i) => (
+                  <div key={a.key} className="row gap8" style={{ fontSize: 11.5 }}>
+                    <span style={{ width: 12, height: 12, borderRadius: 2, background: PALETTE[i % PALETTE.length], flexShrink: 0, marginTop: 1 }} />
+                    <span style={{ fontWeight: 600 }}>{a.label}</span>
+                    {algoRows[i]?.is_best_total_cost && <Chip tone="good" style={{ fontSize: 9 }}>최저 비용</Chip>}
+                  </div>
+                ))}
+                <div className="muted" style={{ fontSize: 10.5, marginTop: 8, lineHeight: 1.6 }}>
+                  외곽 = 해당 지표에서 우수. 모든 축 [0, 1] 정규화, 높을수록 좋음.
+                  <br />축 방향: PRR↑ 우수 / 비용·지연·핸드오버·BS부하·미래위험↓ 우수.
+                </div>
+              </div>
             </div>
-          }
-          style={{ padding: 0 }}
-        >
-          <div className="tbl-wrap" style={{ maxHeight: 'calc(100vh - 250px)' }}>
+          </Card>
+        );
+      })()}
+
+      {/* ── per-edge breakdown ── */}
+      {perEdge.length > 0 && (
+        <Card title="구간별 비용" en="Edge breakdown" right={<Chip>{perEdge.length}개 구간</Chip>} style={{ marginBottom: 16 }}>
+          <div className="tbl-wrap">
             <table className="tbl">
-              <thead><tr><th>시각<span className="en">Time</span></th><th>대상<span className="en">Target</span></th><th>유형<span className="en">Type</span></th><th>이벤트 내용<span className="en">Event</span></th></tr></thead>
+              <thead>
+                <tr><th>구간</th><th className="r">거리</th><th className="r">지연</th><th className="r">부하율</th><th className="r">비용</th><th>커버리지</th></tr>
+              </thead>
               <tbody>
-                {logs.map((l, i) => {
-                  const st = LOG_STYLE[l.kind] ?? LOG_STYLE.info;
+                {perEdge.map((e, i) => {
+                  const isCur = e.edge_id === curEdgeId;
+                  const name  = e.best_node_name || edgeNames[e.edge_id] || e.edge_id;
                   return (
-                    <tr key={i}>
-                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{l.t}</span></td>
-                      <td><span className="mono" style={{ fontWeight: 600, fontSize: 11.5 }}>{l.target}</span></td>
-                      <td><Chip tone={st.tone} dot={st.tone !== ''}>{st.ko}</Chip></td>
-                      <td style={{ whiteSpace: 'normal', maxWidth: 280, lineHeight: 1.4 }}>{l.ko}</td>
+                    <tr key={e.edge_id || i} style={isCur ? { background: 'var(--brand-tint)', fontWeight: 500 } : {}}>
+                      <td>
+                        <span className="mono" style={{ fontSize: 11.5 }}>{name}</span>
+                        {isCur && <Chip style={{ marginLeft: 6, fontSize: 9, background: 'var(--brand)', color: '#fff' }}>현재</Chip>}
+                      </td>
+                      <td className="r"><span className="num">{e.distance_m?.toFixed(0) ?? '—'}</span><span className="muted" style={{ fontSize: 10 }}> m</span></td>
+                      <td className="r"><span className="num" style={{ color: `var(--${latencyTone(e.latency_ms || 0)})`, fontWeight: 600 }}>{(e.latency_ms || 0).toFixed(1)}</span><span className="muted" style={{ fontSize: 10 }}> ms</span></td>
+                      <td className="r">
+                        <div className="row gap6" style={{ justifyContent: 'flex-end' }}>
+                          <div className="pbar" style={{ width: 40 }}><i style={{ width: `${Math.min((e.load_ratio || 0) * 100, 100)}%`, background: 'var(--brand-2)' }} /></div>
+                          <span className="num" style={{ fontSize: 11 }}>{((e.load_ratio || 0) * 100).toFixed(0)}%</span>
+                        </div>
+                      </td>
+                      <td className="r"><span className="num" style={{ fontWeight: 600 }}>{(e.total_cost || 0).toFixed(2)}</span></td>
+                      <td>{e.within_coverage === false ? <Chip tone="bad" dot>미커버</Chip> : <Chip tone="good" dot>커버됨</Chip>}</td>
                     </tr>
                   );
                 })}
@@ -1173,61 +601,1091 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
             </table>
           </div>
         </Card>
+      )}
 
-        {/* LLM panel */}
-        <Card title="AI 자연어 분석" en="LLM summary" right={
-          <div className="row gap8">
-            {mode === 'pro' && llmProviders.length > 1 && (
-              <select className="input" style={{ height: 28, fontSize: 11, minWidth: 110 }}
-                value={selectedProvider}
-                onChange={e => setSelectedProvider(e.target.value)}>
-                {llmProviders.map(p => (
-                  <option key={p.id} value={p.id}>{p.name.split('/')[1]?.trim() || p.name} — {p.model}</option>
-                ))}
-              </select>
-            )}
-            <Chip tone="brand">
-              <Icon.spark size={11} />
-              {usedProvider ? (PROVIDER_LABELS[usedProvider]?.name || usedProvider) : (PROVIDER_LABELS[selectedProvider]?.name || 'AI')}
-            </Chip>
+      {/* ── latency percentiles ── */}
+      {pSorted.length > 0 && (
+        <Card title="Latency 백분위수" en="Percentiles"
+          right={<Chip tone={useLive ? 'good' : ''}>{useLive ? `시간축 ${pSorted.length}건` : `구간 분포 ${pSorted.length}건`}</Chip>}
+          style={{ marginBottom: 16 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+            {useLive ? '라이브 실행 중 누적된 latency 시계열의 백분위수.' : '라이브 표본 부족 — 구간별 공간 분포로 대체. 인용 시 구분 표기하세요.'}
           </div>
-        }>
-          {revealed === 0 && !analyzing && (
-            <div style={{ textAlign: 'center', padding: '26px 16px' }}>
-              <div style={{ width: 52, height: 52, borderRadius: 14, background: 'var(--brand-tint)', display: 'grid', placeItems: 'center', margin: '0 auto 14px', color: 'var(--brand-2)' }}><Icon.spark size={26} /></div>
-              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 5 }}>AI 분석 준비 완료</div>
-              <div className="muted" style={{ fontSize: 11.5, marginBottom: 18, lineHeight: 1.5 }}>
-                로그 {logs.length}건을 분석해<br />자연어 요약을 생성합니다
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+            <Stat label="P50 (중앙값)" icon="speed" value={pct(pSorted, 50)?.toFixed(1) ?? '—'} unit="ms" />
+            <Stat label="P90"         icon="speed" value={pct(pSorted, 90)?.toFixed(1) ?? '—'} unit="ms" />
+            <Stat label="P95"         icon="warn"  value={pct(pSorted, 95)?.toFixed(1) ?? '—'} unit="ms" />
+            <Stat label="P99"         icon="warn"  value={pct(pSorted, 99)?.toFixed(1) ?? '—'} unit="ms" accent />
+          </div>
+        </Card>
+      )}
+
+      {/* ── Chart 3: latency distribution histogram ── */}
+      {(() => {
+        const latVals = (bundle?.per_edge_metrics || []).map(e => e.latency_ms).filter(v => v != null);
+        const useVals = useLive && liveSamples.length >= 10 ? liveSamples : latVals;
+        if (useVals.length < 2) return null;
+        return (
+          <Card title="Latency 분포 히스토그램" en="Latency distribution"
+            right={<Chip tone={useLive && liveSamples.length >= 10 ? 'good' : ''}>{useVals.length}건 {useLive && liveSamples.length >= 10 ? '(시계열)' : '(구간별)'}</Chip>}
+            style={{ marginBottom: 16 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+              막대 색상: 초록 = 낮은 지연(양호), 주황 = 중간, 빨강 = 높은 지연(주의). 수직 점선: P50/P90/P95.
+              {!(useLive && liveSamples.length >= 10) && <span style={{ color: 'var(--warn)' }}> ※ 라이브 표본 부족 — 구간 공간 분포로 대체.</span>}
+            </div>
+            <HistogramChart values={useVals} bucketCount={14} xLabel="Latency (ms)" height={150} />
+          </Card>
+        );
+      })()}
+
+      {/* ── Chart 4: base-station load comparison ── */}
+      {(() => {
+        const routeBS = (bundle?.per_bs_metrics || []).filter(bs => bs.affected_edge_count > 0);
+        if (!routeBS.length) return null;
+        const items = routeBS.slice(0, 12).map(bs => ({
+          label: bs.bs_name || bs.bs_id,
+          value: (bs.load_ratio ?? 0) * 100,
+          display: `${((bs.load_ratio ?? 0) * 100).toFixed(0)}% ${bs.avg_latency_on_route_ms != null ? '· ' + bs.avg_latency_on_route_ms.toFixed(1) + 'ms' : ''}`,
+          color: (bs.load_ratio ?? 0) > 0.9 ? 'var(--bad)' : (bs.load_ratio ?? 0) > 0.7 ? 'var(--warn)' : 'var(--good)',
+        }));
+        return (
+          <Card title="기지국 부하 — 경로 경유 BS" en="BS load (on-route)"
+            right={<Chip>{routeBS.length}개 BS</Chip>}
+            style={{ marginBottom: 16 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+              경로를 경유하는 BS/RSU만 표시. 표시값: 부하율% · 경로 평균 지연.
+              색상: <span style={{ color: 'var(--good)' }}>■ 정상 ≤70%</span>
+              &nbsp;<span style={{ color: 'var(--warn)' }}>■ 주의 ≤90%</span>
+              &nbsp;<span style={{ color: 'var(--bad)' }}>■ 과부하 &gt;90%</span>
+            </div>
+            <BarChart items={items} max={100} />
+          </Card>
+        );
+      })()}
+
+      {/* ── algorithm settings sweep (Algo Cmp tab port) ── */}
+      {mode === 'pro' && (
+        <Card title="알고리즘 설정 비교" en="Settings sweep"
+          right={<button className="btn sm" onClick={runComparison} disabled={cmp?.status === 'running' || !bundle?.available}>
+            {cmp?.status === 'running' ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : <><Icon.spark size={13} /> 비교 실행</>}
+          </button>}
+          style={{ marginBottom: 16 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>같은 경로를 latency/BS-선택/자원할당 알고리즘별로 재평가합니다.</div>
+          {cmp?.status === 'running' && !cmp?.by_latency && <div className="muted" style={{ fontSize: 12 }}>실행 중…</div>}
+          {cmp?.by_latency && (
+            <div className="grid" style={{ gridTemplateColumns: 'repeat(3,1fr)', gap: 14 }}>
+              <div>
+                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>지연 알고리즘 (평균 ms)</div>
+                <BarChart items={Object.entries(cmp.by_latency).map(([id, v]) => {
+                  const isLow = v.avg_latency_ms === Math.min(...Object.values(cmp.by_latency).map(x => x.avg_latency_ms));
+                  return { label: algoLabel(id), value: v.avg_latency_ms, display: `${v.avg_latency_ms.toFixed(1)}ms${isLow ? ' ·최저' : ''}`, color: isLow ? 'var(--good)' : 'var(--brand-2)' };
+                })} />
               </div>
-              {llmError && (
-                <div style={{ fontSize: 11.5, color: 'var(--bad)', marginBottom: 12, lineHeight: 1.5, textAlign: 'left', background: 'var(--bad-tint)', padding: '8px 10px', borderRadius: 8 }}>{llmError}</div>
-              )}
-              <button className="btn primary" onClick={runAI}><Icon.spark size={15} /> AI 분석 시작</button>
+              <div>
+                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>BS 선택 (핸드오버 수)</div>
+                <BarChart items={Object.entries(cmp.by_bs_selection || {}).map(([id, v]) => ({
+                  label: algoLabel(id), value: v.handover_count, display: `${v.handover_count}회`, color: 'var(--brand-2)',
+                }))} />
+              </div>
+              <div>
+                <div className="muted" style={{ fontSize: 10.5, marginBottom: 6 }}>자원 할당 (사용률)</div>
+                <BarChart items={Object.entries(cmp.by_allocation || {}).map(([id, v]) => ({
+                  label: algoLabel(id), value: v.total_utilization * 100, display: `${(v.total_utilization * 100).toFixed(0)}%`, color: 'var(--brand-2)',
+                }))} max={100} />
+              </div>
             </div>
           )}
-          {analyzing && (
-            <div style={{ textAlign: 'center', padding: '34px 16px' }}>
-              <div className="spin" style={{ width: 30, height: 30, border: '3px solid var(--brand-tint2)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 14px' }} />
-              <div className="muted" style={{ fontSize: 12 }}>AI 분석 중…</div>
-            </div>
-          )}
-          {revealed > 0 && (
-            <div className="col gap12">
-              {llmResult.slice(0, revealed).map((t, i) => (
-                <div key={i} className="fade row gap12" style={{ padding: '12px 13px', background: i === 6 ? 'var(--bad-tint)' : i === 7 ? 'var(--good-tint)' : 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
-                  <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flex: '0 0 auto', marginTop: 1 }}>{String(i + 1).padStart(2, '0')}</span>
-                  <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
-                </div>
-              ))}
-              {revealed === llmResult.length && llmResult.length > 0 && (
-                <button className="btn sm" onClick={runAI} style={{ alignSelf: 'flex-start' }}><Icon.reset size={13} /> 다시 분석</button>
-              )}
-            </div>
+          {!cmp?.by_latency && cmp?.status !== 'running' && (
+            <div className="muted" style={{ fontSize: 12 }}>{cmp?.status === 'error' ? (cmp.reason || '실패') : '"비교 실행"을 눌러 결과를 확인하세요.'}</div>
           )}
         </Card>
+      )}
+
+      {/* ── Chart 7: Latency CDF ── */}
+      {(() => {
+        const latVals = (bundle?.per_edge_metrics || []).map(e => e.latency_ms).filter(v => v != null);
+        if (latVals.length < 2) return null;
+        return (
+          <Card title="지연 누적분포 (CDF)" en="Latency CDF"
+            right={<Chip tone="">{latVals.length}개 구간</Chip>}
+            style={{ marginBottom: 16 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+              누적분포함수 — 수직선: <span style={{ color: 'var(--good)' }}>■ URLLC 10ms</span>
+              &nbsp;·&nbsp;<span style={{ color: 'var(--warn)' }}>■ 안전 100ms</span>
+              &nbsp;·&nbsp;<span style={{ color: 'var(--bad)' }}>■ 고내성 500ms</span>
+            </div>
+            <CDFChart latencies={latVals} height={220} />
+          </Card>
+        );
+      })()}
+
+      {/* ── Jain's Fairness Index card ── */}
+      {bundle?.run_summary?.jain_fairness_index != null && (() => {
+        const jfi = bundle.run_summary.jain_fairness_index;
+        const tone = jfi >= 0.9 ? 'good' : jfi >= 0.7 ? 'warn' : 'bad';
+        const label = jfi >= 0.9 ? '공정' : jfi >= 0.7 ? '보통' : '불공정';
+        return (
+          <Card title="Jain 공정성 지수" en="Jain's Fairness Index"
+            right={<Chip tone={tone}>{label} {jfi.toFixed(4)}</Chip>}
+            style={{ marginBottom: 16 }}>
+            <div className="row gap16" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <div style={{ flex: '1 1 180px' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: jfi >= 0.9 ? 'var(--good)' : jfi >= 0.7 ? 'var(--warn)' : 'var(--bad)', marginBottom: 4 }}>
+                  {jfi.toFixed(4)}
+                </div>
+                <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
+                  범위: [1/n, 1] — 1.0 = 완전 공정, 1/n = 최악 불공정
+                </div>
+              </div>
+              <div style={{ flex: '2 1 220px', fontSize: 11, lineHeight: 1.6, background: 'var(--surface-2)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}>
+                <div style={{ color: 'var(--brand-2)', marginBottom: 8, display: 'inline-flex', alignItems: 'center', flexWrap: 'wrap', gap: 2, fontSize: 13 }}>
+                  <i>J</i> =
+                  <MathFrac
+                    n={<>(Σ<sub><i>i</i></sub> <i>ρ</i><sub><i>i</i></sub>)<sup>2</sup></>}
+                    d={<><i>n</i> · Σ<sub><i>i</i></sub> <i>ρ</i><sub><i>i</i></sub><sup>2</sup></>}
+                  />
+                </div>
+                <div className="muted"><i>ρ</i><sub><i>i</i></sub> = BS <i>i</i> 부하율, <i>n</i> = BS 수</div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  출처: Jain, Chiu, Hawe, <i>DEC-TR-301</i>, 1984 §3.1
+                </div>
+              </div>
+            </div>
+          </Card>
+        );
+      })()}
+
+      {/* ── run history comparison ── */}
+      {mode === 'pro' && (
+        <Card title="실행 이력" en="Run history" right={<Chip>{history.length}개 저장됨</Chip>} style={{ marginBottom: 16 }}>
+          {history.length === 0 ? (
+            <div className="muted" style={{ fontSize: 12 }}>저장된 실행 없음 — 위에서 "현재 결과 히스토리 저장"을 누르세요.</div>
+          ) : (
+            <>
+              <div className="tbl-wrap" style={{ marginBottom: 12 }}>
+                <table className="tbl">
+                  <thead><tr><th></th><th>시각</th><th>알고리즘 수</th><th>네트워크 모드</th><th></th></tr></thead>
+                  <tbody>
+                    {history.map((h, i) => (
+                      <tr key={i} className={checkedRuns.includes(i) ? 'selected' : ''}>
+                        <td><input type="checkbox" checked={checkedRuns.includes(i)} onChange={() => setCheckedRuns(p => p.includes(i) ? p.filter(x => x !== i) : [...p, i].slice(-3))} /></td>
+                        <td><span className="num muted" style={{ fontSize: 11.5 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
+                        <td><span className="num">{Object.keys(h.algorithms || {}).length}</span></td>
+                        <td><Chip tone="brand">{h.config?.policy_options?.network_mode ?? '—'}</Chip></td>
+                        <td className="r"><button className="btn icon sm" onClick={() => removeRun(i)}>✕</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {checkedSelected.length >= 2 && (
+                <div className="tbl-wrap">
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 7 }}>선택 {checkedSelected.length}개 비교</div>
+                  <table className="tbl">
+                    <thead><tr><th>시각</th>{CMP_COLS.map(c => <th key={c.key} className="r">{c.label}</th>)}</tr></thead>
+                    <tbody>
+                      {checkedSelected.map((h, i) => {
+                        const best = Object.values(h.algorithms || {}).sort((a, b) => (a.total_cost ?? Infinity) - (b.total_cost ?? Infinity))[0];
+                        return (
+                          <tr key={i}>
+                            <td><span className="num muted" style={{ fontSize: 11 }}>{new Date(h.timestamp).toLocaleString('ko-KR')}</span></td>
+                            {CMP_COLS.map(c => <td key={c.key} className="r"><span className="num">{best && best[c.key] != null ? c.fmt(best[c.key]) : '—'}</span></td>)}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </Card>
+      )}
+    </>
+  );
+}
+
+// ── Explain section ────────────────────────────────────────────────────────
+
+function FindingList({ title, items, renderRow, emptyMsg, tone = '' }) {
+  if (!items?.length) return null;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div className="row gap8" style={{ marginBottom: 7 }}>
+        <b style={{ fontSize: 12 }}>{title}</b>
+        <Chip tone={tone || (items.length > 3 ? 'warn' : '')}>{items.length}건</Chip>
       </div>
-      </>}
+      <div className="col gap5">
+        {items.slice(0, 8).map((it, i) => (
+          <div key={i} className="row gap10" style={{ fontSize: 11.5, padding: '7px 11px', background: 'var(--surface-2)', borderRadius: 7, border: '1px solid var(--border)', flexWrap: 'wrap' }}>
+            {renderRow(it)}
+          </div>
+        ))}
+        {items.length > 8 && <div className="muted" style={{ fontSize: 11, paddingLeft: 4 }}>… {items.length - 8}건 더 있음</div>}
+      </div>
     </div>
   );
 }
+
+function SectionExplain({ bundle, simLogs, mode, simConfig }) {
+  const [analyzing,     setAnalyzing]     = useState(false);
+  const [llmResult,     setLlmResult]     = useState([]);
+  const [llmError,      setLlmError]      = useState(null);
+  const [revealed,      setRevealed]      = useState(0);
+  const [llmProviders,  setLlmProviders]  = useState([]);
+  const [selectedProv,  setSelectedProv]  = useState('');
+  const [usedProvider,  setUsedProvider]  = useState(null);
+  const [logOpen,       setLogOpen]       = useState(false);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/analysis/llm/providers`).then(r => r.json()).then(d => {
+      const ps = d.providers || [];
+      setLlmProviders(ps);
+      const active = ps.find(p => p.active);
+      if (active && !selectedProv) setSelectedProv(active.id);
+    }).catch(() => {});
+  }, []);
+
+  const summ = bundle?.simulation_summary;
+  const seed = summ?.recommendation_text_seed;
+
+  async function runAI() {
+    setAnalyzing(true); setRevealed(0); setLlmError(null); setLlmResult([]); setUsedProvider(null);
+    try {
+      const payload = {
+        sim_elapsed: 0, vehicle_pos: null,
+        edge_history: [], edge_avg_speeds: {}, route_edge_names: {},
+        sim_logs: simLogs ?? [],
+        algorithm: summ?.selected_algorithm ?? null,
+        handover_count: summ?.frequent_handover_sections?.length ?? 0,
+        latency_ms: bundle?.run_summary?.avg_latency_ms ?? null,
+        connected_node: null,
+        provider: selectedProv || null,
+      };
+      const res = await fetch(`${API_BASE}/api/analysis/llm`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+      const data = await res.json();
+      const sections = data.sections || [];
+      setLlmResult(sections); setUsedProvider(data.provider || null); setAnalyzing(false);
+      sections.forEach((_, i) => setTimeout(() => setRevealed(i + 1), i * 420));
+    } catch (e) { setAnalyzing(false); setLlmError(e.message || 'AI 분석 중 오류가 발생했습니다.'); }
+  }
+
+  if (!bundle?.available) {
+    return (
+      <Card title="원인 분석" en="Explain" style={{ marginBottom: 18 }}>
+        <SectionEmpty msg="시뮬레이션을 실행하면 병목·위험 분석이 표시됩니다." />
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      {/* ── primary finding + suggested focus ── */}
+      {seed?.primary_finding && (
+        <div style={{ padding: '12px 16px', background: 'var(--brand-tint)', borderRadius: 10, marginBottom: 16, fontSize: 12.5, lineHeight: 1.55 }}>
+          <b style={{ marginRight: 8, color: 'var(--brand-2)' }}>핵심 발견</b>{seed.primary_finding}
+          {seed.suggested_focus && <div className="muted" style={{ marginTop: 5, fontSize: 11.5 }}>분석 초점: {seed.suggested_focus}</div>}
+        </div>
+      )}
+
+      {/* ── findings grid ── */}
+      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        <Card title="병목 구간" en="Bottlenecks" right={<Chip tone={summ?.bottleneck_sections?.length ? 'warn' : ''}>{summ?.bottleneck_sections?.length ?? 0}건</Chip>}>
+          <FindingList title="" items={summ?.bottleneck_sections} tone="warn" renderRow={it => (<>
+            <span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>
+            <span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}% · {(it.latency_ms ?? 0).toFixed(1)} ms</span>
+            <Chip tone={it.severity === 'critical' ? 'bad' : 'warn'} style={{ marginLeft: 'auto' }}>{it.severity}</Chip>
+          </>)} />
+          {!summ?.bottleneck_sections?.length && <div className="muted" style={{ fontSize: 12 }}>병목 없음</div>}
+        </Card>
+
+        <Card title="과부하 기지국" en="Overloaded BS" right={<Chip tone={summ?.overloaded_base_stations?.length ? 'bad' : ''}>{summ?.overloaded_base_stations?.length ?? 0}건</Chip>}>
+          <FindingList title="" items={summ?.overloaded_base_stations} tone="bad" renderRow={it => (<>
+            <span className="mono" style={{ fontWeight: 600 }}>{it.bs_name}</span>
+            <span className="muted">부하 {((it.load_ratio ?? 0) * 100).toFixed(0)}%</span>
+            {it.affected_edge_count > 0 && <span className="muted">·경로 {it.affected_edge_count}구간 영향</span>}
+            <Chip tone={it.severity === 'critical' ? 'bad' : 'warn'} style={{ marginLeft: 'auto' }}>{it.severity}</Chip>
+          </>)} />
+          {!summ?.overloaded_base_stations?.length && <div className="muted" style={{ fontSize: 12 }}>과부하 없음</div>}
+        </Card>
+
+        <Card title="고지연 구간" en="High latency" right={<Chip tone={summ?.high_latency_sections?.length ? 'bad' : ''}>{summ?.high_latency_sections?.length ?? 0}건</Chip>}>
+          <FindingList title="" items={summ?.high_latency_sections} tone="bad" renderRow={it => (<>
+            <span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>
+            <span className="num" style={{ color: 'var(--bad)' }}>{(it.latency_ms ?? 0).toFixed(1)} ms</span>
+            <span className="muted">(+{(it.excess_ms ?? 0).toFixed(1)} ms 초과)</span>
+          </>)} />
+          {!summ?.high_latency_sections?.length && <div className="muted" style={{ fontSize: 12 }}>고지연 없음</div>}
+        </Card>
+
+        <Card title="핸드오버 구간" en="Handovers" right={<Chip>{summ?.frequent_handover_sections?.length ?? 0}건</Chip>}>
+          <FindingList title="" items={summ?.frequent_handover_sections} renderRow={it => (<>
+            <span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>
+            <span className="muted" style={{ fontSize: 11 }}>{it.from_bs_name} → {it.to_bs_name}</span>
+            <span className="num muted" style={{ marginLeft: 'auto' }}>{(it.latency_ms ?? 0).toFixed(1)} ms</span>
+          </>)} />
+          {!summ?.frequent_handover_sections?.length && <div className="muted" style={{ fontSize: 12 }}>핸드오버 없음</div>}
+        </Card>
+      </div>
+
+      {/* ── future connectivity risk ── */}
+      {summ?.future_connectivity_risk_sections?.length > 0 && (
+        <Card title="미래 연결 위험 구간" en="Future connectivity risk" right={<Chip tone="bad">{summ.future_connectivity_risk_sections.length}건</Chip>} style={{ marginBottom: 16 }}>
+          <div className="muted" style={{ fontSize: 11, marginBottom: 8 }}>경로 후반부(마지막 25%)에서 기지국 커버리지가 끊기는 구간입니다.</div>
+          <FindingList title="" items={summ.future_connectivity_risk_sections} tone="bad" renderRow={it => (<>
+            <span style={{ fontWeight: 600 }}>{it.street_name || it.edge_id}</span>
+            <Chip tone="bad" style={{ marginLeft: 'auto' }}>{it.severity}</Chip>
+          </>)} />
+        </Card>
+      )}
+
+      {/* ── degradation warnings ── */}
+      {seed?.degradation_warnings?.length > 0 && (
+        <Card title="성능 저하 경고" en="Degradation warnings" style={{ marginBottom: 16 }}>
+          <div className="col gap6">
+            {seed.degradation_warnings.map((t, i) => (
+              <div key={i} className="row gap10" style={{ padding: '7px 12px', borderRadius: 8, background: 'var(--bad-tint)', border: '1px solid var(--bad)', fontSize: 12 }}>
+                <Icon.warn size={13} style={{ color: 'var(--bad)', flexShrink: 0 }} />
+                <span>{t}</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {/* ── Chart 5: route segment risk strip ── */}
+      {bundle?.per_edge_metrics?.length > 0 && (() => {
+        const segs = bundle.per_edge_metrics;
+        const riskOf = e => {
+          if (e.within_coverage === false) return 'bad';
+          if ((e.load_ratio ?? 0) > 0.85) return 'bad';
+          if ((e.latency_ms ?? 0) > 60 || (e.load_ratio ?? 0) > 0.6) return 'warn';
+          return 'good';
+        };
+        const items = segs.map((e, i) => ({
+          badge:   e.handover ? 'HO' : `E${i + 1}`,
+          label:   (e.street_name || e.edge_id || `#${i + 1}`).slice(0, 14),
+          value:   e.latency_ms?.toFixed(1),
+          meta:    `${((e.load_ratio ?? 0) * 100).toFixed(0)}% 부하`,
+          accent:  riskOf(e) === 'bad' ? 'var(--bad)' : riskOf(e) === 'warn' ? 'var(--warn)' : 'var(--good)',
+          textColor: e.within_coverage === false ? 'var(--bad)' : undefined,
+        }));
+        const nBad = items.filter(it => it.accent === 'var(--bad)').length;
+        const nWarn = items.filter(it => it.accent === 'var(--warn)').length;
+        return (
+          <Card title="경로 구간 위험도 시각화" en="Route segment risk"
+            right={
+              <div className="row gap6">
+                {nBad > 0  && <Chip tone="bad">{nBad}개 위험</Chip>}
+                {nWarn > 0 && <Chip tone="warn">{nWarn}개 주의</Chip>}
+                <Chip>{segs.length}개 구간</Chip>
+              </div>
+            }
+            style={{ marginBottom: 16 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 10 }}>
+              각 막대 상단 색상: 위험도 레벨. 수치: 지연(ms). 'HO' 배지 = 핸드오버 발생 구간.
+              <span style={{ marginLeft: 10, color: 'var(--good)' }}>▬ 정상</span>
+              <span style={{ marginLeft: 8, color: 'var(--warn)' }}> ▬ 주의(부하&gt;60% 또는 지연&gt;60ms)</span>
+              <span style={{ marginLeft: 8, color: 'var(--bad)' }}> ▬ 위험(미커버 또는 부하&gt;85%)</span>
+            </div>
+            <SegmentStrip items={items} height={90} />
+          </Card>
+        );
+      })()}
+
+      {/* ── event log (collapsed by default — raw debug log) ── */}
+      <Card title="시뮬레이션 이벤트 로그" en="Event log"
+        right={
+          <div className="row gap8">
+            {simLogs?.length > 0 && <Chip tone="good" dot>실시간</Chip>}
+            <Chip>{simLogs?.length ?? 0}건</Chip>
+            <button className="btn icon sm" onClick={() => setLogOpen(o => !o)} title={logOpen ? '접기' : '펼치기'}>{logOpen ? '▲' : '▼'}</button>
+          </div>
+        }
+        style={{ marginBottom: 16 }}>
+        {!logOpen ? (
+          <div className="muted" style={{ fontSize: 11.5 }}>
+            시뮬레이션 원시 이벤트 로그 ({simLogs?.length ?? 0}건). ▼ 버튼을 눌러 펼치세요.
+          </div>
+        ) : (
+          <div className="tbl-wrap" style={{ maxHeight: 320 }}>
+            <table className="tbl">
+              <thead><tr><th>시각</th><th>대상</th><th>유형</th><th>내용</th></tr></thead>
+              <tbody>
+                {[...(simLogs || [])].reverse().map((l, i) => {
+                  const st = LOG_STYLE[l.kind] ?? LOG_STYLE.info;
+                  return (
+                    <tr key={i}>
+                      <td><span className="num muted" style={{ fontSize: 11.5 }}>{l.t}</span></td>
+                      <td><span className="mono" style={{ fontWeight: 600, fontSize: 11.5 }}>{l.target}</span></td>
+                      <td><Chip tone={st.tone} dot={!!st.tone}>{st.ko}</Chip></td>
+                      <td style={{ whiteSpace: 'normal', maxWidth: 280, lineHeight: 1.4 }}>{l.ko}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      {/* ── Formula reference panel ── */}
+      {(() => {
+        const [open, setOpen] = React.useState(false);
+        const M = ({ c }) => <span style={{ fontStyle: 'italic' }}>{c}</span>;
+        const FORMULAS = [
+          {
+            metric: 'E2E 지연',
+            formula: <><M c="L" /> = <M c="L" /><sub>tx</sub> + <M c="L" /><sub>q</sub> + <M c="L" /><sub>comp</sub></>,
+            threshold: '< 100 ms', ref: 'Hung et al., IEEE VTM 2017',
+          },
+          {
+            metric: 'PRR',
+            formula: <>PRR = 1 − TWDR</>,
+            threshold: '≥ 0.9', ref: 'Ali et al., IEEE Access 2021 §II.B',
+          },
+          {
+            metric: 'CBR',
+            formula: <>CBR = 1 − exp(−<M c="ρ" /> · <M c="R" /><sub>tx</sub> · <M c="f" /><sub>CAM</sub> · <M c="T" /><sub>RRI</sub>)</>,
+            threshold: '< 0.65', ref: 'Gonzalez-Martin et al., IEEE TVT 2019 §IV.A; ETSI TS 102 687 §5.2.2',
+          },
+          {
+            metric: 'PIR P99',
+            formula: <>PIR<sub>P99</sub> = <MathFrac n={<><M c="T" /><sub>CAM</sub></>} d="PRR" /></>,
+            threshold: '≤ 100 ms', ref: '3GPP TR 37.885 §A.2.4; Eckermann et al., IEEE VTC 2019',
+          },
+          {
+            metric: 'Jain FI',
+            formula: <><M c="J" /> = <MathFrac n={<>(Σ<sub><M c="i" /></sub> <M c="ρ" /><sub><M c="i" /></sub>)<sup>2</sup></>} d={<><M c="n" /> · Σ<sub><M c="i" /></sub> <M c="ρ" /><sub><M c="i" /></sub><sup>2</sup></>} /></>,
+            threshold: '≥ 0.9', ref: 'Jain, Chiu, Hawe, DEC-TR-301, 1984 §3.1',
+          },
+          {
+            metric: '경로 손실',
+            formula: <>PL(<M c="d" />) = PL(<M c="d" /><sub>0</sub>) + 10·<M c="n" />·log<sub>10</sub>(<M c="d" />/<M c="d" /><sub>0</sub>)</>,
+            threshold: 'n: LOS 1.61 / Urban 2.75 / NLOS 3.50', ref: 'Fernandez et al., IEEE WCL 2014, Table I-II',
+          },
+          {
+            metric: 'TWDR',
+            formula: <>TWDR = <MathFrac n={<>Σ<sub><M c="e" /></sub> [<M c="t" /><sub><M c="e" /></sub> · 𝟙(¬cov(<M c="e" />))]</>} d={<>Σ<sub><M c="e" /></sub> <M c="t" /><sub><M c="e" /></sub></>} /></>,
+            threshold: '< 0.1', ref: '자체 정의 (coverage risk)',
+          },
+          {
+            metric: '핸드오버 중단',
+            formula: <>HIT = Σ<sub><M c="e" /></sub> <M c="t" /><sub>ho</sub>(<M c="e" />) · 𝟙(HO)</>,
+            threshold: '200–400 ms/회', ref: '5G NR, IEEE doc 10320318 (2023)',
+          },
+        ];
+        return (
+          <Card title="지표 정의 및 근거" en="Metric definitions & citations"
+            right={<button className="btn icon sm" onClick={() => setOpen(o => !o)}>{open ? '▲' : '▼'}</button>}
+            style={{ marginBottom: 16 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: open ? 10 : 0 }}>
+              모든 해석 모델 기반 지표는 검증된 논문/표준 수식을 사용합니다. 클릭하여 펼치기.
+            </div>
+            {open && (
+              <div className="tbl-wrap">
+                <table className="tbl" style={{ fontSize: 11 }}>
+                  <thead><tr><th>지표</th><th>수식</th><th>임계값</th><th>출처</th></tr></thead>
+                  <tbody>
+                    {FORMULAS.map((f, i) => (
+                      <tr key={i}>
+                        <td style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>{f.metric}</td>
+                        <td>
+                          <span style={{ fontSize: 12, color: 'var(--brand-2)', display: 'inline-flex', alignItems: 'center', flexWrap: 'wrap', gap: 1 }}>
+                            {f.formula}
+                          </span>
+                        </td>
+                        <td style={{ whiteSpace: 'nowrap', color: 'var(--muted)' }}>{f.threshold}</td>
+                        <td style={{ fontSize: 10.5, color: 'var(--muted)', maxWidth: 260 }}>{f.ref}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        );
+      })()}
+
+      {/* ── LLM analysis ── */}
+      <Card title="AI 자연어 분석" en="LLM summary" right={
+        <div className="row gap8">
+          {mode === 'pro' && llmProviders.length > 1 && (
+            <select className="input" style={{ height: 28, fontSize: 11, minWidth: 110 }} value={selectedProv} onChange={e => setSelectedProv(e.target.value)}>
+              {llmProviders.map(p => <option key={p.id} value={p.id}>{p.name.split('/')[1]?.trim() || p.name} — {p.model}</option>)}
+            </select>
+          )}
+          <Chip tone="brand"><Icon.spark size={11} /> {usedProvider ? (PROVIDER_LABELS[usedProvider]?.name || usedProvider) : (PROVIDER_LABELS[selectedProv]?.name || 'AI')}</Chip>
+        </div>
+      } style={{ marginBottom: 16 }}>
+        {revealed === 0 && !analyzing && (
+          <div style={{ textAlign: 'center', padding: '22px 16px' }}>
+            <div style={{ width: 48, height: 48, borderRadius: 14, background: 'var(--brand-tint)', display: 'grid', placeItems: 'center', margin: '0 auto 12px', color: 'var(--brand-2)' }}><Icon.spark size={24} /></div>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>AI 분석 준비</div>
+            <div className="muted" style={{ fontSize: 11.5, marginBottom: 16 }}>이벤트 로그 {simLogs?.length ?? 0}건을 분석해 자연어 요약을 생성합니다</div>
+            {llmError && <div style={{ fontSize: 11.5, color: 'var(--bad)', marginBottom: 12, background: 'var(--bad-tint)', padding: '7px 10px', borderRadius: 8, textAlign: 'left' }}>{llmError}</div>}
+            <button className="btn primary" onClick={runAI}><Icon.spark size={14} /> AI 분석 시작</button>
+          </div>
+        )}
+        {analyzing && (
+          <div style={{ textAlign: 'center', padding: '30px 16px' }}>
+            <div className="spin" style={{ width: 28, height: 28, border: '3px solid var(--brand-tint2)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 12px' }} />
+            <div className="muted" style={{ fontSize: 12 }}>AI 분석 중…</div>
+          </div>
+        )}
+        {revealed > 0 && (
+          <div className="col gap10">
+            {llmResult.slice(0, revealed).map((t, i) => (
+              <div key={i} className="fade row gap10" style={{ padding: '11px 13px', background: i === 6 ? 'var(--bad-tint)' : i === 7 ? 'var(--good-tint)' : 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
+                <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flexShrink: 0, marginTop: 1 }}>{String(i + 1).padStart(2, '0')}</span>
+                <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
+              </div>
+            ))}
+            {revealed === llmResult.length && llmResult.length > 0 && (
+              <button className="btn sm" onClick={runAI} style={{ alignSelf: 'flex-start' }}><Icon.reset size={12} /> 다시 분석</button>
+            )}
+          </div>
+        )}
+      </Card>
+    </>
+  );
+}
+
+// ── Batch sub-section (used inside Compare) ────────────────────────────────
+
+function SectionBatch({ mode }) {
+  const [scenarioBatches, setScenarioBatches] = useState(() => loadScenarioBatches());
+  const [selectedBatch,   setSelectedBatch]   = useState(0);
+  const [batchAiLoading,  setBatchAiLoading]  = useState(false);
+  const [batchAiError,    setBatchAiError]    = useState(null);
+  const [batchAiSections, setBatchAiSections] = useState([]);
+  const [batchAiRevealed, setBatchAiRevealed] = useState(0);
+  const [batchAiProvider, setBatchAiProvider] = useState(null);
+  const [selectedProv,    setSelectedProv]    = useState('');
+
+  useEffect(() => { setBatchAiSections([]); setBatchAiError(null); setBatchAiRevealed(0); }, [selectedBatch]);
+
+  const reversed     = [...scenarioBatches].reverse();
+  const currentBatch = reversed[selectedBatch] || null;
+
+  function removeBatch(ri) {
+    const origIdx = scenarioBatches.length - 1 - ri;
+    const next = scenarioBatches.filter((_, i) => i !== origIdx);
+    setScenarioBatches(next); saveScenarioBatches(next); setSelectedBatch(0);
+  }
+
+  async function runBatchAI(batch) {
+    setBatchAiLoading(true); setBatchAiError(null); setBatchAiSections([]); setBatchAiRevealed(0); setBatchAiProvider(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/analysis/llm/batch-compare`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: batch.label, results: batch.results, provider: selectedProv || null }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      const sections = data.sections || [];
+      setBatchAiSections(sections); setBatchAiProvider(data.provider || null); setBatchAiLoading(false);
+      sections.forEach((_, i) => setTimeout(() => setBatchAiRevealed(i + 1), i * 450));
+    } catch (e) { setBatchAiLoading(false); setBatchAiError(e.message || '오류'); }
+  }
+
+  if (scenarioBatches.length === 0) return null;
+
+  return (
+    <Card title="시나리오 배치 비교" en="Batch compare" right={<Chip>{scenarioBatches.length}개 배치</Chip>} style={{ marginBottom: 16 }}>
+      <div className="row gap8 wrap" style={{ marginBottom: 14 }}>
+        {reversed.map((b, i) => {
+          const kind = inferBatchKind(b);
+          const done = (b.results || []).filter(r => r.status === 'done').length;
+          const total = b.results?.length ?? 0;
+          return (
+            <div key={b.batch_id} onClick={() => setSelectedBatch(i)} style={{ flex: '1 1 200px', maxWidth: 270, cursor: 'pointer', padding: '10px 12px', borderRadius: 10, background: i === selectedBatch ? 'var(--brand-tint)' : 'var(--surface-2)', border: `1.5px solid ${i === selectedBatch ? 'var(--brand-2)' : 'var(--border)'}`, transition: 'border-color .15s' }}>
+              <div className="row between" style={{ marginBottom: 5 }}>
+                <Chip tone={kind.tone}>{kind.text}</Chip>
+                <button className="btn icon sm" onClick={e => { e.stopPropagation(); removeBatch(i); }}>✕</button>
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.label || '(레이블 없음)'}</div>
+              <div className="muted" style={{ fontSize: 10.5, marginTop: 3 }}>{done}/{total} 성공</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {currentBatch && (() => {
+        const doneResults = (currentBatch.results || []).filter(r => r.status === 'done');
+        const isRl = doneResults.some(r => r.mode === 'rl_episode');
+        const sweepData = parseSweepBatch(currentBatch);
+        let bestIdx = -1;
+        if (doneResults.length > 0) {
+          bestIdx = doneResults.reduce((bi, r, i) => {
+            const cur  = r.mode === 'rl_episode' ? (r.mean_reward ?? r.total_reward ?? -Infinity) : -(r.route_cost_result?.total_cost ?? Infinity);
+            const best = doneResults[bi];
+            const bv   = best.mode === 'rl_episode' ? (best.mean_reward ?? best.total_reward ?? -Infinity) : -(best.route_cost_result?.total_cost ?? Infinity);
+            return cur > bv ? i : bi;
+          }, 0);
+        }
+        const bestId = bestIdx >= 0 ? doneResults[bestIdx].id : null;
+
+        return (
+          <>
+            {sweepData ? (
+              <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+                <div>
+                  <div className="muted" style={{ fontSize: 10.5, marginBottom: 5 }}>총 비용 추이 (파라미터 스윕)</div>
+                  <LineChart
+                    series={[sweepData.points.map(p => p.totalCost ?? 0)]}
+                    height={150}
+                    labels={sweepData.points.map(p => String(p.x))}
+                    colors={['var(--brand-2)']}
+                    yLabel="총 비용 (cost)"
+                    xLabel={sweepData.paramLabel}
+                  />
+                </div>
+                <div>
+                  <div className="muted" style={{ fontSize: 10.5, marginBottom: 5 }}>평균 지연 추이 (파라미터 스윕)</div>
+                  <LineChart
+                    series={[sweepData.points.map(p => p.avgLatency ?? 0)]}
+                    height={150}
+                    yUnit="ms"
+                    labels={sweepData.points.map(p => String(p.x))}
+                    colors={['var(--warn)']}
+                    yLabel="평균 지연 (ms)"
+                    xLabel={sweepData.paramLabel}
+                  />
+                </div>
+              </div>
+            ) : !isRl ? (
+              <div style={{ marginBottom: 14 }}><BarChart items={doneResults.map(r => ({ label: r.label || r.id, value: r.route_cost_result?.total_cost ?? 0, display: `비용 ${(r.route_cost_result?.total_cost ?? 0).toFixed(1)}`, color: 'var(--brand-2)' }))} /></div>
+            ) : null}
+
+            <div className="tbl-wrap">
+              <table className="tbl">
+                <thead><tr><th>시나리오</th><th>모드</th><th className="r">차량/정책</th><th className="r">seed</th><th className="r">결과</th></tr></thead>
+                <tbody>
+                  {currentBatch.results.map((r, i) => {
+                    const isRlRow = r.mode === 'rl_episode';
+                    const isBest  = r.status === 'done' && r.id === bestId;
+                    return (
+                      <tr key={i} style={isBest ? { background: 'var(--good-tint)' } : {}}>
+                        <td style={{ borderLeft: `3px solid ${r.status !== 'done' ? 'var(--bad)' : isRlRow ? 'var(--good)' : 'var(--brand-2)'}`, paddingLeft: 9 }}>{r.label || r.id}</td>
+                        <td><Chip tone={r.status === 'done' ? (isRlRow ? 'good' : 'brand') : 'bad'}>{r.mode}</Chip></td>
+                        <td className="r"><span className="num">{isRlRow ? (r.policy || '—') : (r.vehicle_count ?? '—')}</span></td>
+                        <td className="r"><span className="num muted">{r.seed ?? '—'}</span></td>
+                        <td className="r">
+                          {r.status !== 'done' ? <span style={{ color: 'var(--bad)' }}>{r.error || '실패'}</span>
+                            : isRlRow ? <span className="num">reward {(r.mean_reward ?? r.total_reward ?? 0).toFixed(2)}</span>
+                            : <span className="num">비용 {(r.route_cost_result?.total_cost ?? 0).toFixed(2)} · {(r.route_cost_result?.avg_latency_ms ?? 0).toFixed(1)} ms</span>}
+                          {isBest && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="row gap8" style={{ marginTop: 12 }}>
+              <button className="btn sm primary" disabled={batchAiLoading} onClick={() => runBatchAI(currentBatch)}>
+                {batchAiLoading ? <><Icon.reset size={12} className="spin" /> 분석 중…</> : <><Icon.spark size={12} /> 배치 비교 AI 분석</>}
+              </button>
+              {batchAiProvider && <Chip style={{ color: PROVIDER_LABELS[batchAiProvider]?.color }}>{PROVIDER_LABELS[batchAiProvider]?.name || batchAiProvider}</Chip>}
+            </div>
+            {batchAiError && <div style={{ marginTop: 8, fontSize: 11.5, color: 'var(--bad)', background: 'var(--bad-tint)', padding: '7px 10px', borderRadius: 8 }}>{batchAiError}</div>}
+            {batchAiRevealed > 0 && (
+              <div className="col gap10" style={{ marginTop: 12 }}>
+                {batchAiSections.slice(0, batchAiRevealed).map((t, i) => (
+                  <div key={i} className="fade row gap10" style={{ padding: '11px 13px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
+                    <span className="num" style={{ fontSize: 11, fontWeight: 700, color: 'var(--brand-2)', flexShrink: 0 }}>{String(i + 1).padStart(2, '0')}</span>
+                    <span style={{ fontSize: 12.5, lineHeight: 1.5 }}>{t}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        );
+      })()}
+    </Card>
+  );
+}
+
+// ── Export section ─────────────────────────────────────────────────────────
+
+function SectionExport({ bundle, simLogs, simHistory, simConfig, networkTelemetry, routeEdges, mode }) {
+  const [csvFlash,    setCsvFlash]    = useState({});
+  const [reportFlash, setReportFlash] = useState({});
+  const [jsonFlash,   setJsonFlash]   = useState(false);
+  const [docxError,   setDocxError]   = useState(null);
+  const [scenarioBatches] = useState(() => loadScenarioBatches());
+
+  const available = !!bundle?.available;
+
+  function flash(key) { setCsvFlash(p => ({ ...p, [key]: true })); setTimeout(() => setCsvFlash(p => ({ ...p, [key]: false })), 2200); }
+
+  async function downloadCsv(endpoint, filename) {
+    try {
+      const res = await fetch(`${API_BASE}${endpoint}`);
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.detail || '다운로드 실패'); return; }
+      const blob = await res.blob();
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+      flash(filename);
+    } catch (e) { alert(e.message || '다운로드 실패'); }
+  }
+
+  async function downloadEventLogs() {
+    try {
+      const res = await fetch(`${API_BASE}/api/export/csv/event-logs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: simLogs ?? [], sim_elapsed_s: 0 }),
+      });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.detail || '실패'); return; }
+      const blob = await res.blob();
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'event_logs.csv'; a.click();
+      flash('event_logs.csv');
+    } catch (e) { alert(e.message || '실패'); }
+  }
+
+  async function downloadBatchCompare() {
+    if (!scenarioBatches.length) { alert('저장된 배치가 없습니다.'); return; }
+    try {
+      const res = await fetch(`${API_BASE}/api/export/csv/batch-compare`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batches: scenarioBatches }),
+      });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.detail || '실패'); return; }
+      const blob = await res.blob();
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'batch_compare.csv'; a.click();
+      flash('batch_compare.csv');
+    } catch (e) { alert(e.message || '실패'); }
+  }
+
+  async function downloadReport(format) {
+    setDocxError(null);
+    const [fmt, qs] = format.split('?');
+    try {
+      const url = `${API_BASE}/api/export/report/${fmt}${qs ? '?' + qs : ''}`;
+      const res = await fetch(url);
+      if (res.status === 501) {
+        const d = await res.json().catch(() => ({}));
+        setDocxError(d.detail || 'python-docx가 설치되어 있지 않습니다.');
+        return;
+      }
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert(d.detail || '실패'); return; }
+      const blob = await res.blob();
+      const ext = fmt === 'markdown' ? 'md' : fmt === 'html' ? 'html' : fmt === 'docx' ? 'docx' : 'json';
+      const langSuffix = qs?.includes('lang=ko') ? '_KO' : qs?.includes('lang=en') ? '_EN' : '';
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `v2x_report${langSuffix}.${ext}`; a.click();
+      setReportFlash(p => ({ ...p, [format]: true }));
+      setTimeout(() => setReportFlash(p => ({ ...p, [format]: false })), 2200);
+    } catch (e) { alert(e.message || '실패'); }
+  }
+
+  function downloadFullJson() {
+    const payload = {
+      exported_at: new Date().toISOString(),
+      report_bundle: bundle ?? null,
+      sim_logs: simLogs ?? [],
+      sim_history: simHistory ?? [],
+      route_edges: routeEdges ?? null,
+      network_telemetry: networkTelemetry ?? null,
+      scenario_batches: scenarioBatches ?? [],
+      sim_config: simConfig ?? null,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'v2x_full_report.json'; a.click();
+    setJsonFlash(true); setTimeout(() => setJsonFlash(false), 2200);
+  }
+
+  const CSV_EXPORTS = [
+    { key: 'run_summary',       label: 'run_summary.csv',       endpoint: '/api/export/csv/run-summary',       desc: '핵심 KPI 1행 요약',         needs: available },
+    { key: 'algorithm_compare', label: 'algorithm_compare.csv', endpoint: '/api/export/csv/algorithm-compare', desc: '알고리즘별 전체 메트릭',     needs: available && !!bundle?.algorithm_compare?.length },
+    { key: 'per_edge',          label: 'per_edge_metrics.csv',  endpoint: '/api/export/csv/per-edge',          desc: '구간별 상세 비용 데이터',    needs: available && !!bundle?.per_edge_metrics?.length },
+    { key: 'per_bs',            label: 'per_bs_metrics.csv',    endpoint: '/api/export/csv/per-bs',            desc: 'BS/RSU 노드별 메트릭',      needs: available && !!bundle?.per_bs_metrics?.length },
+    { key: 'scenario_metadata', label: 'scenario_metadata.csv', endpoint: '/api/export/csv/scenario-metadata', desc: '시뮬레이션 설정 및 식별자',  needs: true },
+  ];
+
+  return (
+    <>
+      {/* ── structured CSV exports ── */}
+      <Card title="CSV 내보내기" en="CSV export" style={{ marginBottom: 16 }}>
+        {!available && <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>시뮬레이션을 먼저 실행하면 데이터가 채워집니다.</div>}
+        <div className="col gap8">
+          {CSV_EXPORTS.map(({ key, label, endpoint, desc, needs }) => (
+            <div key={key} className="row between" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600 }}>{label}</div>
+                <div className="muted" style={{ fontSize: 11 }}>{desc}</div>
+              </div>
+              <button className={'btn sm' + (csvFlash[label] ? ' good' : '')} disabled={!needs} onClick={() => downloadCsv(endpoint, label)}>
+                {csvFlash[label] ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 다운로드</>}
+              </button>
+            </div>
+          ))}
+          {/* event_logs — client-side POST */}
+          <div className="row between" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>event_logs.csv</div>
+              <div className="muted" style={{ fontSize: 11 }}>시뮬레이션 이벤트 로그 ({simLogs?.length ?? 0}건)</div>
+            </div>
+            <button className={'btn sm' + (csvFlash['event_logs.csv'] ? ' good' : '')} disabled={!simLogs?.length} onClick={downloadEventLogs}>
+              {csvFlash['event_logs.csv'] ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 다운로드</>}
+            </button>
+          </div>
+          {/* batch_compare — client-side POST */}
+          <div className="row between" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>batch_compare.csv</div>
+              <div className="muted" style={{ fontSize: 11 }}>시나리오 배치 비교 ({scenarioBatches.length}개 배치)</div>
+            </div>
+            <button className={'btn sm' + (csvFlash['batch_compare.csv'] ? ' good' : '')} disabled={!scenarioBatches.length} onClick={downloadBatchCompare}>
+              {csvFlash['batch_compare.csv'] ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 다운로드</>}
+            </button>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── Structured report exports ── */}
+      <Card title="보고서 내보내기" en="Report export" style={{ marginBottom: 16 }}>
+        {!available && <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>시뮬레이션을 먼저 실행하면 보고서를 생성할 수 있습니다.</div>}
+        <div className="col gap8">
+          {[
+            { fmt: 'markdown', label: 'Markdown 보고서', desc: '논문·GitHub 호환 — 모든 10개 섹션 포함', ext: '.md' },
+            { fmt: 'html',     label: 'HTML 보고서',     desc: '독립형 HTML — 브라우저 열람·인쇄 가능', ext: '.html' },
+            { fmt: 'json',     label: '보고서 JSON',     desc: '구조화된 ReportDocument 모델 (Python/R 분석용)', ext: '.json' },
+          ].map(({ fmt, label, desc, ext }) => (
+            <div key={fmt} className="row between" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600 }}>{label}<span className="muted" style={{ fontWeight: 400, marginLeft: 6, fontSize: 11 }}>{ext}</span></div>
+                <div className="muted" style={{ fontSize: 11 }}>{desc}</div>
+              </div>
+              <button className={'btn sm' + (reportFlash[fmt] ? ' good' : '')} disabled={!available} onClick={() => downloadReport(fmt)}>
+                {reportFlash[fmt] ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 다운로드</>}
+              </button>
+            </div>
+          ))}
+          {/* DOCX — Korean + English (dual-language academic format) */}
+          <div style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)' }}>
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>DOCX 학술 보고서<span className="muted" style={{ fontWeight: 400, marginLeft: 6, fontSize: 11 }}>.docx</span></div>
+              <div className="muted" style={{ fontSize: 11 }}>논문/연구보고서 형식 — Abstract·수식·참고문헌 포함 · python-docx 필요</div>
+            </div>
+            <div className="row gap8">
+              <button className={'btn sm' + (reportFlash['docx?lang=ko'] ? ' good' : '')} disabled={!available} onClick={() => downloadReport('docx?lang=ko')}>
+                {reportFlash['docx?lang=ko'] ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 워드 (한국어)</>}
+              </button>
+              <button className={'btn sm' + (reportFlash['docx?lang=en'] ? ' good' : '')} disabled={!available} onClick={() => downloadReport('docx?lang=en')}>
+                {reportFlash['docx?lang=en'] ? <><Icon.check size={12} /> Saved</> : <><Icon.download size={12} /> Word (English)</>}
+              </button>
+            </div>
+          </div>
+          {docxError && (
+            <div style={{ fontSize: 11, color: 'var(--bad)', padding: '6px 10px', borderRadius: 6, background: 'var(--surface-2)', border: '1px solid var(--bad)' }}>
+              DOCX: {docxError}
+            </div>
+          )}
+        </div>
+
+        {/* full JSON export — Pro only */}
+        {mode === 'pro' && (
+          <div className="row between" style={{ padding: '8px 12px', borderRadius: 8, background: 'var(--surface-2)', border: '1px solid var(--border)', marginTop: 8 }}>
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>전체 JSON 내보내기</div>
+              <div className="muted" style={{ fontSize: 11 }}>시계열·배치·설정 원시 데이터 전체 (외부 분석 도구용)</div>
+            </div>
+            <button className={'btn sm' + (jsonFlash ? ' good' : '')} onClick={downloadFullJson}>
+              {jsonFlash ? <><Icon.check size={12} /> 저장됨</> : <><Icon.download size={12} /> 다운로드</>}
+            </button>
+          </div>
+        )}
+      </Card>
+    </>
+  );
+}
+
+// ── Metadata section ───────────────────────────────────────────────────────
+
+function KVRow({ label, value, mono }) {
+  return (
+    <div className="row between" style={{ padding: '6px 0', borderBottom: '1px solid var(--border)', fontSize: 12 }}>
+      <span className="muted">{label}</span>
+      {mono
+        ? <span className="mono" style={{ fontWeight: 600, fontSize: 11.5 }}>{value ?? '—'}</span>
+        : <span style={{ fontWeight: 500 }}>{value ?? '—'}</span>}
+    </div>
+  );
+}
+
+function SectionMetadata({ bundle }) {
+  const meta   = bundle?.scenario_metadata;
+  const summ   = bundle?.simulation_summary;
+  const cfg    = summ?.used_config;
+
+  if (!bundle?.available) {
+    return (
+      <Card title="메타데이터" en="Metadata" style={{ marginBottom: 18 }}>
+        <SectionEmpty msg="시뮬레이션을 실행하면 설정 및 런 식별자가 표시됩니다." />
+      </Card>
+    );
+  }
+
+  const originStr = meta?.origin_lat != null ? `${Number(meta.origin_lat).toFixed(5)}, ${Number(meta.origin_lng).toFixed(5)}` : '—';
+  const destStr   = meta?.dest_lat   != null ? `${Number(meta.dest_lat).toFixed(5)}, ${Number(meta.dest_lng).toFixed(5)}`   : '—';
+  const cw = meta?.cost_weights || {};
+  const ns = meta?.norm_scales  || {};
+
+  return (
+    <>
+      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        {/* ── run identity ── */}
+        <Card title="런 식별자" en="Run identity">
+          <KVRow label="런 ID"       value={meta?.run_id || bundle?.run_summary?.run_id} mono />
+          <KVRow label="시나리오 ID" value={meta?.scenario_id || summ?.scenario_id} mono />
+          <KVRow label="생성 시각"   value={summ?.generated_at ? new Date(summ.generated_at).toLocaleString('ko-KR') : null} />
+          <KVRow label="시드(seed)"  value={meta?.seed ?? '미지정'} mono />
+          <KVRow label="차량 수"     value={meta?.vehicle_count != null ? `${meta.vehicle_count}대` : null} />
+          <KVRow label="시뮬 모드"   value={meta?.sim_mode} />
+          <KVRow label="출발 좌표"   value={originStr} mono />
+          <KVRow label="도착 좌표"   value={destStr} mono />
+        </Card>
+
+        {/* ── algorithm selection ── */}
+        <Card title="알고리즘 설정" en="Algorithm config">
+          <KVRow label="네트워크 모드"      value={meta?.network_mode} />
+          <KVRow label="교통 시간대"        value={meta?.traffic_time_period === 'peak' ? '첨두시 (peak)' : '비첨두시 (off_peak)'} />
+          <KVRow label="경로 알고리즘"      value={algoLabel(meta?.route_algorithm)} />
+          <KVRow label="지연 알고리즘"      value={algoLabel(meta?.latency_algorithm)} />
+          <KVRow label="BS 선택 알고리즘"   value={algoLabel(meta?.bs_selection_algorithm)} />
+          <KVRow label="자원 할당 알고리즘" value={algoLabel(meta?.resource_allocation_algorithm || meta?.allocation_algorithm)} />
+          <KVRow label="선택 알고리즘"      value={algoLabel(summ?.selected_algorithm)} />
+          <KVRow label="기준 알고리즘"      value={algoLabel(summ?.baseline_algorithm)} />
+        </Card>
+      </div>
+
+      {/* ── cost weights + norm scales ── */}
+      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        <Card title="비용 가중치" en="Cost weights">
+          {[['w_distance', '거리'], ['w_time', '이동 시간'], ['w_latency', 'Latency'], ['w_load', 'BS 부하'], ['w_handover', '핸드오버'], ['w_blockage', '신호 차단'], ['w_coverage_risk', '커버리지 위험']].map(([k, lbl]) => (
+            <KVRow key={k} label={lbl} value={cw[k] != null ? Number(cw[k]).toFixed(2) : (cfg?.cost_weights?.[k] != null ? Number(cfg.cost_weights[k]).toFixed(2) : '—')} mono />
+          ))}
+        </Card>
+
+        <Card title="정규화 스케일" en="Norm scales">
+          {[['distance_km', '거리 (km)'], ['time_min', '시간 (min)'], ['latency_ms', 'Latency (ms)'], ['loss_db', '손실 (dB)']].map(([k, lbl]) => (
+            <KVRow key={k} label={lbl} value={ns[k] != null ? Number(ns[k]).toFixed(2) : (cfg?.norm_scales?.[k] != null ? Number(cfg.norm_scales[k]).toFixed(2) : '—')} mono />
+          ))}
+          <div style={{ marginTop: 12 }}>
+            <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>네트워크 관찰</div>
+            {(summ?.recommendation_text_seed?.network_observations || []).map((t, i) => (
+              <div key={i} style={{ fontSize: 11.5, padding: '4px 0', lineHeight: 1.5 }}>• {t}</div>
+            ))}
+          </div>
+        </Card>
+      </div>
+    </>
+  );
+}
+
+// ── Root ReportTab component ───────────────────────────────────────────────
+
+function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, routeEdges, simHistory, simConfig, mode }) {
+  const [subTab,       setSubTab]       = useState(() => mode === 'lite' ? 'explain' : 'overview');
+  const [bundle,       setBundle]       = useState(null);
+  const [bundleLoading, setBundleLoading] = useState(false);
+  const [bundleError,  setBundleError]  = useState(null);
+
+  // Lite can only see explain (logs + LLM) — reset if mode changes
+  useEffect(() => { if (mode === 'lite' && subTab !== 'explain') setSubTab('explain'); }, [mode, subTab]);
+
+  function fetchBundle() {
+    setBundleLoading(true); setBundleError(null);
+    // Push current sheet's routeEdges into backend _state first so the bundle
+    // reflects the active sheet even when multiple sheets have been run.
+    const prep = routeEdges
+      ? fetch(`${API_BASE}/api/report/use-sheet`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ route_edges: routeEdges, network_telemetry: networkTelemetry || null }),
+        }).catch(() => {})
+      : Promise.resolve();
+    prep.then(() =>
+      fetch(`${API_BASE}/api/report/bundle`)
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .then(d => { setBundle(d); setBundleLoading(false); })
+        .catch(e => { setBundleLoading(false); setBundleError(e.message || '번들 불러오기 실패'); })
+    );
+  }
+  useEffect(() => { fetchBundle(); }, []);
+
+  const TAB_OPTIONS = mode === 'pro'
+    ? [
+        { v: 'overview',  label: 'Overview'  },
+        { v: 'compare',   label: 'Compare'   },
+        { v: 'explain',   label: 'Explain'   },
+        { v: 'export',    label: 'Export'    },
+        { v: 'metadata',  label: 'Metadata'  },
+      ]
+    : [{ v: 'explain', label: '분석' }];
+
+  return (
+    <div className="page-pad fade">
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Analysis Report</div>
+          <h1>분석 보고서 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Report</span></h1>
+          <div className="sub">Overview · Compare · Explain · Export · Metadata</div>
+        </div>
+        <div className="row gap8">
+          {simLogs?.length > 0 && <Chip tone="good" dot>LIVE</Chip>}
+          <button className="btn sm" onClick={fetchBundle} disabled={bundleLoading}>
+            {bundleLoading ? <><Icon.reset size={13} className="spin" /> 불러오는 중…</> : <><Icon.reset size={13} /> 새로고침</>}
+          </button>
+        </div>
+      </div>
+
+      <div className="row gap8" style={{ marginBottom: bundleError ? 8 : 20 }}>
+        <Seg value={subTab} onChange={setSubTab} options={TAB_OPTIONS} />
+        {bundle?.available && <Chip tone="good">데이터 있음</Chip>}
+        {bundle && !bundle.available && <Chip tone="">{bundle.reason || '데이터 없음'}</Chip>}
+      </div>
+
+      {bundleError && (
+        <div style={{ fontSize: 11.5, color: 'var(--bad)', marginBottom: 16, padding: '7px 12px', borderRadius: 8, background: 'var(--bad-tint)', border: '1px solid var(--bad)' }}>
+          보고서 번들 불러오기 실패: {bundleError}
+        </div>
+      )}
+
+      {bundleLoading && !bundle && (
+        <div style={{ textAlign: 'center', padding: '40px 16px', color: 'var(--ink-4)' }}>
+          <div className="spin" style={{ width: 24, height: 24, border: '2px solid var(--border)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 12px' }} />
+          <div style={{ fontSize: 12.5 }}>보고서 데이터 불러오는 중…</div>
+        </div>
+      )}
+
+      {(!bundleLoading || bundle) && subTab === 'overview' && mode === 'pro' && (
+        <SectionOverview bundle={bundle} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} sim={sim} />
+      )}
+
+      {(!bundleLoading || bundle) && subTab === 'compare' && mode === 'pro' && (
+        <>
+          <SectionCompare bundle={bundle} routeCoords={routeCoords} routeEdges={routeEdges} networkTelemetry={networkTelemetry} vehiclePos={vehiclePos} simHistory={simHistory} simConfig={simConfig} mode={mode} />
+          <SectionBatch mode={mode} />
+        </>
+      )}
+
+      {(!bundleLoading || bundle) && subTab === 'explain' && (
+        <SectionExplain bundle={bundle} simLogs={simLogs} mode={mode} simConfig={simConfig} />
+      )}
+
+      {subTab === 'export' && mode === 'pro' && (
+        <SectionExport bundle={bundle} simLogs={simLogs} simHistory={simHistory} simConfig={simConfig} networkTelemetry={networkTelemetry} routeEdges={routeEdges} mode={mode} />
+      )}
+
+      {(!bundleLoading || bundle) && subTab === 'metadata' && mode === 'pro' && (
+        <SectionMetadata bundle={bundle} />
+      )}
+    </div>
+  );
+}
+
 window.ReportTab = ReportTab;

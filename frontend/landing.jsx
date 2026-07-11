@@ -17,7 +17,7 @@ const MODE_CARDS = [
     v: 'pro',
     title: 'Professional',
     en: 'For research & evaluation',
-    desc: '스타트업 · 대학원 · 연구실 — 전체 알고리즘/실험 기능이 필요한 분께 추천합니다.',
+    desc: '스타트업 · 대학원 · 연구실 · 전체 알고리즘/실험 기능이 필요한 분께 추천합니다.',
     bullets: [
       '알고리즘 선택, 비용가중치, 커스텀 정책 등 전체 설정',
       '경로·알고리즘 비교, 시나리오 배치 실행/비교',

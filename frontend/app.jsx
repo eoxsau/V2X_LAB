@@ -57,7 +57,7 @@ function App() {
       lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
       prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
       traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
-      traffic_time_period: 'peak',
+      traffic_time_period: 'peak', bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
     },
   };
   const [simConfig, setSimConfig] = useState(() => {
@@ -317,8 +317,11 @@ function App() {
             backgroundVehicles={backgroundVehicles}
             setBackgroundVehicles={setBackgroundVehicles}
             simLogs={simLogs}
+            setSimLogs={setSimLogs}
             simHistory={simHistory}
+            setSimHistory={setSimHistory}
             routeEdges={routeEdges}
+            setRouteEdges={setRouteEdges}
             sheets={sheets}
             setSheets={setSheets}
             activeSheetIdx={activeSheetIdx}

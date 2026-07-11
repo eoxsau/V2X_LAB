@@ -29,6 +29,9 @@
     @keyframes spin { to { transform: rotate(360deg); } }
     .fade { opacity: 1; }
 
+    /* Math expression sub/sup — prevent line-height blowout */
+    sub, sup { line-height: 0; font-size: 0.72em; }
+
     /* Prism JSON token colors — matched to app CSS variables, not a stock theme */
     .sc-code-layer .token.property  { color: var(--brand-2); }
     .sc-code-layer .token.string    { color: var(--good); }
@@ -49,14 +52,14 @@
 
   <script src="data.js"></script>
   <script type="text/babel" src="ui.jsx?v=20260623a"></script>
-  <script type="text/babel" src="landing.jsx?v=20260629b"></script>
-  <script type="text/babel" src="charts.jsx?v=20260621a"></script>
-  <script type="text/babel" src="tab-dashboard.jsx?v=20260630c"></script>
-  <script type="text/babel" src="tab-simulation.jsx?v=20260630c"></script>
+  <script type="text/babel" src="landing.jsx?v=20260711a"></script>
+  <script type="text/babel" src="charts.jsx?v=20260706a"></script>
+  <script type="text/babel" src="tab-dashboard.jsx?v=20260708b"></script>
+  <script type="text/babel" src="tab-simulation.jsx?v=20260711d"></script>
   <script type="text/babel" src="tab-scenario.jsx?v=20260629a"></script>
   <script type="text/babel" src="tab-sim-chat.jsx?v=20260624a"></script>
-  <script type="text/babel" src="tab-report.jsx?v=20260630e"></script>
-  <script type="text/babel" src="tab-settings.jsx?v=20260629a"></script>
-  <script type="text/babel" src="app.jsx?v=20260629b"></script>
+  <script type="text/babel" src="tab-report.jsx?v=20260711a"></script>
+  <script type="text/babel" src="tab-settings.jsx?v=20260630b"></script>
+  <script type="text/babel" src="app.jsx?v=20260711a"></script>
 </body>
 </html>

@@ -111,9 +111,9 @@ function buildFallbackLookahead(routeEdges, vehiclePos, hops) {
 function LatencyBreakdown({ total, lBase, lSignal, lQueue }) {
   if (total === null || lBase === null || lSignal === null || lQueue === null) return null;
   const items = [
-    { label: '기본 지연(L_base)',     value: lBase,   color: 'var(--brand-2)' },
-    { label: '신호 지연(HARQ)',       value: lSignal, color: 'var(--warn)'    },
-    { label: '혼잡 대기(큐잉)',       value: lQueue,  color: 'var(--bad)'     },
+    { label: <><i>L</i><sub>tx</sub> — 전송 지연</>,  value: lBase,   color: 'var(--brand-2)' },
+    { label: <><i>L</i><sub>q</sub> — 신호 처리</>,   value: lSignal, color: 'var(--warn)'    },
+    { label: <><i>L</i><sub>comp</sub> — 혼잡 대기</>, value: lQueue,  color: 'var(--bad)'     },
   ];
   return (
     <Card
@@ -336,17 +336,38 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const bsItems    = candidates.slice(0, 5).map(c => {
     const ms  = c.predicted_latency_ms ?? 0;
     const pct = Math.min(100, Math.round(ms / 0.3));
+    const isRsu = c.type === 'rsu';
     return {
-      label:   (c.name ?? c.id ?? '').replace(/기지국\s*/, 'BS-'),
+      label:   isRsu ? `[RSU] ${c.name ?? c.id ?? ''}` : (c.name ?? c.id ?? '').replace(/기지국\s*/, 'BS-'),
       value:   pct,
       display: ms.toFixed(1) + 'ms',
-      color:   pct > 50 ? 'var(--bad)' : pct > 25 ? 'var(--warn)' : 'var(--good)',
+      color:   isRsu ? '#FF8F00' : (pct > 50 ? 'var(--bad)' : pct > 25 ? 'var(--warn)' : 'var(--good)'),
     };
   });
 
   /* latency chip */
   const latTone = latency !== null ? latencyTone(latency) : null;
   const latTxt  = latency !== null ? latency.toFixed(1) : '—';
+
+  /* CBR — Gonzalez-Martin et al., IEEE TVT 2019 §IV.A
+     CBR = 1 − exp(−ρ·R_tx·f_CAM·T_RRI)
+     ρ = vehicle_count / route_distance_m, R_tx = BS coverage radius (m)
+     f_CAM = 10 Hz (ETSI EN 302 637-2), T_RRI = 0.1 s (3GPP TS 36.331) */
+  const _cbrVehicleCount = parseInt(simConfig?.vehicle_count || 1);
+  const _cbrRouteDistM   = (routeEdges?.total_distance_m || 1000);
+  const _cbrRho          = _cbrVehicleCount / Math.max(_cbrRouteDistM, 1);
+  const _cbrRtx          = connNodeObj?.coverage_radius_m || 200;
+  const cbrVal = hasLive
+    ? Math.min(1 - Math.exp(-_cbrRho * _cbrRtx * 10 * 0.1), 1)
+    : (routeEdges?.cbr_avg ?? null);
+  const cbrTone = cbrVal === null ? null : cbrVal > 0.65 ? 'bad' : cbrVal > 0.45 ? 'warn' : 'good';
+
+  /* PIR P99 — geometric distribution upper bound, 3GPP TR 37.885 §A.2.4
+     PIR_P99 = T_CAM / PRR,  PRR = 1 − TWDR,  threshold ≤ 100 ms */
+  const _twdr  = routeEdges?.coverage_risk ?? null;
+  const _prr   = _twdr !== null ? Math.max(0.01, 1 - _twdr) : null;
+  const pirP99 = _prr !== null ? Math.round(100 / _prr) : null;
+  const pirTone = pirP99 === null ? null : pirP99 > 100 ? 'bad' : pirP99 > 80 ? 'warn' : 'good';
 
   /* route distance for progress sub */
   const totalDistM = routeEdges?.total_distance_m > 0 ? routeEdges.total_distance_m : null;
@@ -386,6 +407,31 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   useEffect(() => {
     if (mode === 'pro' && subTab === 'network') fetchCoverageKpi();
   }, [mode, subTab]);
+
+  // ── SA 배치 최적화 ──────────────────────────────────────────────────────────
+  const [placementConfig, setPlacementConfig] = useState({ n_stations: 3, network_mode: '5G', node_type: 'bs' });
+  const [placementRunning, setPlacementRunning] = useState(false);
+  const [placementResult, setPlacementResult] = useState(null);
+  const [placementError, setPlacementError] = useState(null);
+
+  async function runPlacementOptimize() {
+    setPlacementRunning(true);
+    setPlacementError(null);
+    try {
+      const res = await fetch('http://127.0.0.1:8001/api/placement/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...placementConfig, n_greedy: 2, n_random: 2, sa_iter: 2000 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '최적화 실패');
+      setPlacementResult(data);
+    } catch (e) {
+      setPlacementError(e.message);
+    } finally {
+      setPlacementRunning(false);
+    }
+  }
 
   const edgeStatsNet = networkTelemetry?.edge_stats || [];
   const perEdgeNet   = routeEdges?.per_edge || [];
@@ -577,6 +623,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const [lookahead, setLookahead] = useState(null);
   const [lookaheadLoading, setLookaheadLoading] = useState(false);
   const [lookaheadError, setLookaheadError] = useState(null);
+  const [aiForecast, setAiForecast] = useState({ loading: false, sections: [], error: null, provider: null, revealed: 0 });
 
   const aheadNodeId = currentEdgeId && currentEdgeId.includes('_') ? currentEdgeId.split('_')[1] : null;
   const fallbackLookahead = useMemo(
@@ -609,6 +656,34 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
         setLookahead(null);
         setLookaheadLoading(false);
       });
+  }
+
+  async function runAIForecast() {
+    setAiForecast({ loading: true, sections: [], error: null, provider: null, revealed: 0 });
+    try {
+      const payload = {
+        hops,
+        lookahead_score: lookaheadScore ?? null,
+        risk_level: lookaheadRisk ?? null,
+        per_hop: perHop ?? [],
+        avg_latency_ms: avgLatency ?? null,
+        speed_kmh: speed ?? null,
+        handover_count: handoverCount ?? 0,
+        weak_hops: weakHopCount ?? 0,
+        danger_hops: dangerHopCount ?? 0,
+        disconnect_risk: disconnectRisk ?? null,
+      };
+      const res = await fetch('http://127.0.0.1:8001/api/analysis/llm/forecast', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+      const data = await res.json();
+      const sections = data.sections || [];
+      setAiForecast({ loading: false, sections, error: null, provider: data.provider || null, revealed: 0 });
+      sections.forEach((_, i) => setTimeout(() => setAiForecast(prev => ({ ...prev, revealed: i + 1 })), i * 380));
+    } catch (e) {
+      setAiForecast({ loading: false, sections: [], error: e.message || '오류', provider: null, revealed: 0 });
+    }
   }
 
   useEffect(() => {
@@ -836,7 +911,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
       </div>
 
       {/* ── Stat row 2 ─────────────────────────────────────── */}
-      <div className="grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginBottom: 14 }}>
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(6, 1fr)', marginBottom: 14 }}>
         {/* 현재 Latency */}
         <div className="stat">
           <div className="label">현재 Latency<span style={{ marginLeft: 4 }}><Icon.latency size={13} style={{ opacity: 0.4 }} /></span></div>
@@ -852,14 +927,43 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
             )}
           </div>
         </div>
+        {/* CBR — 채널 점유율 */}
+        <div className="stat" title="채널 점유율 CBR — Gonzalez-Martin et al., IEEE TVT 2019 §IV.A&#10;CBR = 1 − exp(−ρ·R_tx·f_CAM·T_RRI)&#10;임계값 0.65 (ETSI TS 102 687 §5.2.2)">
+          <div className="label">CBR <span className="muted" style={{ fontSize: 10 }}>(채널 점유율)</span></div>
+          <div className="value num">
+            {cbrVal !== null ? (cbrVal * 100).toFixed(1) : '—'}
+            {cbrVal !== null && <span className="unit">%</span>}
+          </div>
+          <div style={{ marginTop: 8 }}>
+            {cbrTone && <Chip tone={cbrTone}>{cbrVal > 0.65 ? '혼잡' : cbrVal > 0.45 ? '주의' : '정상'}</Chip>}
+            <div className="sub" style={{ marginTop: 4, fontSize: 10 }}>임계 65% [ETSI]</div>
+          </div>
+        </div>
+        {/* PIR P99 */}
+        <div className="stat" title="패킷 재수신 간격 P99 (PIR)&#10;PIR_P99 = T_CAM / PRR (기하분포 상한)&#10;기준: ≤ 100 ms (3GPP TR 37.885 Table A.1)&#10;[Eckermann et al., IEEE VTC Fall 2019]">
+          <div className="label">PIR P99 <span className="muted" style={{ fontSize: 10 }}>(재수신 간격)</span></div>
+          <div className="value num">
+            {pirP99 !== null ? pirP99 : '—'}
+            {pirP99 !== null && <span className="unit">ms</span>}
+          </div>
+          <div style={{ marginTop: 8 }}>
+            {pirTone && <Chip tone={pirTone}>{pirP99 > 100 ? '기준 초과' : pirP99 > 80 ? '주의' : '준수'}</Chip>}
+            <div className="sub" style={{ marginTop: 4, fontSize: 10 }}>기준 100ms [3GPP]</div>
+          </div>
+        </div>
         {/* 핸드오버 횟수 */}
-        <Stat
-          label="핸드오버 횟수"
-          icon="antenna"
-          value={handoverCount}
-          unit="회"
-          sub={connNode ? `현재: ${connNode}` : (hasLive ? 'BS 없음' : '—')}
-        />
+        <div className="stat" title="5G NR 핸드오버 중단 시간: 200–400 ms (IEEE 5G NR V2X, doc 10320318, 2023)">
+          <div className="label">핸드오버 횟수<span style={{ marginLeft: 4 }}><Icon.antenna size={13} style={{ opacity: 0.4 }} /></span></div>
+          <div className="value num">{handoverCount}<span className="unit">회</span></div>
+          <div className="sub" style={{ marginTop: 4 }}>
+            {connNode ? `현재: ${connNode}` : (hasLive ? 'BS 없음' : '—')}
+          </div>
+          {handoverCount > 0 && (
+            <div className="sub" style={{ fontSize: 10, marginTop: 2, opacity: 0.7 }}>
+              중단 200–400ms/회 [5G NR]
+            </div>
+          )}
+        </div>
         {/* 단절 횟수 */}
         <Stat
           label="단절 횟수"
@@ -888,6 +992,13 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
       {/* ── Latency breakdown + Info row — Pro 전용(알고리즘 내부 동작 진단용) ── */}
       {mode === 'pro' && <>
       <LatencyBreakdown total={latency} lBase={lBase} lSignal={lSignal} lQueue={lQueue} />
+      {(lBase !== null || lSignal !== null || lQueue !== null) && (
+        <div style={{ fontSize: 10.5, color: 'var(--ink-4)', marginTop: -6, marginBottom: 10, paddingLeft: 4, display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 3 }}>
+          <span>E2E 지연 = <i>L</i><sub>tx</sub> + <i>L</i><sub>q</sub> + <i>L</i><sub>comp</sub></span>
+          <span style={{ opacity: 0.6 }}>—</span>
+          <span style={{ fontStyle: 'italic' }}>Hung et al., IEEE VTM 2017; 3GPP TS 22.186 §5.1</span>
+        </div>
+      )}
       <InfoRow networkTelemetry={networkTelemetry} routeEdges={routeEdges} />
       </>}
 
@@ -1119,7 +1230,11 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
                         <span className="mono" style={{ fontWeight: 600 }}>{name}</span>
                         {isConn && <Chip tone="good" dot style={{ marginLeft: 8 }}>연결 중</Chip>}
                       </td>
-                      <td><span className="mono" style={{ fontSize: 11 }}>{c.type || '—'}</span></td>
+                      <td>
+                        {c.type === 'rsu'
+                          ? <Chip style={{ background: '#FF8F00', color: '#fff', fontSize: 10 }}>RSU</Chip>
+                          : <Chip tone="brand" style={{ fontSize: 10 }}>BS</Chip>}
+                      </td>
                       <td className="r"><span className="num">{(c.distance_m ?? 0).toFixed(0)}</span> <span className="muted" style={{ fontSize: 10 }}>m</span></td>
                       <td className="r">
                         {nodeLoad !== null
@@ -1248,6 +1363,93 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
           </Card>
         );
       })()}
+
+      {/* ── SA 배치 최적화 ──────────────────────────────────────────── */}
+      <Card title="기지국 배치 최적화" en="SA Placement Optimizer" style={{ marginBottom: 18 }}>
+        <div className="muted" style={{ fontSize: 11.5, lineHeight: 1.6, marginBottom: 14 }}>
+          Simulated Annealing(SA) 기반 최적 배치 탐색. ITS 교통량을 차량 수요로 사용하며
+          첨두(peak) / 비첨두(off-peak) 를 각각 독립 최적화해 비교합니다.
+          초기화: greedy forward selection (warm-start) + random 병렬 실행 후 최선 선택.
+        </div>
+        <div className="row gap8" style={{ flexWrap: 'wrap', marginBottom: 14, alignItems: 'center' }}>
+          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>기지국 수</label>
+          <input type="number" min={1} max={10} value={placementConfig.n_stations}
+            onChange={e => setPlacementConfig(c => ({ ...c, n_stations: Math.max(1, Math.min(10, +e.target.value)) }))}
+            style={{ width: 60, padding: '4px 8px', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}
+          />
+          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>기술</label>
+          <Seg value={placementConfig.network_mode} onChange={v => setPlacementConfig(c => ({ ...c, network_mode: v }))}
+            options={[{ v: '4G', label: '4G' }, { v: '5G', label: '5G' }, { v: '6G', label: '6G' }]} />
+          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>노드 유형</label>
+          <Seg value={placementConfig.node_type} onChange={v => setPlacementConfig(c => ({ ...c, node_type: v }))}
+            options={[{ v: 'bs', label: 'BS' }, { v: 'rsu', label: 'RSU' }]} />
+          <button className="btn primary sm" onClick={runPlacementOptimize} disabled={placementRunning}
+            style={{ marginLeft: 8 }}>
+            {placementRunning ? <><Icon.reset size={12} className="spin" /> 최적화 중…</> : <><Icon.antenna size={12} /> 최적화 실행</>}
+          </button>
+        </div>
+        {placementError && (
+          <div style={{ color: 'var(--bad)', fontSize: 12, marginBottom: 10 }}>{placementError}</div>
+        )}
+        {placementResult && (() => {
+          const { peak, off_peak, comparison } = placementResult;
+          const rows = [
+            { label: '최종 평균 지연 (ms)', peak: peak.cost_final_ms.toFixed(2), off: off_peak.cost_final_ms.toFixed(2) },
+            { label: 'SA 개선율 (%)', peak: peak.improvement_pct.toFixed(1) + '%', off: off_peak.improvement_pct.toFixed(1) + '%' },
+            { label: '미커버 수요 비율 (%)', peak: peak.uncovered_demand_pct.toFixed(1) + '%', off: off_peak.uncovered_demand_pct.toFixed(1) + '%' },
+            { label: '탐색 후보 수', peak: peak.n_candidates, off: off_peak.n_candidates },
+            { label: '수요점 수', peak: peak.n_demand_points, off: off_peak.n_demand_points },
+          ];
+          return (
+            <div>
+              <div className="row gap8" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
+                <Chip tone="good">
+                  배치 일치: {comparison.overlap_count}/{peak.placed.length} ({comparison.overlap_pct}%)
+                </Chip>
+                <Chip tone={comparison.cost_diff_ms > 0 ? 'warn' : 'good'}>
+                  첨두-비첨두 지연 차: {comparison.cost_diff_ms > 0 ? '+' : ''}{comparison.cost_diff_ms.toFixed(2)} ms
+                </Chip>
+              </div>
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>지표</th>
+                      <th>첨두 (Peak)</th>
+                      <th>비첨두 (Off-peak)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map(r => (
+                      <tr key={r.label}>
+                        <td style={{ color: 'var(--ink-2)', fontSize: 12 }}>{r.label}</td>
+                        <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.peak}</td>
+                        <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.off}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                {[['첨두 최적 배치', peak], ['비첨두 최적 배치', off_peak]].map(([label, r]) => (
+                  <div key={label} style={{ background: 'var(--surface-2)', borderRadius: 10, padding: '10px 14px' }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>{label}</div>
+                    {r.placed.map((p, i) => (
+                      <div key={p.id} className="row" style={{ fontSize: 11.5, gap: 8, marginBottom: 4 }}>
+                        <span className="chip" style={{ fontSize: 10, padding: '1px 6px' }}>#{i + 1}</span>
+                        <span style={{ fontFamily: 'var(--mono)', color: 'var(--ink-2)' }}>
+                          {p.lat.toFixed(5)}, {p.lng.toFixed(5)}
+                        </span>
+                        <span className="muted" style={{ fontSize: 10 }}>deg={p.degree}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
+      </Card>
 
       {mergedEdges.length > 0 && (
         <div className="grid" style={{ gridTemplateColumns: '1.5fr 1fr', marginBottom: 18 }}>
@@ -1512,8 +1714,69 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
                 <div><b style={{ color: 'var(--ink)' }}>Risk summary:</b> {futureWatch}</div>
                 <div style={{ marginTop: 6 }}><b style={{ color: 'var(--ink)' }}>Immediate watchpoint:</b> {worstHop ? `${worstHop.hop}홉 앞 구간의 커버리지가 가장 약합니다.` : 'look-ahead 데이터 없음'}</div>
                 <div style={{ marginTop: 6 }}><b style={{ color: 'var(--ink)' }}>Policy note:</b> look-ahead {policyLookahead}홉 / route {forecastRouteAlgo}</div>
-                <div style={{ marginTop: 6 }}><b style={{ color: 'var(--ink)' }}>Detail split:</b> 현재 노드 선택 이유와 자원 상태는 위 네트워크 상세에서 확인합니다.</div>
               </div>
+              {/* forecast score formula */}
+              <div style={{ marginTop: 14, padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 8, border: '1px solid var(--border)', fontSize: 11 }}>
+                <div style={{ color: 'var(--brand-2)', fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 4, marginBottom: 5 }}>
+                  <i>S</i><sub>lookahead</sub> =
+                  <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', verticalAlign: 'middle', margin: '0 3px', lineHeight: 1.3 }}>
+                    <span style={{ borderBottom: '1px solid currentColor', padding: '0 4px 2px', whiteSpace: 'nowrap' }}>Σ<sub><i>k</i>=1</sub><sup><i>H</i></sup> (1/<i>k</i>) · cov(<i>k</i>)</span>
+                    <span style={{ padding: '2px 4px 0', whiteSpace: 'nowrap' }}>Σ<sub><i>k</i>=1</sub><sup><i>H</i></sup> (1/<i>k</i>)</span>
+                  </span>
+                </div>
+                <div className="muted" style={{ lineHeight: 1.5 }}>
+                  조화급수 감쇠 가중 커버리지 점수. <i>H</i> = look-ahead 홉 수, cov(<i>k</i>) = <i>k</i>홉 커버리지 비율.
+                  <br />근거: Sliwa &amp; Wietfeld, <i>IEEE Commun. Mag.</i> 2019; Sutton &amp; Barto, <i>RL: An Introduction</i>, §3.4, 2018
+                </div>
+              </div>
+            </Card>
+          </div>
+
+          {/* ── AI forecast prediction ── */}
+          <div style={{ marginTop: 18 }}>
+            <Card title="AI 연결성 위험 예측" en="AI connectivity forecast"
+              right={
+                <div className="row gap8">
+                  <Chip tone="brand"><Icon.spark size={11} /> AI 예측</Chip>
+                  <button className="btn sm primary" onClick={runAIForecast} disabled={aiForecast.loading || !activeLookahead}>
+                    {aiForecast.loading
+                      ? <><span className="spin" style={{ display: 'inline-block', width: 10, height: 10, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', marginRight: 5 }} />분석 중…</>
+                      : <><Icon.spark size={13} /> AI 위험 예측</>}
+                  </button>
+                </div>
+              }>
+              {aiForecast.sections.length === 0 && !aiForecast.loading && (
+                <div style={{ textAlign: 'center', padding: '20px 16px' }}>
+                  <div style={{ width: 40, height: 40, borderRadius: 12, background: 'var(--brand-tint)', display: 'grid', placeItems: 'center', margin: '0 auto 10px', color: 'var(--brand-2)' }}><Icon.spark size={20} /></div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 3 }}>AI 미래 연결성 예측</div>
+                  <div className="muted" style={{ fontSize: 11.5, marginBottom: 12 }}>
+                    look-ahead {hops}홉 데이터를 분석해 단절 위험·권고 조치를 예측합니다.
+                    {!activeLookahead && <span style={{ color: 'var(--warn)' }}> (시뮬레이션 실행 후 활성화)</span>}
+                  </div>
+                  {aiForecast.error && (
+                    <div style={{ fontSize: 11.5, color: 'var(--bad)', background: 'var(--bad-tint)', padding: '7px 10px', borderRadius: 8, marginBottom: 10, textAlign: 'left' }}>{aiForecast.error}</div>
+                  )}
+                </div>
+              )}
+              {aiForecast.loading && (
+                <div style={{ textAlign: 'center', padding: '28px 16px' }}>
+                  <div className="spin" style={{ width: 26, height: 26, border: '3px solid var(--brand-tint2)', borderTopColor: 'var(--brand-2)', borderRadius: '50%', margin: '0 auto 10px' }} />
+                  <div className="muted" style={{ fontSize: 12 }}>AI가 미래 위험을 분석 중입니다…</div>
+                </div>
+              )}
+              {aiForecast.revealed > 0 && (
+                <div className="col gap8">
+                  {aiForecast.sections.slice(0, aiForecast.revealed).map((t, i) => (
+                    <div key={i} className="fade row gap10" style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 8, border: '1px solid var(--border)', alignItems: 'flex-start' }}>
+                      <span className="num" style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--brand-2)', flexShrink: 0, marginTop: 2 }}>{String(i + 1).padStart(2, '0')}</span>
+                      <span style={{ fontSize: 12.5, lineHeight: 1.55 }}>{t}</span>
+                    </div>
+                  ))}
+                  {aiForecast.revealed === aiForecast.sections.length && aiForecast.sections.length > 0 && (
+                    <button className="btn sm" onClick={runAIForecast} style={{ alignSelf: 'flex-start' }}><Icon.reset size={12} /> 다시 예측</button>
+                  )}
+                </div>
+              )}
             </Card>
           </div>
         </>

@@ -39,6 +39,11 @@ class RouteMetrics:
                             "fraction of *edges* disconnected" (edges vary widely in
                             length/duration, so this is the more defensible basis for
                             a PRR-style connection-retention ratio).
+    prr_approx              Packet Reception Ratio approximation: 1 - time_weighted_disconnection_ratio.
+                            Not a real PRR (no packet-level simulation), but the best available
+                            proxy for "fraction of travel time connected". Higher is better.
+                            Always equals 1 - time_weighted_disconnection_ratio; stored here so
+                            consumers never have to recompute it.
     average_bs_load         Mean BS load ratio across traversed edges  (0–1).
     bs_load_variance        Variance of BS load ratios (load consistency metric).
     resource_deficit_ratio  Fraction of BS nodes currently above capacity  (0–1).
@@ -60,6 +65,7 @@ class RouteMetrics:
     handover_count: int
     disconnection_ratio: float
     time_weighted_disconnection_ratio: float
+    prr_approx: float
     average_bs_load: float
     bs_load_variance: float
     resource_deficit_ratio: float
@@ -100,6 +106,7 @@ def compute_metrics(
             handover_count=0,
             disconnection_ratio=0.0,
             time_weighted_disconnection_ratio=0.0,
+            prr_approx=1.0,
             average_bs_load=0.0,
             bs_load_variance=0.0,
             resource_deficit_ratio=deficit,
@@ -134,6 +141,7 @@ def compute_metrics(
     n_future_disc = sum(1 for r in last_quarter if not r.within_coverage)
     future_conn_risk = n_future_disc / len(last_quarter) if last_quarter else 0.0
 
+    _twdr = round(time_weighted_disc, 4)
     return RouteMetrics(
         algorithm=algorithm,
         total_distance_m=round(sum(float(r.distance_m) for r in edge_results), 2),
@@ -142,7 +150,8 @@ def compute_metrics(
         max_latency_ms=round(max(latencies), 2),
         handover_count=sum(1 for r in edge_results if r.handover_occurred),
         disconnection_ratio=round(n_disconnected / n, 4),
-        time_weighted_disconnection_ratio=round(time_weighted_disc, 4),
+        time_weighted_disconnection_ratio=_twdr,
+        prr_approx=round(1.0 - _twdr, 4),
         average_bs_load=round(avg_load, 4),
         bs_load_variance=round(load_var, 6),
         resource_deficit_ratio=round(deficit, 4),
@@ -200,6 +209,7 @@ def from_k_candidates(
         else:
             # Fallback: build from KPathCandidate summary fields
             deficit = _bs_deficit_ratio(bs_nodes)
+            _twdr_fallback = round(c.coverage_risk, 4)
             m = RouteMetrics(
                 algorithm=algo_name,
                 total_distance_m=c.total_distance_m,
@@ -208,7 +218,8 @@ def from_k_candidates(
                 max_latency_ms=c.max_latency_ms,
                 handover_count=c.handover_count,
                 disconnection_ratio=c.coverage_risk,
-                time_weighted_disconnection_ratio=c.coverage_risk,  # 폴백: edge_results 없이는 시간가중 계산 불가, edge 비율로 대체
+                time_weighted_disconnection_ratio=_twdr_fallback,  # 폴백: edge_results 없이는 시간가중 계산 불가, edge 비율로 대체
+                prr_approx=round(1.0 - _twdr_fallback, 4),
                 average_bs_load=0.0,
                 bs_load_variance=0.0,
                 resource_deficit_ratio=deficit,
@@ -224,35 +235,23 @@ def from_k_candidates(
 
 
 # ── Comparison ─────────────────────────────────────────────────────────────────
-# All 13 user-facing metrics, lower = better for all of them
-_LOWER_IS_BETTER = frozenset({
-    "total_distance_m",
-    "travel_time_s",
-    "average_latency_ms",
-    "max_latency_ms",
-    "handover_count",
-    "disconnection_ratio",
-    "average_bs_load",
-    "bs_load_variance",
-    "resource_deficit_ratio",
-    "blockage_risk_count",
-    "future_connectivity_risk",
-    "total_cost",
-    "execution_time_ms",
-})
-
-_COMPARE_METRICS = list(_LOWER_IS_BETTER)   # deterministic order via frozenset iteration avoided
-_COMPARE_METRICS = [
+# Lower raw value → better rank (all cost/risk metrics)
+_LOWER_IS_BETTER_METRICS = [
     "total_distance_m", "travel_time_s", "average_latency_ms", "max_latency_ms",
     "handover_count", "disconnection_ratio", "average_bs_load", "bs_load_variance",
     "resource_deficit_ratio", "blockage_risk_count", "future_connectivity_risk",
     "total_cost", "execution_time_ms",
 ]
+# Higher raw value → better rank (connection quality metrics)
+_HIGHER_IS_BETTER_METRICS = [
+    "prr_approx",
+]
+_COMPARE_METRICS = _LOWER_IS_BETTER_METRICS + _HIGHER_IS_BETTER_METRICS
 
 
 def compare_algorithms(metrics: dict[str, "RouteMetrics"]) -> dict:
     """
-    Rank algorithms across all 13 metrics.
+    Rank algorithms across all metrics (13 lower-is-better + 1 higher-is-better).
 
     Returns
     -------
@@ -270,11 +269,13 @@ def compare_algorithms(metrics: dict[str, "RouteMetrics"]) -> dict:
     rankings: dict[str, list[str]] = {}
     best_per_metric: dict[str, str] = {}
     scores: dict[str, dict[str, float]] = {a: {} for a in algos}
+    _higher_set = set(_HIGHER_IS_BETTER_METRICS)
 
     for metric in _COMPARE_METRICS:
         vals = {a: float(getattr(metrics[a], metric, 0.0)) for a in algos}
-        # lower raw value → better rank for all metrics in this set
-        ranked = sorted(algos, key=lambda a: vals[a])
+        higher_better = metric in _higher_set
+        # sort: ascending for lower-is-better, descending for higher-is-better
+        ranked = sorted(algos, key=lambda a: vals[a], reverse=higher_better)
         rankings[metric] = ranked
         best_per_metric[metric] = ranked[0]
 
@@ -283,9 +284,10 @@ def compare_algorithms(metrics: dict[str, "RouteMetrics"]) -> dict:
         for a in algos:
             if span < 1e-12:
                 norm = 1.0
+            elif higher_better:
+                norm = (vals[a] - mn) / span          # higher raw → higher score
             else:
-                # lower raw → higher normalised score
-                norm = 1.0 - (vals[a] - mn) / span
+                norm = 1.0 - (vals[a] - mn) / span    # lower raw → higher score
             scores[a][metric] = round(norm, 4)
 
     summary_rank = {

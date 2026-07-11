@@ -76,7 +76,7 @@ function scbSaveBatches(list) {
 }
 
 // 엑셀 시트탭 스트립 — 더블클릭으로 이름 수정, "+"로 새 시트, "전체 비교 실행"으로 일괄 평가.
-function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError }) {
+function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView }) {
   const [editingIdx, setEditingIdx] = useState(null);
   const [editValue, setEditValue] = useState('');
   return (
@@ -131,6 +131,17 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
       {batchError && <span style={{ alignSelf: 'center', fontSize: 11, color: 'var(--bad)', marginRight: 8, whiteSpace: 'nowrap' }}>{batchError}</span>}
       <button
         className="btn sm"
+        onClick={onToggleGrid}
+        style={{
+          alignSelf: 'center', margin: '0 4px', flex: '0 0 auto',
+          ...(gridView ? { background: 'var(--brand-2)', color: '#fff', borderColor: 'var(--brand-2)' } : {}),
+        }}
+        title={gridView ? '단일 뷰로 돌아가기' : '모든 시트를 그리드로 보기 (CCTV 뷰)'}
+      >
+        {gridView ? '↩ 단일 뷰' : '⊞ 그리드 뷰'}
+      </button>
+      <button
+        className="btn sm"
         disabled={batchRunning || sheets.length < 2}
         onClick={onRunBatch}
         style={{ alignSelf: 'center', margin: '0 4px', flex: '0 0 auto' }}
@@ -142,26 +153,448 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
   );
 }
 
-// 컨트롤 패널 / 시뮬레이션 챗봇을 지도 위에 띄우는 원형 토글 버튼 — 둘 다 같은 디자인.
-function FabButton({ icon, active, onClick, title }) {
-  const IconComp = Icon[icon];
+// 컨트롤 패널 / 시뮬레이션 챗봇을 지도 우측에 붙이는 세로형 탭 버튼.
+// 텍스트를 세로로 표시(writing-mode: vertical-rl)하고 왼쪽에만 모서리를 둥글게 처리해
+// 지도 오른쪽 가장자리에 자연스럽게 붙도록 설계했다.
+function TabButton({ label, active, onClick }) {
   return (
     <button
       onClick={onClick}
-      title={title}
       style={{
-        width: 38, height: 38, borderRadius: '50%', border: 'none', cursor: 'pointer',
-        display: 'grid', placeItems: 'center', flex: '0 0 auto',
+        width: 26,
+        padding: '12px 0',
+        borderRadius: '6px 0 0 6px',
+        border: 'none',
+        cursor: 'pointer',
+        writingMode: 'vertical-rl',
+        fontSize: 10.5,
+        fontWeight: 700,
+        letterSpacing: '0.05em',
+        whiteSpace: 'nowrap',
         background: active ? 'var(--brand-2)' : 'var(--brand)',
-        color: '#fff', boxShadow: 'var(--sh-2)',
+        color: '#fff',
+        boxShadow: '-3px 0 10px rgba(0,0,0,0.18)',
+        transition: 'background 0.15s',
+        flexShrink: 0,
       }}
     >
-      <IconComp size={16} />
+      {label}
     </button>
   );
 }
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, simHistory, routeEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
+// ── CCTV Grid view helpers ─────────────────────────────────────────────────────
+
+// {lat,lng} 또는 [lat,lng] 모두 허용
+function normPt(p) { return Array.isArray(p) ? p : [p.lat, p.lng]; }
+
+// 경로 폴리라인 위에서 progress(0~1) 위치의 [lat, lng]를 선형 보간으로 반환
+function interpolateOnRoute(coords, progress) {
+  if (!coords || coords.length < 2) return null;
+  if (progress <= 0) return [coords[0][0], coords[0][1]];
+  if (progress >= 1) return [coords[coords.length - 1][0], coords[coords.length - 1][1]];
+  let totalLen = 0;
+  const segs = [];
+  for (let i = 1; i < coords.length; i++) {
+    const d = Math.hypot(coords[i][0] - coords[i-1][0], coords[i][1] - coords[i-1][1]);
+    segs.push(d);
+    totalLen += d;
+  }
+  if (totalLen === 0) return [coords[0][0], coords[0][1]];
+  const target = progress * totalLen;
+  let acc = 0;
+  for (let i = 0; i < segs.length; i++) {
+    if (acc + segs[i] >= target) {
+      const t = segs[i] === 0 ? 0 : (target - acc) / segs[i];
+      return [
+        coords[i][0] + t * (coords[i+1][0] - coords[i][0]),
+        coords[i][1] + t * (coords[i+1][1] - coords[i][1]),
+      ];
+    }
+    acc += segs[i];
+  }
+  return [coords[coords.length - 1][0], coords[coords.length - 1][1]];
+}
+
+// ── mini-map 공통 헬퍼 (module scope) ────────────────────────────────────────
+
+// BS 마커 풀 갱신 + 접속선 갱신
+function miniApplyNetwork(map, bsPool, connLineRef, nodes, connName, vehPos) {
+  const seen = new Set();
+  (nodes || []).forEach(node => {
+    if (node.lat == null || node.lng == null) return;
+    const id = String(node.id || node.name);
+    seen.add(id);
+    const isConn = (node.name === connName || String(node.id) === connName);
+    const fillColor = isConn ? '#1E88E5' : '#78909C';
+    const radius    = isConn ? 7 : 5;
+    if (!bsPool[id]) {
+      bsPool[id] = {
+        marker: L.circleMarker([node.lat, node.lng], {
+          radius, fillColor, color: '#fff', weight: 1.5, fillOpacity: 0.92, interactive: false,
+        }).addTo(map),
+        lat: node.lat, lng: node.lng, name: node.name || String(node.id),
+      };
+    } else {
+      bsPool[id].marker.setStyle({ fillColor, radius });
+    }
+  });
+  Object.keys(bsPool).forEach(id => {
+    if (!seen.has(id)) { try { bsPool[id].marker.remove(); } catch (_) {} delete bsPool[id]; }
+  });
+  // 접속선
+  if (connLineRef.current) { try { connLineRef.current.remove(); } catch (_) {} connLineRef.current = null; }
+  if (vehPos && connName) {
+    const entry = Object.values(bsPool).find(b => b.name === connName);
+    if (entry) {
+      connLineRef.current = L.polyline(
+        [vehPos, [entry.lat, entry.lng]],
+        { color: '#1E88E5', weight: 1.5, opacity: 0.6, dashArray: '5 5', interactive: false }
+      ).addTo(map);
+    }
+  }
+}
+
+// 배경차량 마커 풀 갱신
+function miniApplyBgVehicles(map, bgPool, vehicles) {
+  const seen = new Set();
+  (vehicles || []).forEach(v => {
+    if (v.lat == null || v.lng == null) return;
+    seen.add(v.id);
+    if (bgPool[v.id]) {
+      bgPool[v.id].setLatLng([v.lat, v.lng]);
+    } else {
+      bgPool[v.id] = L.circleMarker([v.lat, v.lng], {
+        radius: 3, color: '#9AA5B1', weight: 0,
+        fillColor: '#9AA5B1', fillOpacity: 0.6, interactive: false,
+      }).addTo(map);
+    }
+  });
+  Object.keys(bgPool).forEach(id => {
+    if (!seen.has(id)) { try { bgPool[id].remove(); } catch (_) {} delete bgPool[id]; }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SheetMiniMap({ sheet, isActive,
+  liveVehiclePos, liveRouteCoords, liveNetworkTelemetry, liveBackgroundVehicles,
+  stations, onReplayTick }) {
+
+  const containerRef = useRef(null);
+  const mapRef       = useRef(null);
+  const polyRef      = useRef(null);
+  const vehRef       = useRef(null);
+  const bsPoolRef    = useRef({});   // id → { marker, lat, lng, name }
+  const connLineRef  = useRef(null);
+  const bgPoolRef    = useRef({});   // id → marker
+
+  const origin = sheet.config?.origin;
+  const dest   = sheet.config?.dest;
+
+  // ── 맵 초기화 (sheet.id 바뀔 때만) ──────────────────────────────────
+  useEffect(() => {
+    if (!containerRef.current) return;
+    if (mapRef.current) { try { mapRef.current.remove(); } catch (_) {} mapRef.current = null; }
+    bsPoolRef.current = {}; bgPoolRef.current = {};
+    connLineRef.current = null; polyRef.current = null; vehRef.current = null;
+
+    const map = L.map(containerRef.current, {
+      zoomControl: false, attributionControl: false,
+      dragging: false, scrollWheelZoom: false,
+      doubleClickZoom: false, boxZoom: false, keyboard: false,
+    });
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+      { maxZoom: 19, subdomains: 'abcd' }).addTo(map);
+    mapRef.current = map;
+
+    // 출발지 / 도착지
+    if (origin) L.circleMarker([origin.lat, origin.lng], { radius: 6, fillColor: '#1F9D57', color: '#fff', fillOpacity: 1, weight: 2, interactive: false }).addTo(map);
+    if (dest)   L.circleMarker([dest.lat,   dest.lng],   { radius: 6, fillColor: '#E0463C', color: '#fff', fillOpacity: 1, weight: 2, interactive: false }).addTo(map);
+
+    // 경로 (비활성 시트만 — 활성은 live effect에서)
+    if (!isActive) {
+      const route = sheet.result?.routeCoords || [];
+      const norm  = route.map(normPt);
+      if (norm.length > 0) {
+        polyRef.current = L.polyline(norm, { color: '#1E88E5', weight: 3, opacity: 0.85, interactive: false }).addTo(map);
+        map.fitBounds(polyRef.current.getBounds(), { padding: [18, 18] });
+      } else if (origin) {
+        map.setView([origin.lat, origin.lng], 14);
+      } else {
+        map.setView([36.4, 127.9], 7);
+      }
+
+      // 초기 BS 배치 (최종 network_telemetry의 candidate_nodes 또는 stations)
+      const tel  = sheet.result?.network_telemetry;
+      const cand = tel?.candidate_nodes?.length ? tel.candidate_nodes : (stations || []);
+      const conn = tel?.ego_vehicle?.connected_network_node_name
+                || tel?.connected_node?.name || tel?.connected_node?.id;
+      miniApplyNetwork(map, bsPoolRef.current, connLineRef, cand, conn, null);
+    } else {
+      map.setView(origin ? [origin.lat, origin.lng] : [36.4, 127.9], origin ? 14 : 7);
+    }
+
+    // invalidateSize 재시도 — CSS Grid 확정 전 검은 화면 방지
+    const timers = [80, 300, 700, 1500].map(d =>
+      setTimeout(() => { try { map.invalidateSize(); } catch (_) {} }, d)
+    );
+    let ro;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => { try { map.invalidateSize(); } catch (_) {} });
+      ro.observe(containerRef.current);
+    }
+
+    return () => {
+      timers.forEach(clearTimeout);
+      if (ro) ro.disconnect();
+      if (mapRef.current) { try { mapRef.current.remove(); } catch (_) {} mapRef.current = null; }
+    };
+  }, [sheet.id]);
+
+  // ── 활성 시트: 실시간 경로 갱신 ────────────────────────────────────
+  useEffect(() => {
+    if (!isActive || !mapRef.current || !liveRouteCoords?.length) return;
+    const norm = liveRouteCoords.map(normPt);
+    if (!polyRef.current) {
+      polyRef.current = L.polyline(norm, { color: '#1E88E5', weight: 3, opacity: 0.85, interactive: false }).addTo(mapRef.current);
+      mapRef.current.fitBounds(polyRef.current.getBounds(), { padding: [18, 18] });
+    } else {
+      polyRef.current.setLatLngs(norm);
+    }
+  }, [isActive, liveRouteCoords]);
+
+  // ── 활성 시트: 실시간 자차 + BS + 접속선 ───────────────────────────
+  useEffect(() => {
+    if (!isActive || !mapRef.current) return;
+    const vehPos = liveVehiclePos ? [liveVehiclePos.lat, liveVehiclePos.lng] : null;
+
+    if (vehPos) {
+      if (!vehRef.current) {
+        vehRef.current = L.circleMarker(vehPos, { radius: 7, fillColor: '#f44336', color: '#fff', fillOpacity: 1, weight: 2, interactive: false }).addTo(mapRef.current);
+      } else {
+        vehRef.current.setLatLng(vehPos);
+      }
+    }
+
+    if (liveNetworkTelemetry) {
+      const connName = liveNetworkTelemetry.ego_vehicle?.connected_network_node_name
+                    || liveNetworkTelemetry.connected_node?.name
+                    || liveNetworkTelemetry.connected_node?.id;
+      const cand = liveNetworkTelemetry.candidate_nodes || [];
+      miniApplyNetwork(mapRef.current, bsPoolRef.current, connLineRef, cand, connName, vehPos);
+    }
+  }, [isActive, liveVehiclePos, liveNetworkTelemetry]);
+
+  // ── 활성 시트: 배경차량 ───────────────────────────────────────────
+  useEffect(() => {
+    if (!isActive || !mapRef.current) return;
+    miniApplyBgVehicles(mapRef.current, bgPoolRef.current, liveBackgroundVehicles);
+  }, [isActive, liveBackgroundVehicles]);
+
+  // ── 비활성 완료 시트: 리플레이 애니메이션 ───────────────────────────
+  // simHistory가 있으면 실제 기록 progress로, 없으면 synthetic 0→1 sweep
+  useEffect(() => {
+    if (isActive) return;
+    const route = sheet.result?.routeCoords;
+    if (!route?.length) return;
+    const normRoute = route.map(normPt);
+    const history   = sheet.result?.simHistory;
+    const tel       = sheet.result?.network_telemetry;
+    const cand      = tel?.candidate_nodes?.length ? tel.candidate_nodes : (stations || []);
+
+    // BS 이름 → {lat,lng} 조회 테이블
+    const bsPos = {};
+    cand.forEach(n => { if (n.lat != null) bsPos[n.name || String(n.id)] = [n.lat, n.lng]; });
+
+    const hasHistory = history?.length > 0;
+    const TICK_MS    = 50;
+    const SWEEP      = 160; // 8초 루프
+    let frame = 0;
+
+    const interval = setInterval(() => {
+      if (!mapRef.current) return;
+      let progress, connBs, latency;
+
+      if (hasHistory) {
+        const e = history[frame % history.length];
+        progress = e?.progress ?? 0; connBs = e?.bs; latency = e?.latency;
+        frame++;
+      } else {
+        progress = (frame % SWEEP) / SWEEP; frame++;
+      }
+
+      // 자차 이동
+      const pos = interpolateOnRoute(normRoute, progress);
+      if (pos) {
+        if (!vehRef.current) {
+          vehRef.current = L.circleMarker(pos, { radius: 7, fillColor: '#f44336', color: '#fff', fillOpacity: 1, weight: 2, interactive: false }).addTo(mapRef.current);
+        } else {
+          vehRef.current.setLatLng(pos);
+        }
+
+        // 접속 BS 하이라이트 갱신
+        if (connBs) {
+          Object.entries(bsPoolRef.current).forEach(([, entry]) => {
+            const isConn = entry.name === connBs;
+            entry.marker.setStyle({ fillColor: isConn ? '#1E88E5' : '#78909C', radius: isConn ? 7 : 5 });
+          });
+          // 접속선
+          if (connLineRef.current) { try { connLineRef.current.remove(); } catch (_) {} connLineRef.current = null; }
+          const bsLatLng = bsPos[connBs];
+          if (bsLatLng) {
+            connLineRef.current = L.polyline(
+              [pos, bsLatLng],
+              { color: '#1E88E5', weight: 1.5, opacity: 0.6, dashArray: '5 5', interactive: false }
+            ).addTo(mapRef.current);
+          }
+        }
+      }
+
+      if (onReplayTick) onReplayTick({ progress, latency, bs: connBs });
+    }, TICK_MS);
+
+    return () => clearInterval(interval);
+  }, [isActive, sheet.id, !!sheet.result?.routeCoords?.length]);
+
+  return <div ref={containerRef} style={{ width: '100%', height: '100%', background: '#e8eaf0' }} />;
+}
+
+// 개별 시트 셀 — 리플레이 틱을 상태로 관리해야 하므로 별도 컴포넌트로 분리
+function SheetGridCell({ sheet, i, activeSheetIdx, onSelectSheet,
+  liveVehiclePos, liveRouteCoords, liveNetworkTelemetry, liveBackgroundVehicles,
+  stations, sim }) {
+  const isActive   = i === activeSheetIdx;
+  const isRunning  = isActive && sim.running;
+  const isDone     = sheet.status === 'ran';
+  const hasRoute   = !!sheet.result?.routeCoords?.length;
+  const hasHistory = !!sheet.result?.simHistory?.length;
+
+  // 리플레이 중인 비활성 시트의 현재 프레임 데이터
+  const [replayEntry, setReplayEntry] = useState(null);
+
+  const tel = isActive
+    ? liveNetworkTelemetry
+    : (replayEntry ? { ego_vehicle: { current_latency_ms: replayEntry.latency, connected_network_node_name: replayEntry.bs } }
+                   : sheet.result?.network_telemetry);
+  const lat = tel?.ego_vehicle?.current_latency_ms ?? tel?.latency_ms;
+  const bs  = tel?.ego_vehicle?.connected_network_node_name ?? tel?.connected_node?.name ?? tel?.connected_node?.id;
+
+  // 리플레이 progress bar 값 (0~1)
+  const replayProgress = (!isActive && replayEntry?.progress != null) ? replayEntry.progress : null;
+
+  return (
+    <div
+      key={sheet.id}
+      onDoubleClick={() => onSelectSheet(i)}
+      style={{
+        position: 'relative', borderRadius: 7, overflow: 'hidden',
+        border: isActive ? '2px solid #2196f3' : (isDone ? '2px solid #1e3a4a' : '2px solid #2a2a2a'),
+        cursor: 'pointer', minHeight: 0, minWidth: 0,
+      }}
+    >
+      <SheetMiniMap
+        sheet={sheet} isActive={isActive}
+        liveVehiclePos={liveVehiclePos}
+        liveRouteCoords={liveRouteCoords}
+        liveNetworkTelemetry={isActive ? liveNetworkTelemetry : null}
+        liveBackgroundVehicles={isActive ? liveBackgroundVehicles : null}
+        stations={stations}
+        onReplayTick={setReplayEntry}
+      />
+
+      {/* 리플레이 진행 바 (비활성 완료 시트) */}
+      {!isActive && isDone && replayProgress != null && (
+        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, zIndex: 20, background: 'rgba(255,255,255,0.08)' }}>
+          <div style={{ height: '100%', width: `${replayProgress * 100}%`, background: '#2196f3', transition: 'width 0.08s linear' }} />
+        </div>
+      )}
+
+      {/* top name + status bar */}
+      <div style={{
+        position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10,
+        background: 'linear-gradient(to bottom, rgba(0,0,0,0.68) 0%, rgba(0,0,0,0) 100%)',
+        padding: '8px 10px 22px',
+        display: 'flex', alignItems: 'center', gap: 6, pointerEvents: 'none',
+      }}>
+        <span style={{ color: '#fff', fontSize: 12, fontWeight: 700, flex: 1, textShadow: '0 1px 3px rgba(0,0,0,0.9)' }}>
+          {sheet.name}
+        </span>
+        {isRunning && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: '#66bb6a', fontWeight: 600 }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#66bb6a', display: 'inline-block', boxShadow: '0 0 5px #66bb6a' }} />
+            LIVE
+          </span>
+        )}
+        {!isActive && isDone && hasRoute && (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: '#60a5fa', fontWeight: 600 }}>
+            <span style={{ fontSize: 9 }}>▶</span> REPLAY
+          </span>
+        )}
+        {isDone && !isRunning && !hasRoute && (
+          <span style={{ fontSize: 10, color: '#a5f3fc', padding: '2px 6px', background: 'rgba(34,211,238,0.15)', borderRadius: 4 }}>완료</span>
+        )}
+        {!isDone && !isRunning && (
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.38)' }}>미실행</span>
+        )}
+      </div>
+
+      {/* bottom metrics + hint */}
+      <div style={{
+        position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 10,
+        background: 'linear-gradient(to top, rgba(0,0,0,0.62) 0%, rgba(0,0,0,0) 100%)',
+        padding: '22px 10px 8px',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end',
+        pointerEvents: 'none',
+      }}>
+        <span style={{ color: 'rgba(255,255,255,0.38)', fontSize: 9 }}>더블클릭 확장</span>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {lat != null && (
+            <span style={{ color: lat > 20 ? '#ef5350' : '#66bb6a', fontSize: 11, fontWeight: 700 }}>
+              {(+lat).toFixed(1)} ms
+            </span>
+          )}
+          {bs && <span style={{ color: 'rgba(255,255,255,0.6)', fontSize: 10 }}>{bs}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SheetGridView({ sheets, activeSheetIdx, onSelectSheet,
+  liveVehiclePos, liveRouteCoords, liveNetworkTelemetry, liveBackgroundVehicles,
+  stations, sim }) {
+  const n    = sheets.length;
+  const cols = n <= 1 ? 1 : 2;
+  const rows = Math.ceil(n / cols);
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: `repeat(${cols}, 1fr)`,
+      gridTemplateRows:    `repeat(${rows}, 1fr)`,
+      gap: 3, height: '100%', background: '#111', padding: 3, boxSizing: 'border-box',
+    }}>
+      {sheets.map((sheet, i) => (
+        <SheetGridCell
+          key={sheet.id}
+          sheet={sheet} i={i}
+          activeSheetIdx={activeSheetIdx}
+          onSelectSheet={onSelectSheet}
+          liveVehiclePos={liveVehiclePos}
+          liveRouteCoords={liveRouteCoords}
+          liveNetworkTelemetry={liveNetworkTelemetry}
+          liveBackgroundVehicles={liveBackgroundVehicles}
+          stations={stations}
+          sim={sim}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, setSimLogs, simHistory, setSimHistory, routeEdges, setRouteEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
@@ -209,6 +642,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   // sheets/activeSheetIdx는 App(app.jsx)으로 끌어올려져 props로 내려온다 — 대시보드 탭도
   // "지금 실행 중인 시트가 뭔지" 같은 출처를 봐야 시트별로 분리해서 보여줄 수 있기 때문.
   const [batchRunning, setBatchRunning] = useState(false);
+  const [gridView, setGridView] = useState(false); // CCTV grid view — all sheets side by side
   const [batchError, setBatchError] = useState(null);
   const prevArrived = useRef(false);
   const currentRunIdRef = useRef(null); // /api/simulation/start가 돌려준 DB simulation_runs.id — 도착 시 시트 데이터를 같은 행에 영구 저장하는 데 씀
@@ -234,6 +668,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setNetworkTelemetry(sheet.result?.network_telemetry || null);
     setRouteCoords(sheet.result?.routeCoords || []);
     setVehiclePos(sheet.result?.vehiclePos || null);
+    if (setRouteEdges)  setRouteEdges(sheet.result?.routeEdges ?? null);
+    if (setSimLogs)     setSimLogs(sheet.result?.simLogs ?? []);
+    if (setSimHistory)  setSimHistory(sheet.result?.simHistory ?? []);
     prevArrived.current = !!sheet.result?.vehiclePos?.arrived;
   }
 
@@ -696,22 +1133,27 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const seenIds = new Set();
     stations.forEach((st) => {
       seenIds.add(st.id);
+      const isRsu = st.node_type === 'rsu';
+      // BS = 파란 원(#1E88E5), RSU = 주황 다이아몬드 효과(#FF8F00, 더 작고 테두리 두꺼움)
+      const fillColor = isRsu ? '#FF8F00' : '#1E88E5';
+      const radius    = isRsu ? 6 : 8;
+      const weight    = isRsu ? 3 : 2.5;
       let marker = stationMarkers.current[st.id];
       if (!marker) {
         marker = L.circleMarker([st.lat, st.lng], {
-          radius: 8, color: '#fff', weight: 2.5, fillColor: '#1E88E5', fillOpacity: 0.93, interactive: true,
+          radius, color: '#fff', weight, fillColor, fillOpacity: 0.93, interactive: true,
         }).addTo(g);
-        marker.bindTooltip(st.name, { permanent: true, direction: 'bottom', offset: [0, 6], className: 'bs-label' });
+        const typeLabel = isRsu ? '[RSU]' : '[BS]';
+        marker.bindTooltip(`${typeLabel} ${st.name}`, { permanent: true, direction: 'bottom', offset: [0, 6], className: 'bs-label' });
         stationMarkers.current[st.id] = marker;
       } else {
         marker.setLatLng([st.lat, st.lng]);
       }
-      // 삭제모드 핸들러는 모드가 바뀔 때마다 깨끗하게 다시 건다(중복 바인딩 방지)
       marker.off('mouseover'); marker.off('mouseout'); marker.off('click');
-      marker.setStyle({ fillColor: '#1E88E5', color: '#fff' });
+      marker.setStyle({ fillColor, color: '#fff' });
       if (deleteMode) {
         marker.on('mouseover', (e) => { e.target.setStyle({ fillColor: '#9AA5B1', color: '#5B6670' }); });
-        marker.on('mouseout',  (e) => { e.target.setStyle({ fillColor: '#1E88E5', color: '#fff' }); });
+        marker.on('mouseout',  (e) => { e.target.setStyle({ fillColor, color: '#fff' }); });
         marker.on('click', (e) => { L.DomEvent.stopPropagation(e); deleteStation(st.id); });
       }
     });
@@ -852,13 +1294,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }, [mode]);
 
   /* ── user-created base station create / delete ───────────────── */
-  async function createStation(lat, lng) {
+  async function createStation(lat, lng, nodeTypeOverride) {
     setStationsErr(null);
+    const nt = nodeTypeOverride !== undefined ? nodeTypeOverride : (stationType === 'rsu' ? 'rsu' : 'base_station');
     try {
       const res = await fetch(`${api}/network-nodes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lat, lng, node_type: 'base_station' }),
+        body: JSON.stringify({ lat, lng, node_type: nt }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || '기지국 생성 실패');
@@ -906,6 +1349,34 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       }));
     } catch (e) {
       setStationsErr(e.message);
+    }
+  }
+
+  async function runSaCompare() {
+    setSaCompareRunning(true);
+    setSaCompareError(null);
+    setSaCompareResult(null);
+    try {
+      const res = await fetch(`${api}/api/placement/compare-with-sa`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          origin,
+          dest,
+          network_mode: networkGen.toUpperCase(),
+          traffic_time_period: trafficPeriod || 'peak',
+          n_greedy: 2,
+          n_random: 2,
+          sa_iter: 2000,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'SA 비교군 실행 실패');
+      setSaCompareResult(data);
+    } catch (e) {
+      setSaCompareError(e.message);
+    } finally {
+      setSaCompareRunning(false);
     }
   }
 
@@ -982,8 +1453,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (mode === 'dest') { if (dest) { setDestDone(true); setMode(null); } }
     else setMode('dest');
   };
+  const [stationType, setStationType] = useState('bs'); // 'bs' | 'rsu' — 생성 버튼 클릭 시 어떤 노드를 만들지
   const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
   const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
+
+  // SA 비교군
+  const [saCompareRunning, setSaCompareRunning] = useState(false);
+  const [saCompareResult, setSaCompareResult] = useState(null);
+  const [saCompareError, setSaCompareError] = useState(null);
 
   // Lite 전용 예시 시나리오 프리셋 — 학부생이 출발지/도착지를 직접 찍지 않아도 현재 구역
   // 안에서 바로 시작할 수 있게, 구역(area) 내부 좌표를 비율로 계산해 채운다(특정 도시
@@ -1117,7 +1594,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (mode === 'area')   return '지도에서 드래그하여 시뮬레이션 구역을 선택하세요';
     if (mode === 'origin') return origin ? "'출발지'를 눌러 확정 (다시 클릭하면 위치 변경)" : '지도를 클릭해 출발지를 선택하세요';
     if (mode === 'dest')   return dest   ? "'도착지'를 눌러 확정 (다시 클릭하면 위치 변경)"  : '지도를 클릭해 도착지를 선택하세요';
-    if (mode === 'bs_create') return '지도에서 기지국을 배치할 위치를 클릭하세요.';
+    if (mode === 'bs_create') return stationType === 'rsu'
+      ? '지도에서 RSU를 설치할 위치를 클릭하세요 — 가장 가까운 교차로로 자동 스냅됩니다.'
+      : '지도에서 기지국을 배치할 위치를 클릭하세요 — 가장 가까운 건물 옥상으로 자동 스냅됩니다.';
     if (mode === 'bs_delete') return '삭제할 기지국을 클릭하세요.';
     return '';
   })();
@@ -1238,8 +1717,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             <LegendRow shape="circle" color="#E0463C" label="도착지">
               {destDone ? <Icon.check size={13} style={{ color: 'var(--good)' }} /> : <span className="mono" style={{ fontSize: 9, color: 'var(--ink-4)' }}>—</span>}
             </LegendRow>
-            <LegendRow shape="circle" color="#1E88E5" label="기지국">
-              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.length}개</span>
+            <LegendRow shape="circle" color="#1E88E5" label="기지국 (BS)">
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.filter(s=>s.node_type!=='rsu').length}개</span>
+            </LegendRow>
+            <LegendRow shape="circle" color="#FF8F00" label="RSU">
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.filter(s=>s.node_type==='rsu').length}개</span>
             </LegendRow>
             {vehicleCount > 1 && (
               <LegendRow shape="circle" color="#9AA5B1" label="배경 차량">
@@ -1336,26 +1818,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         )}
       </div>
 
-      {/* ── FAB 스택 — 컨트롤 패널 / 시뮬레이션 챗봇을 지도 우상단에 아이콘으로 ─ */}
-      <div style={{ position: 'absolute', right: 14, top: 14, zIndex: 650, display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <FabButton
-          icon="sliders"
+      {/* ── 세로형 탭 버튼 — 컨트롤 패널 / 시뮬레이션 챗봇, 지도 우측 가장자리에 붙임 ─ */}
+      <div style={{ position: 'absolute', right: 0, top: 20, zIndex: 650, display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <TabButton
+          label="Control"
           active={openPanel === 'control'}
           onClick={() => setOpenPanel(p => p === 'control' ? null : 'control')}
-          title="컨트롤 패널"
         />
-        <FabButton
-          icon="spark"
+        <TabButton
+          label="Sim Chat"
           active={openPanel === 'scenario'}
           onClick={() => setOpenPanel(p => p === 'scenario' ? null : 'scenario')}
-          title="시뮬레이션 챗봇"
         />
       </div>
 
-      {/* ── 플로팅 패널 — FAB 클릭 시 아이콘 옆에서 펼쳐짐 ──────────── */}
+      {/* ── 플로팅 패널 — 탭 버튼 클릭 시 왼쪽으로 펼쳐짐 ──────────── */}
       {openPanel && (
         <div style={{
-          position: 'absolute', top: 14, bottom: 14, right: 64,
+          position: 'absolute', top: 14, bottom: 14, right: 28,
           width: 360, zIndex: 660,
           background: 'var(--surface)', borderRadius: 14, boxShadow: 'var(--sh-3)',
           border: '1px solid var(--border)', display: 'flex', flexDirection: 'column',
@@ -1507,20 +1987,33 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           </div>
 
-          {/* base stations — Pro 전용 (Lite는 자동 배치된 기지국을 그대로 사용) */}
+          {/* base stations + RSU — Pro 전용 (Lite는 자동 배치된 기지국을 그대로 사용) */}
           {appMode === 'pro' && (
           <div className="field">
-            <label>기지국 <span className="en">BASE STATIONS</span></label>
+            <label>기지국 / RSU <span className="en">BS &amp; RSU</span></label>
             <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
               <div className="row between" style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
                 <span className="row gap8" style={{ minWidth: 0 }}>
                   <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#1E88E5', flex: '0 0 auto' }} />
-                  <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>배치됨 {stations.length}개</span>
+                  <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>
+                    BS {stations.filter(s => s.node_type !== 'rsu').length}개
+                  </span>
+                  <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#FF8F00', flex: '0 0 auto', marginLeft: 4 }} />
+                  <span style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>
+                    RSU {stations.filter(s => s.node_type === 'rsu').length}개
+                  </span>
                 </span>
               </div>
+              <Seg value={stationType} onChange={setStationType}
+                options={[{ v: 'bs', label: 'BS (기지국)' }, { v: 'rsu', label: 'RSU' }]} />
+              {stationType === 'rsu' && (
+                <div className="muted" style={{ fontSize: 10.5 }}>
+                  RSU는 PC5 사이드링크(~1–3ms, 범위 150m) — 교차로에 자동 스냅됩니다
+                </div>
+              )}
               <div className="row gap8">
                 <button className={'btn sm ' + (mode === 'bs_create' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area} onClick={tryBsCreate}>
-                  <Icon.antenna size={13} /> {mode === 'bs_create' ? '지도 클릭…' : '생성'}
+                  <Icon.antenna size={13} /> {mode === 'bs_create' ? '지도 클릭…' : (stationType === 'rsu' ? 'RSU 배치' : 'BS 배치')}
                 </button>
                 <button className={'btn sm ' + (mode === 'bs_delete' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area || stations.length === 0} onClick={tryBsDelete}>
                   <Icon.antenna size={13} /> {mode === 'bs_delete' ? '제거할 곳 클릭…' : '제거'}
@@ -1538,6 +2031,74 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               )}
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
+
+            {/* SA 비교군 — 동일 BS/RSU 수로 SA 최적 배치 결과를 헤드리스 평가해 나란히 비교 */}
+            {stations.length > 0 && origin && dest && (
+              <div style={{ marginTop: 10, padding: '12px 14px', background: 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)' }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>
+                  SA 비교군 <span style={{ fontWeight: 400, color: 'var(--ink-3)', fontSize: 11 }}>— 동일 조건 최적 배치와 수치 비교</span>
+                </div>
+                <div className="muted" style={{ fontSize: 11, marginBottom: 10, lineHeight: 1.5 }}>
+                  현재 배치(실험군 BS {stations.filter(s=>s.node_type!=='rsu').length}개 / RSU {stations.filter(s=>s.node_type==='rsu').length}개)와 동일한 수를
+                  SA로 최적 배치한 뒤 헤드리스 평가해 지연·PRR 수치를 비교합니다.
+                </div>
+                <button className="btn sm primary" onClick={runSaCompare}
+                  disabled={saCompareRunning || !origin || !dest}>
+                  {saCompareRunning
+                    ? <><Icon.reset size={12} className="spin" /> SA 비교군 실행 중…</>
+                    : <><Icon.compare size={12} /> SA 비교군 실행</>}
+                </button>
+                {saCompareError && <div style={{ color: 'var(--bad)', fontSize: 11.5, marginTop: 8 }}>{saCompareError}</div>}
+                {saCompareResult && (() => {
+                  const { user, sa_optimal, improvement } = saCompareResult;
+                  return (
+                    <div style={{ marginTop: 10 }}>
+                      <div className="tbl-wrap">
+                        <table className="tbl">
+                          <thead>
+                            <tr>
+                              <th style={{ fontSize: 11 }}>지표</th>
+                              <th style={{ fontSize: 11 }}>실험군 (사용자 배치)</th>
+                              <th style={{ fontSize: 11 }}>비교군 (SA 최적)</th>
+                              <th style={{ fontSize: 11 }}>개선</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              ['평균 지연 (ms)', user.avg_latency_ms, sa_optimal.avg_latency_ms, 'low'],
+                              ['P95 지연 (ms)', user.p95_latency_ms, sa_optimal.p95_latency_ms, 'low'],
+                              ['PRR (%)', user.prr_pct, sa_optimal.prr_pct, 'high'],
+                              ['미커버 구간 (%)', user.uncovered_pct, sa_optimal.uncovered_pct, 'low'],
+                            ].map(([label, uv, sv, better]) => {
+                              const improved = better === 'low' ? sv < uv : sv > uv;
+                              const diff = better === 'low' ? uv - sv : sv - uv;
+                              return (
+                                <tr key={label}>
+                                  <td style={{ fontSize: 11.5 }}>{label}</td>
+                                  <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5 }}>{uv != null ? (+uv).toFixed(2) : '—'}</td>
+                                  <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5, color: improved ? 'var(--good)' : 'var(--bad)' }}>
+                                    {sv != null ? (+sv).toFixed(2) : '—'}
+                                  </td>
+                                  <td style={{ fontSize: 11, color: improved ? 'var(--good)' : 'var(--bad)' }}>
+                                    {diff != null ? (improved ? '▼' : '▲') + Math.abs(diff).toFixed(2) : '—'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      {improvement?.sa_cost_improvement_pct != null && (
+                        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+                          SA 배치의 가중평균 지연 개선율: <b style={{ color: 'var(--good)' }}>{improvement.sa_cost_improvement_pct.toFixed(1)}%</b>
+                          {' '}({improvement.sa_n_candidates}개 후보 중 {improvement.sa_iter}회 탐색)
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
           </div>
           )}
 
@@ -1736,7 +2297,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
             {(osmWarning || simNotice) && (
               <div style={{ padding: '10px 12px', background: 'var(--warn-tint)', border: '1px solid var(--warn-line)', borderRadius: 10, color: 'var(--warn)', fontSize: 11.5 }}>
-                현재 시스템에서는 SUMO 대신 OSM fallback mode가 사용될 수 있습니다.
+                {osmWarning || simNotice}
               </div>
             )}
           </div>
@@ -1758,6 +2319,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           )}
         </div>
       )}
+
+      {/* ── CCTV 그리드 뷰 — 모든 시트를 나란히 ─────────────────────── */}
+      {gridView && (
+        <div style={{ position: 'absolute', inset: 0, zIndex: 900 }}>
+          <SheetGridView
+            sheets={sheets}
+            activeSheetIdx={activeSheetIdx}
+            onSelectSheet={idx => { switchToSheet(idx); setGridView(false); }}
+            liveVehiclePos={vehiclePos}
+            liveRouteCoords={routeCoords}
+            liveNetworkTelemetry={networkTelemetry}
+            liveBackgroundVehicles={backgroundVehicles}
+            stations={stations}
+            sim={sim}
+          />
+        </div>
+      )}
     </div>
 
     <SheetTabBar
@@ -1770,6 +2348,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       onRunBatch={runAllSheetsAsBatch}
       batchRunning={batchRunning}
       batchError={batchError}
+      onToggleGrid={() => setGridView(v => !v)}
+      gridView={gridView}
     />
     </div>
   );

@@ -22,7 +22,7 @@ const DEFAULT_SIM_CONFIG = {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
     traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
-    traffic_time_period: 'peak',
+    traffic_time_period: 'peak', bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
   },
 };
 
@@ -67,6 +67,10 @@ function validateSimulationConfig(config) {
     errors.push('policy_options.network_mode: must be "4G", "5G", or "6G"');
   if (pol.traffic_time_period !== undefined && !['peak', 'off_peak'].includes(pol.traffic_time_period))
     errors.push('policy_options.traffic_time_period: must be "peak" or "off_peak"');
+  if (pol.bg_reroute_prob !== undefined && (typeof pol.bg_reroute_prob !== 'number' || pol.bg_reroute_prob < 0 || pol.bg_reroute_prob > 1))
+    errors.push('policy_options.bg_reroute_prob: must be a number 0–1');
+  if (pol.bg_reroute_mode !== undefined && !['random', 'congestion'].includes(pol.bg_reroute_mode))
+    errors.push('policy_options.bg_reroute_mode: must be "random" or "congestion"');
 
   return { valid: errors.length === 0, errors, sanitized: mergeWithDefaultConfig(config) };
 }
@@ -111,6 +115,10 @@ function mergeWithDefaultConfig(userConfig) {
       merged.policy_options.network_mode = pol.network_mode;
     if (typeof pol.traffic_time_period === 'string' && ['peak', 'off_peak'].includes(pol.traffic_time_period))
       merged.policy_options.traffic_time_period = pol.traffic_time_period;
+    if (typeof pol.bg_reroute_prob === 'number' && pol.bg_reroute_prob >= 0)
+      merged.policy_options.bg_reroute_prob = Math.min(pol.bg_reroute_prob, 1);
+    if (typeof pol.bg_reroute_mode === 'string' && ['random', 'congestion'].includes(pol.bg_reroute_mode))
+      merged.policy_options.bg_reroute_mode = pol.bg_reroute_mode;
   }
   return merged;
 }
@@ -528,6 +536,28 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
                   <span className="sfx">대/km²</span>
                 </div></td>
                 <td><span className="muted" style={{ fontSize: 11 }}>차량 외 기기(폰·IoT) 밀도 — 같은 기지국 capacity를 나눠 쓰는 비차량 부하 (0–2000)</span></td>
+              </tr>
+              <tr>
+                <td><b style={{ fontWeight: 600 }}>배경 차량 실시간 재경로</b></td>
+                <td><div className="input-suffix" style={{ width: 130 }}>
+                  <input className="input" style={{ height: 32 }} type="number" min="0" max="100" step="1"
+                    value={Math.round((cfgDraft.policy_options.bg_reroute_prob ?? 0.02) * 100)}
+                    onChange={e => setPolicy('bg_reroute_prob', Math.max(0, Math.min(100, parseInt(e.target.value, 10) || 0)) / 100)} />
+                  <span className="sfx">%/초</span>
+                </div></td>
+                <td><span className="muted" style={{ fontSize: 11 }}>SUMO 모드 한정 — 배경 차량이 초당 이 확률로 주행 도중 무작위 목적지로 재경로(고정 경로 대신 동적 행태). 0이면 도착 시에만 새 목적지로 교체</span></td>
+              </tr>
+              <tr>
+                <td><b style={{ fontWeight: 600 }}>재경로 트리거 방식</b></td>
+                <td>
+                  <Seg value={cfgDraft.policy_options.bg_reroute_mode ?? 'random'} onChange={v => setPolicy('bg_reroute_mode', v)}
+                    options={[{ v: 'random', label: '무작위' }, { v: 'congestion', label: '혼잡 기반' }]} />
+                </td>
+                <td><span className="muted" style={{ fontSize: 11 }}>
+                  무작위: 모든 배경 차량에 균일 확률 적용. 혼잡 기반: 차량 위치의 기지국 혼잡도(load/capacity)가
+                  높을수록 위 확률이 최대 4배까지 증폭 — "혼잡한 곳에서 우회가 늘어난다"는 검증 가능한 가설로,
+                  자원할당 알고리즘의 혼잡 대응을 스트레스 테스트하는 데 적합
+                </span></td>
               </tr>
               {[
                 ['저지연 우선',    'prefer_low_latency',  '지연시간 최소화 경로 선호'],
