@@ -129,6 +129,11 @@ except ImportError:
 
 from app.services.traffic.its_cache import ITS_CACHE
 from app.services.traffic.traffic_fusion_engine import TRAFFIC_FUSION_ENGINE
+from app.services.regions.region_service import (
+    get_sido_list, get_sigungu_list, get_dong_list,
+    get_region, get_children, get_region_by_bbox,
+    extract_osm_from_pbf, get_area_km2, mark_network_built, db_available,
+)
 from app.services.export.report_builder import (
     build_run_summary,
     build_algorithm_compare,
@@ -248,7 +253,9 @@ async def _cleanup_synthetic_nodes() -> None:
 
 WORK_DIR = Path(__file__).parent / "networks"
 WORK_DIR.mkdir(exist_ok=True)
-MAX_SETUP_AREA_KM2 = 25.0
+MAX_SETUP_AREA_KM2        = 25.0   # Overpass API 모드 상한 (대용량 다운로드 불안정)
+MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 단위 커버)
+DEFAULT_LOCAL_PBF = Path.home() / "Desktop" / "south-korea-260711.osm.pbf"
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
@@ -461,7 +468,8 @@ class SimConfigPolicyOptions(BaseModel):
     prefer_load_balance:  bool  = False
     avoid_disconnection:  bool  = True
     traffic_lambda:       float = 5.0   # background vehicle density (vehicles/km²)
-    other_device_lambda:  float = 300.0 # 차량 외 기기(폰/IoT) 밀도 (기기/km²) — _L_total의 n_vehicles에 가산
+    other_device_lambda:  float = 30.0  # 차량 외 기기 순간 활성 밀도 (기기/km²) — 총 밀도 ~300/km²의 활성 비율 ~10% 적용
+                                         # 출처: Gonzalez-Martin et al. IEEE TVT 2019; 3GPP TR 38.901 Urban Macro 시나리오
     network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
     traffic_time_period:  str   = "peak"  # "peak" / "off_peak" — 어느 ITS 동기화 버킷을 시뮬레이션에 쓸지
     bg_reroute_prob:      float = 0.02  # 배경 차량이 초당 무작위로 목적지를 바꿀 확률 (0~1) — 고정 경로 대신 동적 재경로
@@ -925,47 +933,88 @@ def _seed_other_device_load(nodes: list[dict], other_device_lambda: float, rng: 
         node["n_other_devices"] = _poisson_sample(other_device_lambda * area_km2, rng)
 
 
-def _seed_its_congestion_load(nodes: list[dict], time_period: str = "peak") -> None:
-    """동기화된 실시간 ITS 교통량(/traffic/sync-its)을 기지국별 부하로 환산해
-    node["n_its_load"]에 저장한다.
+# ITS → 기지국 차량 밀도 환산 상수 (Greenshields 모델)
+# Greenshields (1934), Proc. HRB 14, 448-477
+# k_jam: 한국도로용량편람 KHCM (2013) §4 — 도시 간선도로 정체밀도
+# v2x_rate: 3GPP TR 37.885 V15.3.0 §5.2 평가 시나리오 참고치
+_ITS_K_JAM: float = 130.0    # veh/km/lane
+_ITS_N_LANES: int = 1         # TOPIS 방향별 링크 = 편도 1차로 보수적 가정
+_ITS_V2X_RATE: float = 0.30   # V2X 보급률
 
-    기존에는 ITS congestion_score가 mock 모드 배경 차량의 출발/도착지 샘플링 가중치로만
-    쓰였고 latency 큐잉 모델(_L_total)에는 전혀 반영되지 않았다 — 이 함수가 그 간극을
-    메운다. 각 노드의 coverage_radius_m 반경 안에 들어오는 ITS 링크 geometry 포인트들의
-    congestion_score(0~1) 중 최댓값을 그 노드의 혼잡도로 보고, "혼잡도 1.0 = 모델에 안
-    잡히는 차량/기기 최대 50대 상당이 추가로 깔려있다"는 가정으로 결정론적 가산 부하를
-    만든다. ITS는 Poisson이 아니라 실측값이므로 시뮬레이션 시작 시 1회만 계산하고 런
-    내내 고정 — _seed_other_device_load와 같은 설계 철학.
-    ITS가 동기화되지 않은 상태(링크 없음)에서는 n_its_load=0으로 기존 동작과 동일하다.
+
+def _seed_its_congestion_load(nodes: list[dict], time_period: str = "peak") -> None:
+    """ITS 교통량을 기지국별 V2X 차량 수(n_its_load)로 환산해 저장한다.
+
+    Greenshields 밀도 모델: k = k_jam × congestion_score  [veh/km/lane]
+    세그먼트별 V2X 차량 수: ΔN = k_jam × score × n_lanes × v2x_rate × L_km
+    각 세그먼트 중점을 커버리지 내 최근접 기지국 하나에만 배정 (이중 집계 방지),
+    기지국별 ΔN을 합산해 n_its_load에 저장.
     """
     try:
         traffic = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=time_period)
     except Exception:
         traffic = {}
     links = traffic.get("links") or []
-    hot_points = [
-        (pt.get("lat"), pt.get("lng"), float(link.get("congestion_score") or 0.0))
-        for link in links
-        if link.get("congestion_score") and link.get("geometry")
-        for pt in link["geometry"]
-    ]
+
+    # Phase 1: 초기화
     for node in nodes:
         node["its_congestion_score"] = 0.0
         node["n_its_load"] = 0
-        if not hot_points:
+    if not links or not nodes:
+        return
+
+    # Phase 2: 세그먼트 중점 → 최근접 기지국 배정 + ΔN 누적
+    accumulated: dict[str, float] = {}
+    max_score: dict[str, float] = {}
+
+    for link in links:
+        score = float(link.get("congestion_score") or 0.0)
+        if score <= 0:
             continue
-        radius_m = float(node.get("coverage_radius_m") or 400.0)
-        nlat, nlng = node.get("lat"), node.get("lng")
-        if nlat is None or nlng is None:
+        geom = link.get("geometry") or []
+        if len(geom) < 2:
             continue
-        best_score = 0.0
-        for hlat, hlng, score in hot_points:
-            if hlat is None or hlng is None:
+
+        for i in range(len(geom) - 1):
+            p0, p1 = geom[i], geom[i + 1]
+            lat0, lng0 = p0.get("lat"), p0.get("lng")
+            lat1, lng1 = p1.get("lat"), p1.get("lng")
+            if None in (lat0, lng0, lat1, lng1):
                 continue
-            if haversine_m(nlat, nlng, hlat, hlng) <= radius_m:
-                best_score = max(best_score, score)
-        node["its_congestion_score"] = round(best_score, 3)
-        node["n_its_load"] = round(best_score * 50)
+
+            seg_len_km = haversine_m(lat0, lng0, lat1, lng1) / 1000.0
+            if seg_len_km <= 0:
+                continue
+
+            mid_lat = (lat0 + lat1) * 0.5
+            mid_lng = (lng0 + lng1) * 0.5
+            best_nid: str | None = None
+            best_dist = float("inf")
+            for node in nodes:
+                nlat, nlng2 = node.get("lat"), node.get("lng")
+                if nlat is None or nlng2 is None:
+                    continue
+                d = haversine_m(nlat, nlng2, mid_lat, mid_lng)
+                radius_m = float(node.get("coverage_radius_m") or 400.0)
+                if d <= radius_m and d < best_dist:
+                    best_dist = d
+                    best_nid = str(node.get("id") or node.get("name") or "")
+
+            if best_nid is None:
+                continue
+
+            # ΔN = k_jam × score × n_lanes × v2x_rate × L_km
+            delta_n = _ITS_K_JAM * score * _ITS_N_LANES * _ITS_V2X_RATE * seg_len_km
+            accumulated[best_nid] = accumulated.get(best_nid, 0.0) + delta_n
+            if score > max_score.get(best_nid, 0.0):
+                max_score[best_nid] = score
+
+    # Phase 3: 누적값 노드에 적용
+    for node in nodes:
+        nid = str(node.get("id") or node.get("name") or "")
+        if nid in accumulated:
+            node["n_its_load"] = round(accumulated[nid])
+            node["its_congestion_score"] = round(max_score.get(nid, 0.0), 3)
 
 
 def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5.0) -> list[dict]:
@@ -1003,7 +1052,7 @@ def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5
             "type": "base_station",
             "lat": center_lat + lat_span,
             "lng": center_lng - lng_span,
-            "edge_latency_ms": 4.0,
+            "edge_latency_ms": 3.0,    # MEC/앱서버 처리 지연 (백홀+코어는 _L_total이 기술별로 계산)
             "coverage_radius_m": 450.0,
             "congestion_penalty": cong_bs,
             "congestion_score": cong_bs,
@@ -1020,7 +1069,7 @@ def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5
             "type": "roadside_unit",
             "lat": center_lat - lat_span * 0.2,
             "lng": center_lng + lng_span * 0.7,
-            "edge_latency_ms": 2.5,
+            "edge_latency_ms": 0.5,    # PC5 RSU: 메시지 처리+전달 지연 ≈ 0.5ms (백홀 없음)
             "coverage_radius_m": 220.0,
             "congestion_penalty": cong_rsu,
             "congestion_score": cong_rsu,
@@ -1037,7 +1086,7 @@ def generate_network_nodes_for_bbox(bbox: dict | None, traffic_lambda: float = 5
             "type": "edge_node",
             "lat": center_lat - lat_span,
             "lng": center_lng - lng_span * 0.3,
-            "edge_latency_ms": 1.8,
+            "edge_latency_ms": 2.0,    # 엣지 노드(소형셀+MEC): MEC 앱 처리 ≈ 2ms (백홀은 _L_total)
             "coverage_radius_m": 320.0,
             "congestion_penalty": cong_edge,
             "congestion_score": cong_edge,
@@ -1064,7 +1113,7 @@ def db_node_to_candidate(row: dict) -> dict:
         "load": float(row.get("load") or 0.0),
         "congestion_score": congestion,
         "congestion_penalty": congestion,
-        "edge_latency_ms": float(row.get("edge_latency_ms") or 5.0),
+        "edge_latency_ms": float(row.get("edge_latency_ms") or 3.0),
         "coverage_radius_m": float(row.get("coverage_radius_m") or 500.0),
         "source": row.get("source", "user_created"),
         "antenna_height_m": float(row["antenna_height_m"]) if row.get("antenna_height_m") is not None else None,
@@ -3855,20 +3904,22 @@ def buildings_query_by_bbox(req: BuildingBBoxRequest):
 
 @app.post("/api/setup-network")
 async def setup_network(req: SetupRequest):
-    """Download OSM and convert to SUMO network for the given bbox."""
+    """OSM 취득 후 SUMO 네트워크 변환. 로컬 PBF가 있으면 우선 사용 (빠르고 오프라인)."""
     bbox = req.bbox
+    use_local_pbf = DEFAULT_LOCAL_PBF.exists()
 
     area_km2 = (
         (bbox.n - bbox.s) * 111 *
         (bbox.e - bbox.w) * 111 * abs((bbox.n + bbox.s) / 2 * 3.14159 / 180)
     )
 
-    if area_km2 > MAX_SETUP_AREA_KM2:
+    area_limit = MAX_SETUP_AREA_KM2_LOCAL if use_local_pbf else MAX_SETUP_AREA_KM2
+    if area_km2 > area_limit:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"선택 구역이 너무 큽니다 ({area_km2:.2f} km²). "
-                f"netconvert 안정성을 위해 {MAX_SETUP_AREA_KM2:.0f} km² 이하로 선택해주세요."
+                f"선택 구역이 너무 큽니다 ({area_km2:.1f} km²). "
+                f"{'로컬 PBF 모드' if use_local_pbf else 'Overpass API 모드'} 상한은 {area_limit:.0f} km²입니다."
             ),
         )
 
@@ -3881,10 +3932,23 @@ async def setup_network(req: SetupRequest):
         reset_simulation_state()
 
         try:
-            # Step 1: Download OSM
-            await asyncio.get_event_loop().run_in_executor(
-                None, overpass_download, download_bbox, osm_file
-            )
+            if use_local_pbf:
+                # Step 1 (로컬): PBF에서 bbox 추출 — 인터넷 불필요, 빠름
+                from app.services.regions.region_service import _extract_with_osmium, _extract_with_pyosmium
+                import shutil as _shutil
+                osmium_bin = _shutil.which("osmium")
+                s, w, n, e = download_bbox.s, download_bbox.w, download_bbox.n, download_bbox.e
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: (_extract_with_osmium(osmium_bin, DEFAULT_LOCAL_PBF, osm_file, s, w, n, e)
+                             if osmium_bin
+                             else _extract_with_pyosmium(DEFAULT_LOCAL_PBF, osm_file, s, w, n, e))
+                )
+            else:
+                # Step 1 (원격): Overpass API 다운로드
+                await asyncio.get_event_loop().run_in_executor(
+                    None, overpass_download, download_bbox, osm_file
+                )
 
             # Step 2: parse the OSM road graph — NOT a "SUMO unavailable" fallback. This graph
             # (and the pure-Python Dijkstra/A*/K-path functions built on it, "mock_*") is the
@@ -3939,8 +4003,192 @@ async def setup_network(req: SetupRequest):
                 "ok": True,
                 "net_file": str(net_file),
                 "area_km2": round(area_km2, 2),
+                "source": "local_pbf" if use_local_pbf else "overpass",
                 "fallback": False,
                 "warning": None,
+                "mapping": mapping_stats,
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            _state["error"] = str(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/setup-network/info")
+def setup_network_info():
+    """OSM 소스 정보: 로컬 PBF 가용 여부 + 면적 상한"""
+    local = DEFAULT_LOCAL_PBF.exists()
+    return {
+        "local_pbf_available": local,
+        "local_pbf_path": str(DEFAULT_LOCAL_PBF) if local else None,
+        "max_area_km2": MAX_SETUP_AREA_KM2_LOCAL if local else MAX_SETUP_AREA_KM2,
+    }
+
+
+# ─── 전국 행정구역 API ──────────────────────────────────────────────────────
+
+@app.get("/api/regions/status")
+def regions_status():
+    """행정구역 DB 사용 가능 여부 + 통계"""
+    from pathlib import Path as _Path
+    db_path = _Path(__file__).parent / "data" / "regions.db"
+    if not db_available():
+        return {"available": False, "reason": "regions.db가 없습니다. build_region_index.py를 실행하세요."}
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    stats = {}
+    for row in conn.execute("SELECT admin_level, COUNT(*) as cnt FROM regions GROUP BY admin_level").fetchall():
+        stats[row[0]] = row[1]
+    conn.close()
+    return {"available": True, "counts": stats}
+
+
+@app.get("/api/regions/sido")
+def regions_sido():
+    """도/특별시/광역시 목록 (admin_level=4)"""
+    return {"regions": get_sido_list()}
+
+
+@app.get("/api/regions/sigungu")
+def regions_sigungu(parent_osm_id: Optional[int] = None):
+    """시/군/구 목록. parent_osm_id로 시/도 내로 필터링"""
+    return {"regions": get_sigungu_list(parent_osm_id)}
+
+
+@app.get("/api/regions/dong")
+def regions_dong(parent_osm_id: Optional[int] = None):
+    """읍/면/동 목록. parent_osm_id로 시군구 내로 필터링"""
+    return {"regions": get_dong_list(parent_osm_id)}
+
+
+@app.get("/api/regions/{osm_id}")
+def regions_detail(osm_id: int):
+    """단일 행정구역 상세 정보"""
+    r = get_region(osm_id)
+    if not r:
+        raise HTTPException(status_code=404, detail=f"osm_id={osm_id} 구역을 찾을 수 없습니다.")
+    r["area_km2"] = get_area_km2(r)
+    r["children"] = get_children(osm_id)
+    return r
+
+
+@app.get("/api/regions/{osm_id}/children")
+def regions_children(osm_id: int):
+    """하위 행정구역 목록"""
+    return {"regions": get_children(osm_id)}
+
+
+class RegionSetupRequest(BaseModel):
+    osm_id: int
+    pbf_path: Optional[str] = None  # 기본값: ~/Desktop/south-korea-260711.osm.pbf
+
+
+@app.post("/api/setup-network-region")
+async def setup_network_region(req: RegionSetupRequest):
+    """
+    로컬 PBF에서 행정구역 OSM 추출 → SUMO 네트워크 변환.
+    /api/setup-network와 동일한 결과를 반환하지만 Overpass API 대신 로컬 파일 사용.
+    """
+    from pathlib import Path as _Path
+
+    region = get_region(req.osm_id)
+    if not region:
+        raise HTTPException(status_code=404, detail=f"osm_id={req.osm_id} 구역을 찾을 수 없습니다.")
+
+    area_km2 = get_area_km2(region)
+    if area_km2 > MAX_SETUP_AREA_KM2_LOCAL:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"선택 구역 '{region['name_ko']}'이 너무 큽니다 ({area_km2:.1f} km²). "
+                f"시/군/구 이하 단위를 선택해주세요 (상한 {MAX_SETUP_AREA_KM2_LOCAL:.0f} km²)."
+            ),
+        )
+
+    pbf_path = _Path(req.pbf_path) if req.pbf_path else (_Path.home() / "Desktop" / "south-korea-260711.osm.pbf")
+    if not pbf_path.exists():
+        raise HTTPException(status_code=400, detail=f"PBF 파일을 찾을 수 없습니다: {pbf_path}")
+
+    req_id = f"region-{req.osm_id}"
+    net_file = WORK_DIR / f"{req_id}.net.xml"
+
+    # bbox 구성
+    bbox = BBox(
+        s=region["min_lat"],
+        w=region["min_lon"],
+        n=region["max_lat"],
+        e=region["max_lon"],
+    )
+
+    with _network_lock:
+        reset_simulation_state()
+
+        try:
+            # Step 1: 로컬 PBF에서 OSM 추출
+            osm_file = await asyncio.get_event_loop().run_in_executor(
+                None,
+                extract_osm_from_pbf,
+                req.osm_id,
+                pbf_path,
+                WORK_DIR,
+            )
+
+            # Step 2: mock graph 파싱
+            mock_graph = await asyncio.get_event_loop().run_in_executor(
+                None, load_mock_graph, osm_file
+            )
+
+            # Step 3: netconvert로 SUMO 네트워크 변환
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, netconvert, osm_file, net_file, bbox
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"SUMO netconvert 실패 ({region['name_ko']}): {exc} "
+                        "— 구역을 더 작게 줄여보거나 다른 구역을 선택해주세요."
+                    ),
+                ) from exc
+
+            _state["osm_file"] = str(osm_file)
+            _state["mock_graph"] = mock_graph
+            _state["net_file"] = str(net_file)
+            _state["sim_mode"] = "sumo"
+            _state["network_ready"] = True
+            _state["current_bbox"] = {
+                "s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e
+            }
+            _state["current_region"] = {
+                "osm_id": req.osm_id,
+                "name_ko": region["name_ko"],
+                "name_en": region["name_en"],
+                "admin_level": region["admin_level"],
+                "area_km2": area_km2,
+            }
+            _state["synthetic_network_nodes"] = generate_network_nodes_for_bbox(
+                _state["current_bbox"],
+                traffic_lambda=(_state.get("policy_options") or {}).get("traffic_lambda", 5.0),
+            )
+            _state["network_nodes"] = merged_network_nodes()
+
+            mapping_stats = TRAFFIC_FUSION_ENGINE.prepare_current_network_mappings(
+                osm_file=osm_file,
+                net_file=net_file,
+                bbox=_state["current_bbox"],
+            )
+
+            mark_network_built(req.osm_id, str(net_file))
+
+            return {
+                "ok": True,
+                "region": region["name_ko"],
+                "net_file": str(net_file),
+                "area_km2": area_km2,
+                "bbox": {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e},
                 "mapping": mapping_stats,
             }
 
@@ -5508,7 +5756,7 @@ async def create_network_node(req: NetworkNodeCreateRequest):
             "capacity": 100.0,
             "load": 0.0,
             "congestion_score": 0.0,
-            "edge_latency_ms": 5.0,
+            "edge_latency_ms": 3.0,    # MEC/앱서버 처리 지연 (백홀+코어는 _L_total)
             "coverage_radius_m": 500.0,
             "source": "user_created",
             "antenna_height_m": placement.antenna_height_m,

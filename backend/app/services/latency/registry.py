@@ -90,7 +90,7 @@ class HandoverState:
     prev_bs_id: Optional[str] = None
     current_bs_id: Optional[str] = None
     handover_occurred: bool = False
-    handover_base_ms: float = 5.0       # flat handover transition cost (ms)
+    handover_base_ms: float = 20.0      # 5G NR Xn 핸드오버 중단시간 (3GPP TR 38.300 §9.2.4: 실측 10-30ms)
 
 
 @dataclass

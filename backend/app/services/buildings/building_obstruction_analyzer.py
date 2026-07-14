@@ -37,22 +37,84 @@ _WALL_SPACING_BY_USE: dict[str, float] = {
     "unknown":          8.0,
 }
 
-# ── Technology parameters for the L_total latency model ───────────────────────
-# alpha calibrated so RSRP transitions at realistic urban coverage distances:
-#   4G: retransmissions begin ~400m, 5G ~500m, 6G ~700m
-# L_base는 "무부하(unloaded) 최선의 경우" 바닥값이 아니라 실측 상용망 평균 체감 지연
-# 기준으로 잡았다 — 4G LTE 실측 RTT는 약 30-50ms(편도 추정 ~25ms), 5G NSA 혼합망 실측은
-# 흔히 5-20ms대(보수적으로 ~15ms), 6G는 미상용이라 ITU-R IMT-2030 목표치 수준(~1ms) 유지.
+# ── Technology parameters — latency model v3.1 ────────────────────────────────
+# L_total = L_base + L_transmission + L_queue
+#   L_base         = TTI × 0.5            (scheduling wait, uniform dist mean)
+#   L_transmission = packet_bits / (SE × BW)  (MCS → throughput → time)
+#   L_queue        = TTI × ρ/(1−ρ)        (M/M/1, service time = 1 TTI slot)
+#
+# Path loss: 2-Slope model (3GPP TR 38.901 UMa LOS, Table 7.4.1-1)
+#   d ≤ d_BP : PL(d) = 10 × 2.2 × log10(d)
+#   d > d_BP : PL(d) = 10 × 2.2 × log10(d_BP) + 10 × 4.0 × log10(d/d_BP)
+#   d_BP = 4 × h_BS × h_UT × f_c / c   (c = 3×10⁸ m/s)
+#
+# SINR via α back-calculation — P_tx and noise_floor cancel (sec. 5 of doc):
+#   SINR(d) = SINR_min + PL(d_edge) − PL(d) − A_seg
+#
+# 출처: 설계 문서 v3.1 (Autonomous V2X AI Routing Lab)
+#   TTI/numerology: 3GPP TS 38.211; MCS SE: 3GPP TS 38.214 Table 5.1.3.1-1
+#   2-Slope β: 3GPP TR 38.901 UMa LOS Table 7.4.1-1
+#   BW 근거: 4G [TS 36.101 단일반송파 최대], 5G [국내 3사 3.5GHz 100MHz 실배치]
 _TECH_PARAMS: dict[str, dict] = {
-    # alpha calibrated so retransmissions begin at realistic distances:
-    #   4G ~240m  (urban macro, 300-400m coverage radius)
-    #   5G ~450m  (urban NR, 450m coverage radius)
-    #   6G ~1000m (future, extended coverage)
-    # coverage_radius_m = 위 코멘트의 실제 커버리지 반경 — 하드 컷오프로 사용(아래 참고).
-    "4G": dict(L_base=25.0, P_tx=43.0, alpha=45.0, beta=3.5, RSRP_thresh=-85.0,  RSRP_range=25.0, N_max=6, T_retx=8.0,  C_tech=100,  coverage_radius_m=400.0),
-    "5G": dict(L_base=15.0, P_tx=46.0, alpha=55.0, beta=3.0, RSRP_thresh=-90.0,  RSRP_range=25.0, N_max=4, T_retx=1.0,  C_tech=500,  coverage_radius_m=450.0),
-    "6G": dict(L_base= 1.0, P_tx=48.0, alpha=68.0, beta=2.5, RSRP_thresh=-95.0,  RSRP_range=25.0, N_max=3, T_retx=0.1,  C_tech=2000, coverage_radius_m=1000.0),
+    "4G": dict(
+        TTI=1.0,              # ms; numerology 0, SCS 15 kHz (3GPP TS 38.211)
+        f_c=2.0e9,            # Hz; LTE 2.0 GHz 대표 반송파
+        h_BS=24.0,            # m;  UMa 기지국 높이
+        h_UT=0.5,             # m;  차량 UE 안테나 높이
+        BW=20e6,              # Hz; LTE 단일반송파 최대 (3GPP TS 36.101)
+        d_edge=2000.0,        # m;  설계 앵커 — 도심 매크로 LTE 커버리지 반경
+        C_tech=100,           # vehicles; M/M/1 수용량 [설계 파라미터]
+        coverage_radius_m=400.0,
+        # ── 비무선 구간 지연 (3GPP TR 36.912, Aijaz et al. IEEE Commun. Surv. 2015) ──
+        backhaul_ms=8.0,      # S1-U 인터페이스(eNB→SGW): 광섬유 도심 편도 평균
+        core_ms=5.0,          # EPC 처리(SGW+PGW+MME): 각 노드 1-2ms × 복수 홉
+    ),
+    "5G": dict(
+        TTI=0.5,              # ms; numerology 1, SCS 30 kHz (국내 3.5GHz 실배치)
+        f_c=3.5e9,            # Hz; 5G NR 3.5 GHz
+        h_BS=24.0,
+        h_UT=0.5,
+        BW=100e6,             # Hz; 국내 3사 3.5GHz 각 100MHz 실배치 근거
+        d_edge=1000.0,        # m;  설계 앵커
+        C_tech=500,
+        coverage_radius_m=450.0,
+        # ── 비무선 구간 지연 (3GPP TR 38.913 §8.1.1, Patel et al. IEEE Access 2022) ──
+        backhaul_ms=3.0,      # NG3 인터페이스(gNB→UPF): CU/DU 분리 포함 편도
+        core_ms=2.0,          # 5GC 처리(UPF+SMF+AMF): MEC 배치 기준
+    ),
+    "6G": dict(
+        TTI=0.125,            # ms; [설계 가정] numerology 3, SCS 120 kHz 플레이스홀더
+        f_c=7.0e9,            # Hz; [설계 가정] upper mid-band 연구 주파수
+        h_BS=24.0,
+        h_UT=0.5,
+        BW=400e6,             # Hz; NR FR2 반송파 최대 (TS 38.101-2) 차용
+        d_edge=500.0,         # m;  설계 앵커
+        C_tech=2000,
+        coverage_radius_m=1000.0,
+        # ── 비무선 구간 지연 (IMT-2030 요구사항 기반 설계 가정) ──
+        backhaul_ms=0.5,      # 분산 RAN + 초저지연 광섬유 인터페이스
+        core_ms=0.5,          # 완전 분산 코어(제로트러스트 UPF 로컬 배치)
+    ),
 }
+
+# ── MCS lookup table (3GPP TS 38.214 Table 5.1.3.1-1) ─────────────────────────
+# (최소 SINR dB [AWGN BLER 10% 근사], 스펙트럼 효율 bit/s/Hz)
+# SINR 문턱은 근사값 — 표준값은 스펙트럼 효율만; 출처: Sadhana 48:77 AWGN LUT
+_MCS_TABLE: list[tuple[float, float]] = [
+    (-6.0, 0.2344),   # MCS  0, QPSK
+    (-2.0, 0.6016),   # MCS  4, QPSK
+    ( 3.0, 1.3262),   # MCS  9, QPSK
+    ( 6.0, 1.6953),   # MCS 12, 16QAM
+    ( 9.0, 2.5703),   # MCS 16, 16QAM
+    (13.0, 3.3223),   # MCS 20, 64QAM
+    (17.0, 4.5234),   # MCS 24, 64QAM
+    (21.0, 5.9004),   # MCS 28, 64QAM
+]
+_SINR_MIN_DB: float = -6.0    # MCS 0 문턱 — 이하면 outage
+_L_OUTAGE_MS: float = 1000.0  # outage 유한 페널티 [설계 가정: 최적화 수렴 유지]
+# CAM 메시지 크기: ETSI EN 302 637-2 V1.4.1 §B.2 (일반 CAM 페이로드 300-800 바이트,
+# 대표값 800 바이트 = 6400 bits 사용)
+_PACKET_BITS: int   = 6_400
 
 
 # ── RSU (Road Side Unit) coverage radii by network mode ───────────────────────
@@ -127,47 +189,84 @@ def _L_total(
     network_mode: str,
     deficit_ratio: float = 0.0,
 ) -> tuple[float, float, float, float]:
-    """Compute L_total = L_base + L_signal + L_queue (ms).
+    """Compute L_total = L_base + L_transmission + L_queue (ms).  [설계 문서 v3.1]
 
-    L_signal uses the Log-Distance RSRP model + HARQ retransmission mapping.
-    L_queue uses the M/M/1 model with rho = n_vehicles / C_tech, PLUS deficit_ratio.
+    ① L_base = TTI × 0.5
+       패킷이 다음 슬롯 경계까지 기다리는 평균 시간 (균등분포 평균).
+       출처: Coll-Perales et al., IEEE TVT 2023; 3GPP TS 38.211 (TTI/numerology)
 
-    deficit_ratio: connecting BS's RB allocation deficit_rb / capacity (0.0 when the
-    BS isn't oversubscribed). The resource-allocation system caps utilization_ratio
-    at 1.0 (a BS 5x oversubscribed looks the same as one merely at capacity once you
-    only look at load/capacity), so without this term a real RB shortage found by the
-    allocation algorithms would never show up as queuing delay here — the two systems
-    would keep estimating congestion independently and disagreeing.
+    ② L_transmission = _PACKET_BITS / (SE × BW)
+       SINR → MCS → 스펙트럼 효율 → 처리량 → 전송 시간.
+       • 2-Slope 경로손실 (3GPP TR 38.901 UMa LOS Table 7.4.1-1):
+           d ≤ d_BP : PL = 10·2.2·log10(d)
+           d > d_BP : PL = 10·2.2·log10(d_BP) + 10·4.0·log10(d/d_BP)
+           d_BP = 4·h_BS·h_UT·f_c / c
+       • SINR α-역산 소거 (설계 문서 §5):
+           SINR(d) = SINR_min + PL(d_edge) − PL(d) − A_seg_db
+           (P_tx = 46 dBm, noise_floor = −95 dBm이 완전 소거됨)
+       • SINR < −6 dB → outage → L_OUTAGE = 1000 ms 반환
+       • MCS 표: 3GPP TS 38.214 Table 5.1.3.1-1 (SE); SINR 문턱은 AWGN 근사
 
-    deficit_ratio is added as a SEPARATE linear penalty on top of (not folded into) rho.
-    Earlier version added it directly to rho before the 0.99 cap — any BS with a large
-    enough deficit got clipped to the same rho≈0.99 ceiling, so distinct BSs with very
-    different oversubscription levels all produced the same ~L_base×99 latency (observed
-    as multiple candidates showing an identical, suspiciously round 1500.0ms — 2026-06-24
-    user report). Linear addition instead keeps L_queue strictly increasing in deficit_ratio
-    (no collision between different severities) and is exactly 0 when deficit_ratio=0, so
-    behavior is unchanged whenever the allocation system reports no deficit.
+    ③ L_queue = TTI × ρ / (1 − ρ)
+       M/M/1 대기행렬, 서비스 시간 = 1 TTI 슬롯 [설계 가정].
+       ρ = n_vehicles / C_tech (최대 0.99 클램프).
+       deficit_ratio > 0이면 RB 할당 부족 선형 페널티 TTI × deficit_ratio 추가.
+       출처: Coll-Perales et al., IEEE TVT 2023
 
-    Returns (L_total, L_base, L_signal, L_queue) — the three components are
-    returned alongside the total so callers (e.g. the dashboard breakdown)
-    can display the model's actual terms instead of an ad-hoc approximation.
+    ④ L_transport = backhaul_ms + core_ms  (기술별 비무선 구간)
+       4G: backhaul 8ms(S1-U) + core 5ms(SGW+PGW+MME) = 13ms
+           출처: Aijaz et al., IEEE Commun. Surv. Tutorials 2015; 3GPP TR 36.912
+       5G: backhaul 3ms(NG3) + core 2ms(UPF+SMF) = 5ms
+           출처: 3GPP TR 38.913 §8.1.1; Patel et al., IEEE Access 2022
+       6G: backhaul 0.5ms + core 0.5ms = 1ms  [IMT-2030 목표 기반 설계 가정]
+
+    Returns (L_total, L_base, L_transmission, L_queue).
+    L_total은 L_transport를 포함한 셀룰러 Uu 구간 전체 지연.
+    호출부는 l_signal_ms 변수명으로 L_transmission을 받아 저장함 (API 필드명 유지).
     """
     p = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])
-    L_base = p["L_base"]
+    C_LIGHT = 3e8  # m/s
 
-    # Log-Distance Path Loss RSRP model
-    RSRP = p["P_tx"] - p["alpha"] - 10.0 * p["beta"] * log10(max(distance_m, 1.0)) - A_seg_db
+    # ── ① L_base: 스케줄링 대기 ─────────────────────────────────────────────
+    TTI = p["TTI"]
+    L_base = TTI * 0.5
 
-    # HARQ retransmission latency
-    N_retx = p["N_max"] * max(0.0, min(1.0, (p["RSRP_thresh"] - RSRP) / p["RSRP_range"]))
-    L_signal = N_retx * p["T_retx"]
+    # ── ② 2-Slope 경로손실 ──────────────────────────────────────────────────
+    d = max(distance_m, 1.0)
+    d_BP = 4.0 * p["h_BS"] * p["h_UT"] * p["f_c"] / C_LIGHT
 
-    # M/M/1 queuing latency (background load only) + separate RB-deficit penalty
+    def _pl(dist: float) -> float:
+        if dist <= d_BP:
+            return 10.0 * 2.2 * log10(max(dist, 1.0))
+        return 10.0 * 2.2 * log10(d_BP) + 10.0 * 4.0 * log10(dist / d_BP)
+
+    # SINR — α·P_tx·noise_floor 소거 후 단순화 (설계 문서 §5)
+    SINR = _SINR_MIN_DB + _pl(p["d_edge"]) - _pl(d) - A_seg_db
+
+    # Outage: MCS 0 문턱 미만
+    if SINR < _SINR_MIN_DB:
+        return _L_OUTAGE_MS, 0.0, _L_OUTAGE_MS, 0.0
+
+    # MCS 선택: SINR을 만족하는 최고 MCS 스펙트럼 효율
+    se = _MCS_TABLE[0][1]
+    for sinr_thr, se_val in _MCS_TABLE:
+        if SINR >= sinr_thr:
+            se = se_val
+
+    throughput_bps = se * p["BW"]
+    L_transmission = round((_PACKET_BITS / throughput_bps) * 1000.0, 3)  # → ms
+
+    # ── ③ L_queue: M/M/1 (서비스 시간 = TTI) ───────────────────────────────
     rho = min(n_vehicles / p["C_tech"], 0.99)
-    L_queue = L_base * rho / (1.0 - rho) + L_base * max(0.0, deficit_ratio)
+    L_queue = round(TTI * rho / (1.0 - rho), 3)
+    if deficit_ratio > 0.0:
+        L_queue = round(L_queue + TTI * max(0.0, deficit_ratio), 3)
 
-    total = round(L_base + L_signal + L_queue, 3)
-    return total, round(L_base, 3), round(L_signal, 3), round(L_queue, 3)
+    # ── ④ L_transport: 백홀 + 코어 네트워크 지연 (기술별 비무선 구간) ─────────
+    L_transport = round(p.get("backhaul_ms", 3.0) + p.get("core_ms", 2.0), 3)
+
+    total = round(L_base + L_transmission + L_queue + L_transport, 3)
+    return total, round(L_base, 3), round(L_transmission, 3), round(L_queue, 3)
 
 
 def _is_blocked_3d(
@@ -293,7 +392,7 @@ def analyze_candidates(
     rsu_global_radius = _RSU_COVERAGE_RADIUS_M.get(network_mode, 150.0)
     results = []
     for node in candidate_nodes:
-        is_rsu = str(node.get("type") or "").lower() in ("rsu", "rsu_node")
+        is_rsu = str(node.get("type") or "").lower() in ("rsu", "rsu_node", "roadside_unit")
         # 노드 자신의 coverage_radius_m을 우선 사용하고, 없으면 기술 모드별 전역값으로 폴백.
         # RSU는 150m, BS는 400~500m — 노드별 반경을 직접 쓰는 것이 더 정확하다.
         node_coverage_radius = float(node.get("coverage_radius_m") or (
@@ -316,14 +415,17 @@ def analyze_candidates(
 
         if is_rsu:
             # RSU — PC5 사이드링크. HARQ·큐잉 없음, 건물 차폐 영향 최소(도로 레벨 직접 통신).
-            # L_rsu는 거리 기반 단순 선형 모델(1~3ms), 컴포넌트 분해: base+signal+queue 대신
-            # total=L_rsu, l_base=1.0ms(PC5 access), l_signal=비례 패널티, l_queue=0으로 표현.
-            predicted_latency_ms = _L_rsu(obs.distance_m, node_coverage_radius)
+            # L_rsu: 거리 기반 선형 모델(1~3ms). PC5 브로드캐스트에도 RSU 처리+전달 지연
+            # (edge_latency_ms)은 존재하므로 합산한다.
+            # 출처: 3GPP TR 36.885 §A.1; ETSI TR 102 638 §4.3
+            l_air_ms = _L_rsu(obs.distance_m, node_coverage_radius)
             l_base_ms = 1.0
-            l_signal_ms = round(predicted_latency_ms - 1.0, 3)
+            l_signal_ms = round(l_air_ms - 1.0, 3)
             l_queue_ms = 0.0
         else:
-            # BS — 셀룰러 Uu 인터페이스.
+            # BS — 셀룰러 Uu 인터페이스: 공중 구간(스케줄링+전송+큐잉)만 계산.
+            # edge_latency_ms(백홀+5GC/EPC 처리)는 아래서 합산.
+            # 출처: 3GPP TS 38.211(TTI/MCS), 3GPP TR 38.901(경로손실 2-Slope), 3GPP TS 38.214
             n_vehicles = (
                 1
                 + int(node.get("n_background_vehicles", 0))
@@ -332,7 +434,7 @@ def analyze_candidates(
             )
             cap = float(node.get("capacity") or 100.0)
             deficit_ratio = float(node.get("deficit_rb", 0.0)) / max(cap, 1.0)
-            predicted_latency_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
+            l_air_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
                 distance_m=obs.distance_m,
                 A_seg_db=obs.estimated_penetration_loss_db,
                 n_vehicles=n_vehicles,
@@ -340,7 +442,11 @@ def analyze_candidates(
                 deficit_ratio=deficit_ratio,
             )
 
-        node_score = round(predicted_latency_ms + edge_latency * 0.5, 2)
+        # E2E 지연 = 공중 구간 + 백홀/코어/MEC 지연 (edge_latency_ms).
+        # 5G BS: 공중 2-4ms + 백홀+5GC 8-12ms → E2E 10-20ms (3GPP TR 38.913 §8.1.1)
+        # PC5 RSU: 공중 1-3ms + RSU 처리 ~1ms → E2E 2-4ms (ETSI GS MEC 003)
+        predicted_latency_ms = round(l_air_ms + edge_latency, 3)
+        node_score = round(predicted_latency_ms, 2)
 
         results.append({
             "node": node,

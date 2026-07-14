@@ -1154,6 +1154,303 @@ function SectionExplain({ bundle, simLogs, mode, simConfig }) {
   );
 }
 
+// ── Sheet Comparison Table ─────────────────────────────────────────────────
+
+function SectionSheetCompare() {
+  const [batches]     = useState(() => loadScenarioBatches());
+  const [selIdx, setSelIdx] = useState(0);
+
+  const sheetBatches = [...batches].reverse().filter(b => (b.label || '').startsWith('시뮬레이션 시트 비교'));
+
+  if (sheetBatches.length === 0) {
+    return (
+      <Card title="시트 알고리즘 비교" en="Sheet comparison" style={{ marginBottom: 16 }}>
+        <SectionEmpty msg="시뮬레이션 탭 → 전체 비교 실행을 눌러 시트별 알고리즘 결과를 비교하세요." />
+      </Card>
+    );
+  }
+
+  const cur        = sheetBatches[Math.min(selIdx, sheetBatches.length - 1)];
+  const doneRows   = (cur.results || []).filter(r => r.status === 'done');
+
+  // Build display rows
+  const rows = doneRows.map(r => {
+    const rc  = r.route_cost_result || {};
+    const prr = rc.prr_approx != null ? rc.prr_approx
+              : rc.coverage_risk != null ? +(1 - rc.coverage_risk).toFixed(4) : null;
+    // P99 from per_edge latency values
+    const lats = (rc.per_edge || []).map(e => e.latency_ms).filter(v => v != null).sort((a, b) => a - b);
+    const p99  = lats.length ? lats[Math.min(lats.length - 1, Math.ceil(0.99 * lats.length) - 1)] : null;
+    const algo = rc.routing_mode || r.simulation_summary?.selected_algorithm || null;
+    return {
+      label:           r.label || r.id,
+      algo:            algo,
+      avg_latency_ms:  rc.avg_latency_ms,
+      p99_latency_ms:  p99,
+      total_cost:      rc.total_cost,
+      handover_count:  rc.handover_count,
+      prr,
+    };
+  });
+
+  // Best per metric
+  const LB  = { avg_latency_ms: true, p99_latency_ms: true, total_cost: true, handover_count: true, prr: false };
+  const best = {};
+  Object.keys(LB).forEach(col => {
+    const vals = rows.map(r => r[col]).filter(v => v != null);
+    if (vals.length) best[col] = LB[col] ? Math.min(...vals) : Math.max(...vals);
+  });
+
+  // % improvement of each row over worst (lower-better cols) or best baseline
+  const worstLatency = rows.length ? Math.max(...rows.map(r => r.avg_latency_ms ?? 0)) : 0;
+
+  return (
+    <Card title="시트 알고리즘 비교" en="Sheet comparison"
+      right={<div className="row gap8">
+        <Chip tone="good" dot>공유 환경 동일</Chip>
+        <Chip>{doneRows.length}개 시트</Chip>
+      </div>}
+      style={{ marginBottom: 16 }}>
+
+      {/* batch selector */}
+      {sheetBatches.length > 1 && (
+        <div className="row gap6 wrap" style={{ marginBottom: 12 }}>
+          {sheetBatches.map((b, i) => (
+            <button key={b.batch_id} className={'btn sm' + (i === selIdx ? ' primary' : '')}
+              onClick={() => setSelIdx(i)}>
+              {new Date(b.ended_at || b.started_at).toLocaleTimeString()} 실행
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* shared env strip */}
+      <div style={{ padding: '6px 10px', background: 'var(--brand-tint)', border: '1px solid var(--brand-2)', borderRadius: 7, fontSize: 11, color: 'var(--ink-2)', marginBottom: 12, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+        <span style={{ fontWeight: 700, color: 'var(--brand-2)' }}>논문 통제 조건</span>
+        <span>📍 출발지 고정</span><span>🏁 도착지 고정</span><span>📡 BS·RSU 공유</span><span>🗺 구역 공유</span>
+        <span className="muted" style={{ fontSize: 10, marginLeft: 'auto' }}>시트마다 알고리즘 설정만 다름</span>
+      </div>
+
+      {/* comparison table */}
+      <div className="tbl-wrap">
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>시트</th>
+              <th>알고리즘</th>
+              <th className="r">지연 avg (ms)</th>
+              <th className="r">지연 P99 (ms)</th>
+              <th className="r">총 비용</th>
+              <th className="r">핸드오버</th>
+              <th className="r">PRR</th>
+              <th className="r">개선율†</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => {
+              const isBestLat  = row.avg_latency_ms != null && row.avg_latency_ms === best.avg_latency_ms;
+              const isBestCost = row.total_cost != null && row.total_cost === best.total_cost;
+              const isBestHO   = row.handover_count != null && row.handover_count === best.handover_count;
+              const isBestPrr  = row.prr != null && row.prr === best.prr;
+              const improvPct  = worstLatency > 0 && row.avg_latency_ms != null
+                ? (((worstLatency - row.avg_latency_ms) / worstLatency) * 100)
+                : null;
+              return (
+                <tr key={i}>
+                  <td style={{ fontWeight: 600 }}>{row.label}</td>
+                  <td><span className="mono" style={{ fontSize: 11 }}>{row.algo ? algoLabel(row.algo) : '—'}</span></td>
+                  <td className="r">
+                    <span className="num" style={{ color: isBestLat ? 'var(--good)' : 'inherit', fontWeight: isBestLat ? 700 : 400 }}>
+                      {fmt1(row.avg_latency_ms)}
+                    </span>
+                    {isBestLat && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}
+                  </td>
+                  <td className="r"><span className="num">{fmt1(row.p99_latency_ms)}</span></td>
+                  <td className="r">
+                    <span className="num" style={{ color: isBestCost ? 'var(--good)' : 'inherit', fontWeight: isBestCost ? 700 : 400 }}>
+                      {fmt2(row.total_cost)}
+                    </span>
+                    {isBestCost && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}
+                  </td>
+                  <td className="r">
+                    <span className="num" style={{ color: isBestHO ? 'var(--good)' : 'inherit', fontWeight: isBestHO ? 700 : 400 }}>
+                      {row.handover_count ?? '—'}
+                    </span>
+                  </td>
+                  <td className="r">
+                    <span className="num" style={{ color: isBestPrr ? 'var(--good)' : 'inherit', fontWeight: isBestPrr ? 700 : 400 }}>
+                      {row.prr != null ? row.prr.toFixed(3) : '—'}
+                    </span>
+                  </td>
+                  <td className="r">
+                    {improvPct != null
+                      ? <span style={{ fontWeight: 700, color: improvPct > 0 ? 'var(--good)' : improvPct < 0 ? 'var(--bad)' : 'var(--ink-3)' }}>
+                          {improvPct > 0 ? '−' : improvPct < 0 ? '+' : ''}{Math.abs(improvPct).toFixed(1)}%
+                        </span>
+                      : <span className="muted">—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="muted" style={{ fontSize: 10.5, marginTop: 6 }}>
+        † 개선율 = 시트 중 최고 지연(worst) 대비 감소 비율 · 녹색 = 해당 열 최선값
+      </div>
+    </Card>
+  );
+}
+
+
+// ── Channel & Fairness section ─────────────────────────────────────────────
+
+function SectionChannel({ bundle }) {
+  const rs = bundle?.run_summary;
+
+  if (!bundle?.available) {
+    return (
+      <Card title="채널·공정성" en="Channel & Fairness" style={{ marginBottom: 16 }}>
+        <SectionEmpty msg="시뮬레이션을 실행하면 채널·공정성 분석이 표시됩니다." />
+      </Card>
+    );
+  }
+
+  const cbr      = rs?.cbr_avg;
+  const pir      = rs?.pir_p99_ms;
+  const pirOk    = rs?.pir_compliant;
+  const hit      = rs?.hit_total_ms;
+  const hCount   = rs?.handover_count;
+  const jfi      = rs?.jain_fairness_index;
+  const urllc    = rs?.urllc_compliance_ratio;
+
+  const cbrTone  = cbr == null ? '' : cbr > 0.65 ? 'bad' : cbr > 0.45 ? 'warn' : 'good';
+  const cbrLabel = cbr == null ? '—' : cbr > 0.65 ? '혼잡' : cbr > 0.45 ? '주의' : '양호';
+  const jfiTone  = jfi == null ? '' : jfi >= 0.9 ? 'good' : jfi >= 0.7 ? 'warn' : 'bad';
+  const jfiLabel = jfi == null ? '—' : jfi >= 0.9 ? '공정' : jfi >= 0.7 ? '보통' : '불공정';
+
+  return (
+    <>
+      {/* ── CBR ── */}
+      <Card title="CBR — Channel Busy Ratio" en="채널 점유율"
+        right={cbr != null ? <Chip tone={cbrTone}>{cbrLabel} {cbr.toFixed(3)}</Chip> : null}
+        style={{ marginBottom: 16 }}>
+        <div className="row gap16" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }}>
+          <div style={{ flex: '1 1 160px' }}>
+            <div style={{ fontSize: 30, fontWeight: 700, color: `var(--${cbrTone || 'ink-2'})`, marginBottom: 4 }}>
+              {cbr != null ? cbr.toFixed(3) : '—'}
+            </div>
+            {cbr != null && (
+              <>
+                <div className="pbar" style={{ width: '100%', height: 8, marginBottom: 4 }}>
+                  <i style={{ width: `${Math.min(cbr * 100, 100)}%`, background: `var(--${cbrTone})` }} />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--ink-4)' }}>
+                  <span>0.0</span><span style={{ color: 'var(--warn)' }}>혼잡 0.65</span><span>1.0</span>
+                </div>
+              </>
+            )}
+          </div>
+          <div style={{ flex: '2 1 220px', fontSize: 11, lineHeight: 1.65, background: 'var(--surface-2)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}>
+            <div style={{ color: 'var(--brand-2)', marginBottom: 6, fontSize: 12.5 }}>
+              CBR = 1 − exp(−ρ · R<sub>tx</sub> · f<sub>CAM</sub> · T<sub>RRI</sub>)
+            </div>
+            <div className="muted">혼잡 임계값: 0.65 (ETSI TS 102 687 §5.2.2)</div>
+            <div className="muted">출처: Gonzalez-Martin et al., IEEE TVT 68(2), 2019 §IV.A †</div>
+            <div className="muted" style={{ marginTop: 4, fontSize: 10.5 }}>† 해석 모델 기반 — C-V2X Mode 4 SPS 가정, 10Hz CAM, 75MHz ITS 대역</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── PIR P99 ── */}
+      <Card title="PIR P99 — Packet Inter-Reception Time" en="패킷 재수신 간격"
+        right={pir != null ? <Chip tone={pirOk ? 'good' : 'bad'}>{pirOk ? '기준 충족' : '기준 초과'} {pir?.toFixed(1)} ms</Chip> : null}
+        style={{ marginBottom: 16 }}>
+        <div className="row gap16" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }}>
+          <div style={{ flex: '1 1 160px' }}>
+            <div style={{ fontSize: 30, fontWeight: 700, color: pir == null ? 'var(--ink-4)' : pirOk ? 'var(--good)' : 'var(--bad)', marginBottom: 4 }}>
+              {pir != null ? pir.toFixed(1) : '—'} <span style={{ fontSize: 14, fontWeight: 400 }}>ms</span>
+            </div>
+            {pir != null && (
+              <div style={{ padding: '5px 10px', borderRadius: 6, background: pirOk ? 'var(--good-tint)' : 'var(--bad-tint)', fontSize: 11, fontWeight: 600, color: pirOk ? 'var(--good)' : 'var(--bad)' }}>
+                {pirOk ? '✓ 100ms 이하 — 안전 메시지 서비스 적합' : '✗ 100ms 초과 — 안전 서비스 부적합'}
+              </div>
+            )}
+          </div>
+          <div style={{ flex: '2 1 220px', fontSize: 11, lineHeight: 1.65, background: 'var(--surface-2)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}>
+            <div style={{ color: 'var(--brand-2)', marginBottom: 6, fontSize: 12.5 }}>
+              PIR<sub>P99</sub> = T<sub>CAM</sub> / PRR<sub>edge</sub>
+            </div>
+            <div className="muted">기준: P99 ≤ 100 ms (3GPP TR 37.885 Table A.1)</div>
+            <div className="muted">T<sub>CAM</sub> = 100 ms (ETSI EN 302 637-2 §6.1.2.3)</div>
+            <div className="muted">출처: Eckermann et al., IEEE VTC Fall 2019 †</div>
+            <div className="muted" style={{ marginTop: 4, fontSize: 10.5 }}>† 기하분포 상한 — PRR 공간 일정 가정 단순화</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── HIT + URLLC ── */}
+      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        <Card title="HIT — Handover Interruption Time" en="핸드오버 중단 시간">
+          <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--warn)', marginBottom: 4 }}>
+            {hit != null ? hit.toFixed(0) : '—'} <span style={{ fontSize: 14, fontWeight: 400 }}>ms</span>
+          </div>
+          <div className="muted" style={{ fontSize: 11, lineHeight: 1.6 }}>
+            핸드오버 {hCount ?? 0}회 × 300 ms/회 (5G NR 실측 200–400 ms 중간값)<br />
+            HIT = Σ<sub>e</sub> t<sub>ho</sub>(e)·𝟙(HO)<br />
+            출처: IEEE doc 10320318, 2023 §III.B<br />
+            목표: &lt;50 ms (DAPS, 3GPP TS 38.300 §9.2.6)
+          </div>
+        </Card>
+        <Card title="URLLC 준수율" en="URLLC Compliance">
+          <div style={{ fontSize: 28, fontWeight: 700, color: urllc != null && urllc >= 0.9 ? 'var(--good)' : 'var(--warn)', marginBottom: 4 }}>
+            {urllc != null ? (urllc * 100).toFixed(1) : '—'}<span style={{ fontSize: 14, fontWeight: 400 }}>%</span>
+          </div>
+          <div className="muted" style={{ fontSize: 11, lineHeight: 1.6 }}>
+            P(L ≤ 10 ms) — 구간 중 지연 10ms 이하 비율<br />
+            기준: URLLC ≤ 10 ms (3GPP TS 22.261 §7.2)<br />
+            ※ 고신뢰 저지연 서비스 적합성 지표
+          </div>
+        </Card>
+      </div>
+
+      {/* ── Jain FI ── */}
+      {jfi != null && (() => {
+        return (
+          <Card title="Jain 공정성 지수" en="Jain's Fairness Index"
+            right={<Chip tone={jfiTone}>{jfiLabel} {jfi.toFixed(4)}</Chip>}
+            style={{ marginBottom: 16 }}>
+            <div className="row gap16" style={{ flexWrap: 'wrap', alignItems: 'flex-start' }}>
+              <div style={{ flex: '1 1 180px' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: `var(--${jfiTone || 'ink-2'})`, marginBottom: 4 }}>
+                  {jfi.toFixed(4)}
+                </div>
+                <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
+                  범위: [1/n, 1] — 1.0 = 완전 공정
+                </div>
+              </div>
+              <div style={{ flex: '2 1 220px', fontSize: 11, lineHeight: 1.6, background: 'var(--surface-2)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--border)' }}>
+                <div style={{ color: 'var(--brand-2)', marginBottom: 8, display: 'inline-flex', alignItems: 'center', flexWrap: 'wrap', gap: 2, fontSize: 13 }}>
+                  <i>J</i> =
+                  <MathFrac
+                    n={<>(Σ<sub><i>i</i></sub> <i>ρ</i><sub><i>i</i></sub>)<sup>2</sup></>}
+                    d={<><i>n</i> · Σ<sub><i>i</i></sub> <i>ρ</i><sub><i>i</i></sub><sup>2</sup></>}
+                  />
+                </div>
+                <div className="muted"><i>ρ</i><sub><i>i</i></sub> = BS <i>i</i> 부하율, <i>n</i> = BS 수</div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  출처: Jain, Chiu, Hawe, <i>DEC-TR-301</i>, 1984 §3.1
+                </div>
+              </div>
+            </div>
+          </Card>
+        );
+      })()}
+    </>
+  );
+}
+
+
 // ── Batch sub-section (used inside Compare) ────────────────────────────────
 
 function SectionBatch({ mode }) {
@@ -1615,12 +1912,27 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
         .catch(e => { setBundleLoading(false); setBundleError(e.message || '번들 불러오기 실패'); })
     );
   }
+
+  // 초기 로드
   useEffect(() => { fetchBundle(); }, []);
+
+  // 시뮬레이션 종료 시 자동 재조회 — 이전 번들 데이터를 계속 보여주는 문제 방지
+  const fetchBundleRef = useRef(null);
+  fetchBundleRef.current = fetchBundle;
+  const simWasRunningRef = useRef(false);
+  useEffect(() => {
+    if (simWasRunningRef.current && !sim.running && sim.elapsed > 0) {
+      // 시뮬레이션이 종료(도착 또는 정지)된 직후 번들 자동 새로고침
+      fetchBundleRef.current?.();
+    }
+    simWasRunningRef.current = sim.running;
+  }, [sim.running, sim.elapsed]);
 
   const TAB_OPTIONS = mode === 'pro'
     ? [
         { v: 'overview',  label: 'Overview'  },
         { v: 'compare',   label: 'Compare'   },
+        { v: 'channel',   label: '채널·공정성' },
         { v: 'explain',   label: 'Explain'   },
         { v: 'export',    label: 'Export'    },
         { v: 'metadata',  label: 'Metadata'  },
@@ -1668,9 +1980,14 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
 
       {(!bundleLoading || bundle) && subTab === 'compare' && mode === 'pro' && (
         <>
+          <SectionSheetCompare />
           <SectionCompare bundle={bundle} routeCoords={routeCoords} routeEdges={routeEdges} networkTelemetry={networkTelemetry} vehiclePos={vehiclePos} simHistory={simHistory} simConfig={simConfig} mode={mode} />
           <SectionBatch mode={mode} />
         </>
+      )}
+
+      {(!bundleLoading || bundle) && subTab === 'channel' && mode === 'pro' && (
+        <SectionChannel bundle={bundle} />
       )}
 
       {(!bundleLoading || bundle) && subTab === 'explain' && (

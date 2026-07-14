@@ -102,7 +102,7 @@ class NormScales:
     """
     distance_km: float = 1.0     # 1 km → 1.0
     time_min: float = 1.0        # 1 min → 1.0
-    latency_ms: float = 20.0     # 20 ms (hard-latency SLA) → 1.0
+    latency_ms: float = 50.0     # 50 ms → 1.0 (3GPP TR 37.885 협력 주행 실용 one-hop 목표, ETSI EN 302 637-2 CAM 예산 기준)
     loss_db: float = 30.0        # 30 dB (concrete-wall max) → 1.0
 
 

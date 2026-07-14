@@ -76,79 +76,112 @@ function scbSaveBatches(list) {
 }
 
 // 엑셀 시트탭 스트립 — 더블클릭으로 이름 수정, "+"로 새 시트, "전체 비교 실행"으로 일괄 평가.
-function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView }) {
+function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView, hasEnv }) {
   const [editingIdx, setEditingIdx] = useState(null);
   const [editValue, setEditValue] = useState('');
+
+  function sheetAlgoLabel(s) {
+    const algo = s.config?.selectedAlgorithms?.route || s.config?.selectedAlgorithms?.route_algorithm;
+    if (!algo) return null;
+    const SHORT = { dijkstra: 'Dijkstra', astar: 'A*', k_shortest_path: 'K-Path', network_aware_routing: 'Net-Aware', look_ahead_routing: 'Lookahead', rl_routing: 'RL' };
+    return SHORT[algo] ?? algo;
+  }
+
   return (
     <div style={{
-      flex: '0 0 auto', height: 44, background: 'var(--surface)', borderTop: '1px solid var(--border)',
-      display: 'flex', alignItems: 'center', padding: '0 8px', gap: 3, overflowX: 'auto',
+      flex: '0 0 auto', background: 'var(--surface)', borderTop: '1px solid var(--border)',
     }}>
-      {sheets.map((s, i) => (
-        <div
-          key={s.id}
-          onClick={() => editingIdx !== i && onSwitch(i)}
-          onDoubleClick={() => { setEditingIdx(i); setEditValue(s.name); }}
-          title="더블클릭으로 이름 수정"
-          style={{
-            display: 'flex', alignItems: 'center', gap: 6, padding: '0 10px', flex: '0 0 auto', height: 27,
-            borderRadius: 7, cursor: 'pointer', fontSize: 12, fontWeight: i === activeIdx ? 600 : 500,
-            background: i === activeIdx ? 'var(--brand-tint)' : 'transparent',
-            color: i === activeIdx ? 'var(--brand)' : 'var(--ink-3)',
-          }}
-        >
-          {editingIdx === i ? (
-            <input
-              autoFocus
-              value={editValue}
-              onChange={e => setEditValue(e.target.value)}
-              onBlur={() => { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }}
-              onKeyDown={e => {
-                if (e.key === 'Enter') { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }
-                if (e.key === 'Escape') setEditingIdx(null);
+      {/* 공유 환경 표시줄 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '3px 12px',
+        borderBottom: '1px solid var(--border)', fontSize: 10.5, color: 'var(--ink-4)',
+      }}>
+        <span style={{ color: hasEnv ? 'var(--good)' : 'var(--ink-4)' }}>🔒</span>
+        <span>공유 환경</span>
+        <span style={{ color: 'var(--border)' }}>|</span>
+        <span style={{ color: hasEnv ? 'var(--ink-2)' : 'var(--ink-4)' }}>
+          {hasEnv ? '구역 · 기지국 · RSU · 출발지 · 도착지 고정 — 알고리즘만 시트별 변경' : '구역·출발지·도착지를 설정하면 잠깁니다'}
+        </span>
+      </div>
+      {/* 시트 탭 스트립 */}
+      <div style={{ height: 40, display: 'flex', alignItems: 'center', padding: '0 8px', gap: 3, overflowX: 'auto' }}>
+        {sheets.map((s, i) => {
+          const algoLabel = sheetAlgoLabel(s);
+          return (
+            <div
+              key={s.id}
+              onClick={() => editingIdx !== i && onSwitch(i)}
+              onDoubleClick={() => { setEditingIdx(i); setEditValue(s.name); }}
+              title="더블클릭으로 이름 수정"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5, padding: '0 10px', flex: '0 0 auto', height: 27,
+                borderRadius: 7, cursor: 'pointer', fontSize: 12, fontWeight: i === activeIdx ? 600 : 500,
+                background: i === activeIdx ? 'var(--brand-tint)' : 'transparent',
+                color: i === activeIdx ? 'var(--brand)' : 'var(--ink-3)',
               }}
-              onClick={e => e.stopPropagation()}
-              style={{ fontSize: 12.5, padding: '2px 4px', width: 90, border: '1px solid var(--border)', borderRadius: 4 }}
-            />
-          ) : (
-            <span style={{ whiteSpace: 'nowrap' }}>{s.name}</span>
-          )}
-          {s.status === 'ran' && <span title="실행 완료" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--good)', flex: '0 0 auto' }} />}
-          {sheets.length > 1 && (
-            <button
-              onClick={e => { e.stopPropagation(); onRemove(i); }}
-              title="시트 삭제"
-              style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--ink-4)', fontSize: 11, padding: 0, lineHeight: 1 }}
-            >✕</button>
-          )}
-        </div>
-      ))}
-      <button onClick={onAdd} title="새 시트" style={{
-        display: 'grid', placeItems: 'center', width: 30, flex: '0 0 auto', border: 'none', background: 'none',
-        cursor: 'pointer', color: 'var(--ink-3)', fontSize: 16,
-      }}>+</button>
-      <div style={{ flex: 1 }} />
-      {batchError && <span style={{ alignSelf: 'center', fontSize: 11, color: 'var(--bad)', marginRight: 8, whiteSpace: 'nowrap' }}>{batchError}</span>}
-      <button
-        className="btn sm"
-        onClick={onToggleGrid}
-        style={{
-          alignSelf: 'center', margin: '0 4px', flex: '0 0 auto',
-          ...(gridView ? { background: 'var(--brand-2)', color: '#fff', borderColor: 'var(--brand-2)' } : {}),
-        }}
-        title={gridView ? '단일 뷰로 돌아가기' : '모든 시트를 그리드로 보기 (CCTV 뷰)'}
-      >
-        {gridView ? '↩ 단일 뷰' : '⊞ 그리드 뷰'}
-      </button>
-      <button
-        className="btn sm"
-        disabled={batchRunning || sheets.length < 2}
-        onClick={onRunBatch}
-        style={{ alignSelf: 'center', margin: '0 4px', flex: '0 0 auto' }}
-        title={sheets.length < 2 ? '비교하려면 시트가 2개 이상 필요합니다' : '모든 시트를 헤드리스로 일괄 평가해 분석보고서 탭에서 비교'}
-      >
-        {batchRunning ? <><Icon.reset size={12} className="spin" /> 비교 실행 중…</> : <><Icon.compare size={12} /> 전체 비교 실행 ({sheets.length})</>}
-      </button>
+            >
+              {editingIdx === i ? (
+                <input
+                  autoFocus
+                  value={editValue}
+                  onChange={e => setEditValue(e.target.value)}
+                  onBlur={() => { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') { onRename(i, editValue.trim() || s.name); setEditingIdx(null); }
+                    if (e.key === 'Escape') setEditingIdx(null);
+                  }}
+                  onClick={e => e.stopPropagation()}
+                  style={{ fontSize: 12.5, padding: '2px 4px', width: 90, border: '1px solid var(--border)', borderRadius: 4 }}
+                />
+              ) : (
+                <span style={{ whiteSpace: 'nowrap' }}>{s.name}</span>
+              )}
+              {algoLabel && (
+                <span style={{
+                  fontSize: 9.5, padding: '1px 5px', borderRadius: 4, whiteSpace: 'nowrap',
+                  background: i === activeIdx ? 'var(--brand-tint2)' : 'var(--surface-2)',
+                  color: i === activeIdx ? 'var(--brand-2)' : 'var(--ink-4)',
+                  fontWeight: 500,
+                }}>{algoLabel}</span>
+              )}
+              {s.status === 'ran' && <span title="실행 완료" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--good)', flex: '0 0 auto' }} />}
+              {sheets.length > 1 && (
+                <button
+                  onClick={e => { e.stopPropagation(); onRemove(i); }}
+                  title="시트 삭제"
+                  style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--ink-4)', fontSize: 11, padding: 0, lineHeight: 1 }}
+                >✕</button>
+              )}
+            </div>
+          );
+        })}
+        <button onClick={onAdd} title="새 시트 추가 (환경 유지)" style={{
+          display: 'grid', placeItems: 'center', width: 30, flex: '0 0 auto', border: 'none', background: 'none',
+          cursor: 'pointer', color: 'var(--ink-3)', fontSize: 16,
+        }}>+</button>
+        <div style={{ flex: 1 }} />
+        {batchError && <span style={{ alignSelf: 'center', fontSize: 11, color: 'var(--bad)', marginRight: 8, whiteSpace: 'nowrap' }}>{batchError}</span>}
+        <button
+          className="btn sm"
+          onClick={onToggleGrid}
+          style={{
+            alignSelf: 'center', margin: '0 4px', flex: '0 0 auto',
+            ...(gridView ? { background: 'var(--brand-2)', color: '#fff', borderColor: 'var(--brand-2)' } : {}),
+          }}
+          title={gridView ? '단일 뷰로 돌아가기' : '모든 시트를 그리드로 보기 (CCTV 뷰)'}
+        >
+          {gridView ? '↩ 단일 뷰' : '⊞ 그리드 뷰'}
+        </button>
+        <button
+          className="btn sm"
+          disabled={batchRunning || sheets.length < 2 || !hasEnv}
+          onClick={onRunBatch}
+          style={{ alignSelf: 'center', margin: '0 4px', flex: '0 0 auto' }}
+          title={!hasEnv ? '출발지·도착지를 먼저 설정하세요' : sheets.length < 2 ? '비교하려면 시트가 2개 이상 필요합니다' : '같은 환경에서 모든 시트를 일괄 평가해 분석보고서 탭에서 비교'}
+        >
+          {batchRunning ? <><Icon.reset size={12} className="spin" /> 비교 실행 중…</> : <><Icon.compare size={12} /> 전체 비교 실행 ({sheets.length})</>}
+        </button>
+      </div>
     </div>
   );
 }
@@ -605,7 +638,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const buildingsSigRef = useRef(null); // 직전에 그린 차폐 건물 집합의 서명 — 안 바뀌었으면 폴리곤 다시 안 그림
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
-  const MAX_SETUP_AREA_KM2 = 25;
+
+  // 로컬 PBF 가용 여부 + 면적 상한 (서버에서 받아옴)
+  const [networkInfo, setNetworkInfo] = useState({ local_pbf_available: false, max_area_km2: 25 });
+  const MAX_SETUP_AREA_KM2 = networkInfo.max_area_km2;
 
   const [mode,       setMode]       = useState(null);
   const [area,       setArea]       = useState(null);
@@ -614,6 +650,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [dest,       setDest]       = useState(null);
   const [destDone,   setDestDone]   = useState(false);
   const [osmStage,   setOsmStage]   = useState(0); // 0 idle · 1 download · 2 convert · 3 ready
+  const [osmSource,  setOsmSource]  = useState(null); // 'local_pbf' | 'overpass' — API 응답에서 설정
   const [osmError,   setOsmError]   = useState(null);
   const [osmWarning, setOsmWarning] = useState(null);
   const [showLayers, setShowLayers] = useState({ vehicles: true, routes: true, stations: true });
@@ -638,6 +675,19 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }, [simConfig?.policy_options?.traffic_time_period]);
   const [openPanel, setOpenPanel] = useState('control'); // null · 'control' · 'scenario' — 우측 FAB로 띄우는 플로팅 패널, 처음 열 때는 컨트롤 패널이 기본으로 열려있음
 
+  // ── 행정구역 선택 (전국 OSM PBF 기반) ──────────────────────────
+  const [areaMode, setAreaMode] = useState('bbox'); // 'bbox' | 'region'
+  const [regionDbAvailable, setRegionDbAvailable] = useState(false);
+  const [sidoList, setSidoList] = useState([]);
+  const [sigunguList, setSigunguList] = useState([]);
+  const [dongList, setDongList] = useState([]);
+  const [selSido, setSelSido] = useState(null);
+  const [selSigungu, setSelSigungu] = useState(null);
+  const [selDong, setSelDong] = useState(null);
+  const [regionLoading, setRegionLoading] = useState(false);
+  const [regionError, setRegionError] = useState(null);
+  const [selectedRegion, setSelectedRegion] = useState(null); // 최종 선택된 region 객체
+
   // ── 시뮬레이션 시트 (Phase 5) ──────────────────────────────────
   // sheets/activeSheetIdx는 App(app.jsx)으로 끌어올려져 props로 내려온다 — 대시보드 탭도
   // "지금 실행 중인 시트가 뭔지" 같은 출처를 봐야 시트별로 분리해서 보여줄 수 있기 때문.
@@ -659,9 +709,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
   function loadSheetConfig(sheet) {
     const c = sheet.config || {};
-    setOrigin(c.origin || null); setOriginDone(!!c.origin);
-    setDest(c.dest || null); setDestDone(!!c.dest);
-    setVehicleCount(c.vehicleCount ?? 1);
+    // 구역·출발지·도착지·차량 수는 모든 시트 공유 — 시트 전환 시 복원하지 않음.
+    // 알고리즘 설정과 결과만 시트별로 로드한다.
     setSelectedAlgorithms(c.selectedAlgorithms || DEFAULT_ALGORITHM_SELECTION);
     setNetworkGen(c.networkGen || '5g');
     if (c.simConfig) setSimConfig(c.simConfig);
@@ -688,37 +737,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }
 
   async function addSheet() {
-    // 새 시트 = 완전히 새로운 시뮬레이션. 이전엔 현재 설정을 복제만 해서 지도/출발지·도착지가
-    // 그대로 남아있어 "바뀐 게 없어 보인다"는 문제가 있었다 — origin/dest/결과를 비워서
-    // 사용자가 새로 출발지·도착지를 찍게 한다.
+    // 새 시트 = 같은 환경(구역·기지국·RSU·출발지·도착지)에서 알고리즘/설정만 바꿔 비교.
+    // 구역·기지국·출발지·도착지는 모든 시트에서 공유하므로 초기화하지 않는다.
+    // 이전 시트의 실행 결과(경로·차량·로그)만 지우고 알고리즘 선택을 기본값으로 되돌린다.
     //
-    // 구역(area)도 비운다 — 시트끼리 같은 구역/지도를 그대로 이어받으면 "시트가 분리가
-    // 안 되고 하나의 지도에서 시뮬레이션되는 것처럼" 보인다는 피드백이 있었다. 새 시트는
-    // "지도에서 구역 그리기"부터 다시 시작해야 한다.
-    //
-    // 주의1: /api/simulation/reset은 호출하지 않는다 — 그 엔드포인트는 reset_simulation_state()를
-    // 통해 network_ready/mock_graph/current_bbox까지 전부 지워버리지만, 이미 area를 null로
-    // 비웠으므로 의미가 없다. 어차피 사용자가 새 구역을 그리면 /api/setup-network가 백엔드의
-    // current_bbox/mock_graph를 통째로 덮어써서 이전 시트의 네트워크를 자연스럽게 대체한다.
-    //
-    // 주의2: 이전 시트가 아직 실행 중이면 반드시 /api/simulation/stop으로 멈춰야 한다. 안 그러면
-    // 백그라운드 스레드가 계속 vehiclePos를 웹소켓으로 밀어넣어 방금 비운 상태를 되돌리고,
-    // 나중에 도착하면 그 시점에 활성화된(새로 만든) 시트로 잘못 캡처된다 — 실행도 안 한 새
-    // 시트에 초록 점이 찍히는 버그의 원인이었다.
+    // 주의: 이전 시트가 아직 실행 중이면 /api/simulation/stop으로 멈춘다. 안 그러면
+    // 웹소켓 위치 업데이트가 새로 만든 시트로 잘못 캡처된다.
     if (sim.running) { try { await fetch(`${api}/api/simulation/stop`, { method: 'POST' }); } catch (_) {} }
 
-    const blankConfig = { origin: null, dest: null, vehicleCount: 1, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig };
+    // 새 시트 config: 공유 환경(origin/dest/vehicleCount)은 현재 전역값으로 초기화,
+    // 알고리즘은 기본값으로 리셋 — mini map 표시 및 배치 실행에 origin/dest 참조 가능하도록 저장.
+    const blankConfig = { origin, dest, vehicleCount, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig };
     const newSheet = { id: `sheet-${Date.now()}`, name: `Sheet ${sheets.length + 1}`, config: blankConfig, result: null, status: 'draft' };
     const next = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s).concat(newSheet);
     setSheets(next); saveSimSheets(next);
     setActiveSheetIdx(next.length - 1);
 
-    setMode(null);
-    setArea(null);
-    setOsmStage(0); setOsmError(null); setOsmWarning(null);
-    setOrigin(null); setOriginDone(false);
-    setDest(null); setDestDone(false);
-    setVehicleCount(1);
+    // 알고리즘 선택만 초기화 (구역·기지국·출발지·도착지·OSM 네트워크는 그대로 유지)
     setSelectedAlgorithms(DEFAULT_ALGORITHM_SELECTION);
     setNetworkTelemetry(null);
     setRouteCoords([]); setVehiclePos(null);
@@ -726,17 +761,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSimError(null); setSimNotice(null);
     prevArrived.current = false;
     dispatch({ type: 'reset' });
-    if (groups.current.areaRect) { groups.current.areaRect.remove(); groups.current.areaRect = null; }
-    if (groups.current.veh)     { groups.current.veh.remove(); groups.current.veh = null; }
-    if (groups.current.route)   groups.current.route.clearLayers();
-    if (groups.current.wp)      groups.current.wp.clearLayers();
-    if (groups.current.network)   groups.current.network.clearLayers();
-    if (groups.current.connLines) groups.current.connLines.clearLayers();
-    if (groups.current.blocks)    groups.current.blocks.clearLayers();
-    if (groups.current.bgVeh)     groups.current.bgVeh.clearLayers();
+    // 경로·차량·배경차량 레이어만 초기화 (구역·네트워크·BS·출발지·도착지 마커는 유지)
+    if (groups.current.veh)    { groups.current.veh.remove(); groups.current.veh = null; }
+    if (groups.current.route)  groups.current.route.clearLayers();
+    if (groups.current.bgVeh)  groups.current.bgVeh.clearLayers();
     bgVehMarkers.current = {};
-    candidateMarkers.current = {};
-    buildingsSigRef.current = null;
   }
 
   function renameSheet(idx, name) {
@@ -789,25 +818,27 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }, [vehiclePos?.arrived]);
 
   async function runAllSheetsAsBatch() {
+    // 공유 환경(origin/dest/vehicleCount)이 설정된 경우에만 배치 실행 가능
+    if (!origin || !dest) { setBatchError('출발지·도착지를 먼저 설정하세요.'); return; }
+
     const allSheets = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
     setSheets(allSheets); saveSimSheets(allSheets);
 
-    const specs = allSheets
-      .filter(s => s.config?.origin && s.config?.dest)
-      .map(s => ({
+    // 모든 시트에 공유 출발지·도착지·차량 수 적용 — 알고리즘만 시트별로 달라짐
+    const specs = allSheets.map(s => ({
         id: s.id,
         label: s.name,
         mode: 'route_metrics',
-        origin: s.config.origin,
-        dest: s.config.dest,
-        vehicle_count: s.config.vehicleCount || 1,
+        origin: origin,
+        dest: dest,
+        vehicle_count: vehicleCount,
         algorithm_config: s.config.selectedAlgorithms || {},
         simulation_config: {
           ...(s.config.simConfig || {}),
           policy_options: { ...(s.config.simConfig?.policy_options || {}), network_mode: (s.config.networkGen || '5g').toUpperCase() },
         },
       }));
-    if (specs.length === 0) { setBatchError('출발지/도착지가 설정된 시트가 없습니다.'); return; }
+    if (specs.length === 0) { setBatchError('시트가 없습니다.'); return; }
 
     setBatchRunning(true); setBatchError(null);
     try {
@@ -1015,6 +1046,82 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }
   useEffect(() => { loadStations(); }, []);
+
+  /* ── 네트워크 소스 정보 (로컬 PBF 여부 + 면적 상한) ─────────── */
+  useEffect(() => {
+    fetch(`${api}/api/setup-network/info`)
+      .then(r => r.json())
+      .then(d => setNetworkInfo(d))
+      .catch(() => {});
+  }, []);
+
+  /* ── 행정구역 DB 상태 확인 ───────────────────────────────────── */
+  useEffect(() => {
+    fetch(`${api}/api/regions/status`)
+      .then(r => r.json())
+      .then(d => {
+        setRegionDbAvailable(d.available);
+        if (d.available) {
+          fetch(`${api}/api/regions/sido`)
+            .then(r => r.json())
+            .then(d => setSidoList(d.regions || []));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!selSido) { setSigunguList([]); setSelSigungu(null); setDongList([]); setSelDong(null); return; }
+    fetch(`${api}/api/regions/sigungu?parent_osm_id=${selSido.osm_id}`)
+      .then(r => r.json())
+      .then(d => { setSigunguList(d.regions || []); setSelSigungu(null); setDongList([]); setSelDong(null); });
+  }, [selSido]);
+
+  useEffect(() => {
+    if (!selSigungu) { setDongList([]); setSelDong(null); return; }
+    fetch(`${api}/api/regions/dong?parent_osm_id=${selSigungu.osm_id}`)
+      .then(r => r.json())
+      .then(d => { setDongList(d.regions || []); setSelDong(null); });
+  }, [selSigungu]);
+
+  /* ── 행정구역으로 구역 확정 ──────────────────────────────────── */
+  async function finalizeAreaFromRegion() {
+    const region = selDong || selSigungu || selSido;
+    if (!region) return;
+    setSelectedRegion(region);
+    setOsmError(null);
+    setOsmWarning(null);
+    setSimNotice(null);
+    setOsmSource('local_pbf'); // 행정구역 모드는 항상 로컬 PBF
+    setOsmStage(1);
+    setRegionError(null);
+
+    try {
+      const res = await fetch(`${api}/api/setup-network-region`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ osm_id: region.osm_id }),
+      });
+      setOsmStage(2);
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || 'Network setup failed');
+
+      setArea({ s: region.min_lat, w: region.min_lon, n: region.max_lat, e: region.max_lon });
+      setOsmStage(3);
+      if (mapObj.current) {
+        mapObj.current.fitBounds([[region.min_lat, region.min_lon], [region.max_lat, region.max_lon]], { padding: [50, 50] });
+        if (groups.current.areaRect) groups.current.areaRect.remove();
+        groups.current.areaRect = L.rectangle(
+          [[region.min_lat, region.min_lon], [region.max_lat, region.max_lon]],
+          { color: '#1F9D57', weight: 2, fillOpacity: 0.04 }
+        ).addTo(mapObj.current);
+      }
+      setTimeout(() => setOsmStage(0), 1200);
+    } catch (e) {
+      setRegionError(e.message);
+      setOsmStage(0);
+    }
+  }
 
   /* ── draw origin/dest markers ───────────────────────────────── */
   useEffect(() => {
@@ -1387,6 +1494,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setOsmError(null);
     setOsmWarning(null);
     setSimNotice(null);
+    setOsmSource(null);
     setOsmStage(1); // downloading
 
     try {
@@ -1398,13 +1506,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         }),
       });
 
-      setOsmStage(2); // converting (response received means OSM done, converting is fast)
+      setOsmStage(2); // converting
 
       const body = await res.json();
       if (!res.ok) {
         throw new Error(body.detail || 'Network setup failed');
       }
 
+      setOsmSource(body.source || 'overpass'); // 'local_pbf' or 'overpass' — from backend
       if (body.warning) setOsmWarning(body.warning);
       setOsmStage(3); // ready
       if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
@@ -1486,8 +1595,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSimError(null);
     setSimNotice(null);
 
-    // 일시정지 상태이면 재개 (vehiclePos/routeCoords 유지)
-    if (!sim.running && sim.elapsed > 0) {
+    // 일시정지 상태이면 재개 (vehiclePos/routeCoords 유지 — 도착 완료 후 재시작은 제외)
+    if (!sim.running && sim.elapsed > 0 && !vehiclePos?.arrived) {
       try {
         const res = await fetch(`${api}/api/simulation/resume`, { method: 'POST' });
         const body = await res.json().catch(() => ({}));
@@ -1499,9 +1608,13 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       return;
     }
 
-    // 새 시뮬레이션 시작
+    // 새 시뮬레이션 시작 (최초 시작 또는 완료 후 재시작)
+    // 이전 런의 로그·히스토리·경로 엣지를 초기화해 결과 중복 방지
     setRouteCoords([]);
     setVehiclePos(null);
+    if (setSimLogs) setSimLogs([]);
+    if (setSimHistory) setSimHistory([]);
+    if (setRouteEdges) setRouteEdges(null);
 
     try {
       const res = await fetch(`${api}/api/simulation/start`, {
@@ -1776,11 +1889,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   : <div style={{ width: 22, height: 22, borderRadius: '50%', background: 'var(--good)', display: 'grid', placeItems: 'center', color: '#fff' }}><Icon.check size={14} /></div>}
                 <b style={{ fontSize: 14 }}>{osmStage < 3 ? '구역 데이터 준비 중…' : '시뮬레이션 준비 완료'}</b>
               </div>
-              {[
-                ['OSM 데이터 다운로드 (Overpass API)', 'Downloading OSM'],
-                ['SUMO 네트워크 변환 (netconvert)',     'Converting network'],
-                ['시뮬레이션 준비 완료',                'Ready'],
-              ].map((s, i) => {
+              {(() => {
+                const isLocal = osmSource === 'local_pbf' || (osmSource === null && (areaMode === 'region' || networkInfo.local_pbf_available));
+                return [
+                  [isLocal ? 'OSM 추출 (로컬 PBF)' : 'OSM 다운로드 (Overpass API)', 'Downloading OSM'],
+                  ['SUMO 네트워크 변환 (netconvert)', 'Converting network'],
+                  ['시뮬레이션 준비 완료', 'Ready'],
+                ];
+              })().map((s, i) => {
                 const st = osmStage > i + 1 ? 'done' : osmStage === i + 1 ? 'active' : 'idle';
                 return (
                   <div key={i} className="row gap12" style={{ padding: '8px 0', opacity: st === 'idle' ? 0.4 : 1 }}>
@@ -1867,17 +1983,40 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
           {/* area */}
           <div className="col gap8">
-            <div className="field"><label>구역 선택 <span className="en">AREA / BBOX</span></label></div>
-            {area ? (
+            <div className="field">
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                구역 선택 <span className="en">AREA</span>
+                <span style={{ fontSize: 9.5, padding: '1px 6px', borderRadius: 4, background: 'var(--brand-tint)', color: 'var(--brand-2)', fontWeight: 500, marginLeft: 2 }}>모든 시트 공유</span>
+              </label>
+            </div>
+
+            {/* 구역 선택 모드 토글 */}
+            <Seg value={areaMode} onChange={v => { setAreaMode(v); setOsmError(null); setRegionError(null); }}
+              options={[
+                { v: 'bbox', label: '지도에서 그리기' },
+                { v: 'region', label: '행정구역 선택', disabled: !regionDbAvailable },
+              ]}
+            />
+            {!regionDbAvailable && (
+              <div className="muted" style={{ fontSize: 10, marginTop: -4 }}>행정구역 DB 미설치 (build_region_index.py 실행 필요)</div>
+            )}
+
+            {/* 지도 그리기 모드 */}
+            {areaMode === 'bbox' && (area ? (
               <>
                 <div className="row between" style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
                   <div className="mono" style={{ fontSize: 11, color: 'var(--ink-2)' }}>{areaKm2(area).toFixed(2)} km²</div>
                   <Chip tone="good" dot>선택됨</Chip>
                 </div>
-                {areaKm2(area) > 5 && (
+                {areaKm2(area) > MAX_SETUP_AREA_KM2 ? (
+                  <div className="row gap8" style={{ padding: '8px 11px', background: 'var(--bad-tint)', borderRadius: 8, fontSize: 10.5, color: 'var(--bad)' }}>
+                    <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
+                    {`구역이 너무 큽니다 (${areaKm2(area).toFixed(0)}km²). ${MAX_SETUP_AREA_KM2}km² 이하로 줄여주세요.`}
+                  </div>
+                ) : areaKm2(area) > 50 && (
                   <div className="row gap8" style={{ padding: '8px 11px', background: 'var(--warn-tint)', borderRadius: 8, fontSize: 10.5, color: 'var(--warn)' }}>
                     <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
-                    {areaKm2(area) > MAX_SETUP_AREA_KM2 ? `선택 구역이 너무 큽니다. ${MAX_SETUP_AREA_KM2}km² 이하로 줄여주세요` : '동 단위 이하로 선택을 권장합니다'}
+                    구/시 단위 — netconvert 변환에 시간이 걸릴 수 있습니다
                   </div>
                 )}
                 <button className="btn sm" onClick={() => setMode('area')}><Icon.layers size={13} /> 구역 다시 그리기</button>
@@ -1892,6 +2031,110 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   <Icon.pin size={13} /> {mode === 'area' ? '드래그하여 선택…' : '지도에서 구역 그리기'}
                 </button>
               </>
+            ))}
+
+            {/* 행정구역 선택 모드 */}
+            {areaMode === 'region' && regionDbAvailable && (
+              <div className="col gap8">
+                {/* 도/광역시 선택 */}
+                <div className="col gap4">
+                  <div style={{ fontSize: 10.5, color: 'var(--ink-3)', fontWeight: 600 }}>도 / 광역시</div>
+                  <select
+                    style={{ width: '100%', padding: '7px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--ink)', fontSize: 12 }}
+                    value={selSido?.osm_id || ''}
+                    onChange={e => {
+                      const r = sidoList.find(x => x.osm_id === Number(e.target.value));
+                      setSelSido(r || null);
+                    }}
+                  >
+                    <option value="">— 선택 —</option>
+                    {sidoList.map(r => <option key={r.osm_id} value={r.osm_id}>{r.name_ko}</option>)}
+                  </select>
+                </div>
+
+                {/* 시/군/구 선택 */}
+                {selSido && (
+                  <div className="col gap4">
+                    <div style={{ fontSize: 10.5, color: 'var(--ink-3)', fontWeight: 600 }}>시 / 군 / 구</div>
+                    <select
+                      style={{ width: '100%', padding: '7px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--ink)', fontSize: 12 }}
+                      value={selSigungu?.osm_id || ''}
+                      onChange={e => {
+                        const r = sigunguList.find(x => x.osm_id === Number(e.target.value));
+                        setSelSigungu(r || null);
+                      }}
+                    >
+                      <option value="">— 선택 (선택 시 해당 시/군/구 전체) —</option>
+                      {sigunguList.map(r => <option key={r.osm_id} value={r.osm_id}>{r.name_ko}</option>)}
+                    </select>
+                  </div>
+                )}
+
+                {/* 읍/면/동 선택 */}
+                {selSigungu && dongList.length > 0 && (
+                  <div className="col gap4">
+                    <div style={{ fontSize: 10.5, color: 'var(--ink-3)', fontWeight: 600 }}>읍 / 면 / 동</div>
+                    <select
+                      style={{ width: '100%', padding: '7px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--surface-2)', color: 'var(--ink)', fontSize: 12 }}
+                      value={selDong?.osm_id || ''}
+                      onChange={e => {
+                        const r = dongList.find(x => x.osm_id === Number(e.target.value));
+                        setSelDong(r || null);
+                      }}
+                    >
+                      <option value="">— 선택 (선택 시 해당 동 전체) —</option>
+                      {dongList.map(r => <option key={r.osm_id} value={r.osm_id}>{r.name_ko}</option>)}
+                    </select>
+                  </div>
+                )}
+
+                {/* 선택된 구역 미리보기 + 확정 버튼 */}
+                {(selDong || selSigungu || selSido) && (() => {
+                  const reg = selDong || selSigungu || selSido;
+                  const areaSqKm = ((reg.max_lat - reg.min_lat) * 111) * ((reg.max_lon - reg.min_lon) * 111 * Math.cos(((reg.min_lat + reg.max_lat) / 2) * Math.PI / 180));
+                  const tooLarge = areaSqKm > MAX_SETUP_AREA_KM2;
+                  return (
+                    <div className="col gap8">
+                      <div className="row between" style={{ padding: '9px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
+                        <span style={{ fontSize: 12, fontWeight: 600 }}>{reg.name_ko}</span>
+                        <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>{areaSqKm.toFixed(1)} km²</span>
+                      </div>
+                      {tooLarge && (
+                        <div className="row gap8" style={{ padding: '7px 10px', background: 'var(--bad-tint)', borderRadius: 8, fontSize: 10.5, color: 'var(--bad)' }}>
+                          <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
+                          {`구역이 너무 큽니다 (${areaSqKm.toFixed(0)}km²). 시/군/구 이하 단위를 선택해주세요 (상한 ${MAX_SETUP_AREA_KM2}km²).`}
+                        </div>
+                      )}
+                      {!tooLarge && areaSqKm > 100 && (
+                        <div className="row gap8" style={{ padding: '7px 10px', background: 'var(--warn-tint)', borderRadius: 8, fontSize: 10.5, color: 'var(--warn)' }}>
+                          <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
+                          {`넓은 구역 (${areaSqKm.toFixed(0)}km²) — netconvert 변환에 1분 이상 소요될 수 있습니다.`}
+                        </div>
+                      )}
+                      {regionError && (
+                        <div style={{ fontSize: 10.5, padding: '7px 10px', background: 'var(--bad-tint)', borderRadius: 8, color: 'var(--bad)' }}>
+                          {regionError}
+                        </div>
+                      )}
+                      <button
+                        className="btn sm primary"
+                        disabled={tooLarge || regionLoading || osmStage > 0}
+                        onClick={finalizeAreaFromRegion}
+                      >
+                        <Icon.layers size={13} />
+                        {osmStage > 0 ? '네트워크 준비 중…' : `"${reg.name_ko}" 구역으로 시뮬레이션 준비`}
+                      </button>
+                      {area && selectedRegion?.osm_id === reg.osm_id && (
+                        <Chip tone="good" dot>준비 완료</Chip>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {!selSido && (
+                  <div className="muted" style={{ fontSize: 10.5 }}>도/광역시를 먼저 선택하세요</div>
+                )}
+              </div>
             )}
           </div>
 
@@ -1918,7 +2161,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
           {/* waypoints */}
           <div className="field">
-            <label>경로 지점 <span className="en">WAYPOINTS</span></label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              경로 지점 <span className="en">WAYPOINTS</span>
+              <span style={{ fontSize: 9.5, padding: '1px 6px', borderRadius: 4, background: 'var(--brand-tint)', color: 'var(--brand-2)', fontWeight: 500, marginLeft: 2 }}>모든 시트 공유</span>
+            </label>
             <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
               <WayRow color="var(--m-origin)" label="출발지" val={origin ? coordStr(origin) : '미지정'} done={originDone} set={tryOrigin} />
               <WayRow color="var(--m-dest)"   label="도착지" val={dest   ? coordStr(dest)   : '미지정'} done={destDone}   set={tryDest} />
@@ -1990,7 +2236,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           {/* base stations + RSU — Pro 전용 (Lite는 자동 배치된 기지국을 그대로 사용) */}
           {appMode === 'pro' && (
           <div className="field">
-            <label>기지국 / RSU <span className="en">BS &amp; RSU</span></label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              기지국 / RSU <span className="en">BS &amp; RSU</span>
+              <span style={{ fontSize: 9.5, padding: '1px 6px', borderRadius: 4, background: 'var(--brand-tint)', color: 'var(--brand-2)', fontWeight: 500, marginLeft: 2 }}>모든 시트 공유</span>
+            </label>
             <div className="col gap8" style={{ opacity: area ? 1 : 0.5 }}>
               <div className="row between" style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
                 <span className="row gap8" style={{ minWidth: 0 }}>
@@ -2350,6 +2599,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       batchError={batchError}
       onToggleGrid={() => setGridView(v => !v)}
       gridView={gridView}
+      hasEnv={!!(originDone && destDone)}
     />
     </div>
   );
