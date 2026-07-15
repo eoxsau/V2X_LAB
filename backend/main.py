@@ -280,8 +280,13 @@ def _load_road_name_cache() -> None:
 def _save_road_name_cache() -> None:
     try:
         _ROAD_NAME_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # sort_keys + trailing newline: new entries land next to their key neighbours
+        # instead of all appending to the last line, so concurrent additions from
+        # different runs merge cleanly instead of always conflicting.
         _ROAD_NAME_CACHE_FILE.write_text(
-            json.dumps(_road_name_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_road_name_cache, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
         )
     except Exception as exc:
         print(f"[VWORLD] Cache save failed: {exc}", flush=True)
