@@ -98,7 +98,9 @@ function App() {
 
     async function bootReset() {
       try {
-        await fetch(`${API}/api/simulation/reset`, { method: 'POST' });
+        // scope=runtime: 차량/경로 찌꺼기만 정리 — 구역(bbox)·도로망은 유지해서
+        // 새로고침 후에도 설정해둔 구역이 (기지국처럼) 그대로 남는다.
+        await fetch(`${API}/api/simulation/reset?scope=runtime`, { method: 'POST' });
       } catch (_) {}
       if (!closed) {
         setVehiclePos(null);
@@ -120,7 +122,7 @@ function App() {
 
     const resetOnUnload = () => {
       try {
-        navigator.sendBeacon(`${API}/api/simulation/reset`);
+        navigator.sendBeacon(`${API}/api/simulation/reset?scope=runtime`);
       } catch (_) {}
     };
     window.addEventListener('beforeunload', resetOnUnload);

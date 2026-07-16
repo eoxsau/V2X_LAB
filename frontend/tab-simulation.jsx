@@ -16,6 +16,7 @@ const ROUTE_ALGORITHMS = [
   'rl_routing',
 ];
 const LATENCY_ALGORITHMS = [
+  'tech_latency_v31',        // 설계문서 v3.1 통합 모델 (기본값)
   'distance_based_latency',
   'load_aware_latency',
   'blockage_aware_latency',
@@ -23,6 +24,7 @@ const LATENCY_ALGORITHMS = [
   'full_composite_latency',
 ];
 const BS_SELECTION_ALGORITHMS = [
+  'rsrp_max',                // RSRP(수신세기) 최대 연결 (v3.1 §9, 기본값)
   'nearest_bs',
   'lowest_latency_bs',
   'strongest_signal_bs',
@@ -41,8 +43,8 @@ const RESOURCE_ALLOCATION_ALGORITHMS = [
 ];
 const DEFAULT_ALGORITHM_SELECTION = {
   route: 'dijkstra',
-  latency: 'full_composite_latency',
-  base_station_selection: 'lowest_latency_bs',
+  latency: 'tech_latency_v31',          // v3.1 통합 모델 (백엔드 기본값과 일치)
+  base_station_selection: 'rsrp_max',   // RSRP 최대 연결 (v3.1 §9)
   resource_allocation: 'equal_allocation',
 };
 // rl_routing은 아직 학습된 RL 에이전트가 없어 미구현 — 선택해도 baseline Dijkstra로
@@ -1024,6 +1026,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     groups.current.bgVeh = L.layerGroup().addTo(map);
     groups.current.bgVehRenderer = L.canvas({ padding: 0.5 });
     mapObj.current = map;
+
+    // 새로고침 복원: 기지국은 DB에서 다시 불러오지만 구역(bbox)은 백엔드 메모리에만
+    // 있어 사각형이 사라졌었다 — 백엔드가 network_ready면 구역을 다시 그린다.
+    fetch(`${api}/api/setup-network/status`)
+      .then(r => r.json())
+      .then(d => {
+        if (!d?.network_ready || !d.bbox || !mapObj.current) return;
+        if (groups.current.areaRect) return; // 이미 그려져 있으면(드래그 등) 건드리지 않음
+        const b = [[d.bbox.s, d.bbox.w], [d.bbox.n, d.bbox.e]];
+        groups.current.areaRect = L.rectangle(b, {
+          color: '#1E3A5F', weight: 1.6, dashArray: '6 4',
+          fillColor: '#2E75B6', fillOpacity: 0.10,
+        }).addTo(mapObj.current);
+        mapObj.current.fitBounds(b, { padding: [50, 50] });
+        setArea({ s: d.bbox.s, w: d.bbox.w, n: d.bbox.n, e: d.bbox.e });
+      })
+      .catch(() => {}); // 구버전 백엔드(엔드포인트 없음)면 조용히 무시
+
     return () => {
       map.remove(); mapObj.current = null; groups.current = {};
       stationMarkers.current = {}; candidateMarkers.current = {}; buildingsSigRef.current = null;

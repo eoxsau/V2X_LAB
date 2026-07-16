@@ -1,6 +1,8 @@
 /* ============================================================ Dashboard tab */
 
 const ALGO_LABELS = {
+  tech_latency_v31:          '기술모델 v3.1',
+  rsrp_max:                  'RSRP 최대',
   dijkstra:                  'Dijkstra',
   astar:                     'A*',
   baseline_dijkstra:         '기본 Dijkstra',

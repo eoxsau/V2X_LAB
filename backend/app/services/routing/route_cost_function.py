@@ -48,6 +48,14 @@ try:
 except ImportError:
     _LATENCY_REGISTRY_AVAILABLE = False
 
+try:
+    # v3.1 통합 모델 — rsrp_max BS 선택(경로손실 기반)에 사용. 활성 기술 모드는
+    # main이 policy_options 적용 시 formula_v31.set_active_mode()로 주입한다.
+    from app.services.latency import formula_v31 as _f31
+    _F31_AVAILABLE = True
+except ImportError:
+    _F31_AVAILABLE = False
+
 
 def _build_latency_input(
     mid_lat: float,
@@ -134,7 +142,9 @@ DEFAULT_WEIGHTS = CostWeights()
 
 
 # ── BS Selection algorithm ─────────────────────────────────────────────────────
-_active_bs_selection: str = "lowest_latency_bs"
+# 기본값 rsrp_max: 수신세기(RSRP) 최대 기지국 연결 (설계문서 v3.1 §9 — 부하 기반 금지).
+# 기존 알고리즘들은 실험용 선택지로 그대로 유지된다.
+_active_bs_selection: str = "rsrp_max"
 
 def set_bs_selection_algorithm(algo: str) -> None:
     global _active_bs_selection
@@ -149,10 +159,13 @@ def _bs_score(
     load: float,
     capacity: float,
     algo: str,
+    loss_db: float = 0.0,
 ) -> float:
     """
     Per-algorithm BS scoring — lower score = better BS candidate.
 
+    rsrp_max:            PL(d) + A_seg 최소화 ≡ RSRP 최대 (P_tx·α는 전 기지국 동일해
+                         순위에 영향 없음 — v3.1 §9). loss_db 미지 시 거리 단조.
     nearest_bs:          raw Haversine distance
     lowest_latency_bs:   propagation penalty + congestion + edge latency (legacy)
     strongest_signal_bs: quadratic distance loss proxy (free-space path loss ∝ d²)
@@ -161,6 +174,10 @@ def _bs_score(
     rl_based_bs:         falls back to lowest_latency_bs (RL agent not yet trained)
     """
     dist_pen = dist_m / max(cov_r, 1.0) * 15.0
+    if algo == "rsrp_max":
+        if _F31_AVAILABLE:
+            return _f31.path_loss(_f31.get_active_mode(), dist_m) + loss_db
+        return dist_m + loss_db  # 폴백: PL은 거리 단조 — 순위 보존
     if algo == "nearest_bs":
         return dist_m
     if algo == "load_balanced_bs":
@@ -334,9 +351,17 @@ def _find_best_bs_full(
         load = float(node.get("load") or 0.0)
         cap = float(node.get("capacity") or 100.0)
         algo = bs_selection_algo or _active_bs_selection
-        # For blockage-aware algorithms, add penetration loss to the score
-        base_score = _bs_score(obs.distance_m, cov_r, cong, edge_lat, load, cap, algo)
-        score = base_score + obs.estimated_penetration_loss_db * 0.8
+        if algo == "rsrp_max":
+            # RSRP-max는 PL(d)+A_seg가 스코어 그 자체 — 아래 0.8배 손실 가산을 또
+            # 더하면 이중계산이므로 분기한다.
+            score = _bs_score(
+                obs.distance_m, cov_r, cong, edge_lat, load, cap, algo,
+                loss_db=obs.estimated_penetration_loss_db,
+            )
+        else:
+            # For blockage-aware algorithms, add penetration loss to the score
+            base_score = _bs_score(obs.distance_m, cov_r, cong, edge_lat, load, cap, algo)
+            score = base_score + obs.estimated_penetration_loss_db * 0.8
         if score < best_score:
             best_score = score
             best_node = node

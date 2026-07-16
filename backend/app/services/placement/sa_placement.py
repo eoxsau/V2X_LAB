@@ -18,17 +18,21 @@ import random as _rng_module
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ── 기술 파라미터 (building_obstruction_analyzer._TECH_PARAMS 와 동기화) ─────────
+# ── 기술 파라미터 — SA 최적화 전용 근사 모델의 사본 ────────────────────────────
+# 주의: L_base/P_tx/alpha/beta 등은 formula_v31(설계문서 v3.1)과 다른 구식 근사식
+# (_L_total_sa)의 파라미터다 — SA 반복 성능을 위해 유지. 단 coverage_radius_m은
+# 런타임 규칙(formula_v31.resolve_coverage_radius: BS=d_edge)과 반드시 일치시킨다.
+# 여기가 어긋나면 배치 최적화가 실제 시뮬레이션과 다른 커버리지로 계산된다.
 _TECH_PARAMS: dict[str, dict] = {
     "4G": dict(L_base=25.0, P_tx=43.0, alpha=45.0, beta=3.5,
                RSRP_thresh=-85.0, RSRP_range=25.0, N_max=6, T_retx=8.0,
-               C_tech=100, coverage_radius_m=400.0),
+               C_tech=100, coverage_radius_m=2000.0),
     "5G": dict(L_base=15.0, P_tx=46.0, alpha=55.0, beta=3.0,
                RSRP_thresh=-90.0, RSRP_range=25.0, N_max=4, T_retx=1.0,
-               C_tech=500, coverage_radius_m=450.0),
+               C_tech=500, coverage_radius_m=1000.0),
     "6G": dict(L_base= 1.0, P_tx=48.0, alpha=68.0, beta=2.5,
                RSRP_thresh=-95.0, RSRP_range=25.0, N_max=3, T_retx=0.1,
-               C_tech=2000, coverage_radius_m=1000.0),
+               C_tech=2000, coverage_radius_m=500.0),
 }
 _RSU_COVERAGE_RADIUS_M = {"4G": 100.0, "5G": 150.0, "6G": 250.0}
 

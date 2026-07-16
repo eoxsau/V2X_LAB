@@ -47,6 +47,11 @@ class BaseStation:
     mec_processing_ms: float = 2.0      # MEC server processing time
     queue_length: float = 0.0           # current items in service queue (λ)
     queue_service_rate: float = 100.0   # items/s  (μ for M/M/1)
+    # v3.1 통합 모델의 M/M/1 큐 입력 — 셀 용량을 공유하는 활성 연결 전체
+    n_background_vehicles: int = 0
+    n_other_devices: int = 0
+    n_its_load: int = 0
+    deficit_rb: float = 0.0             # RB 할당 부족분 (자원할당 시스템이 채움)
 
     @staticmethod
     def from_dict(d: dict) -> "BaseStation":
@@ -63,6 +68,10 @@ class BaseStation:
             mec_processing_ms=float(d.get("mec_processing_ms", 2.0)),
             queue_length=float(d.get("queue_length", 0.0)),
             queue_service_rate=float(d.get("queue_service_rate", 100.0)),
+            n_background_vehicles=int(d.get("n_background_vehicles", 0) or 0),
+            n_other_devices=int(d.get("n_other_devices", 0) or 0),
+            n_its_load=int(d.get("n_its_load", 0) or 0),
+            deficit_rb=float(d.get("deficit_rb", 0.0) or 0.0),
         )
 
 
@@ -152,7 +161,10 @@ class LatencyOutput:
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
-_DEFAULT_ALGORITHM = "full_composite_latency"
+# 기본값: 설계문서 v3.1 통합 모델 (formula_v31.py가 등록). 기존 5종은 롤백/비교용으로
+# 레지스트리에 그대로 남아 있으며, 이 한 줄을 "full_composite_latency"로 되돌리면
+# 이전 동작으로 복귀한다.
+_DEFAULT_ALGORITHM = "tech_latency_v31"
 
 
 class LatencyAlgorithmRegistry:

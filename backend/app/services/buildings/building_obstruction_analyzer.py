@@ -37,95 +37,26 @@ _WALL_SPACING_BY_USE: dict[str, float] = {
     "unknown":          8.0,
 }
 
-# ── Technology parameters — latency model v3.1 ────────────────────────────────
-# L_total = L_base + L_transmission + L_queue
-#   L_base         = TTI × 0.5            (scheduling wait, uniform dist mean)
-#   L_transmission = packet_bits / (SE × BW)  (MCS → throughput → time)
-#   L_queue        = TTI × ρ/(1−ρ)        (M/M/1, service time = 1 TTI slot)
-#
-# Path loss: 2-Slope model (3GPP TR 38.901 UMa LOS, Table 7.4.1-1)
-#   d ≤ d_BP : PL(d) = 10 × 2.2 × log10(d)
-#   d > d_BP : PL(d) = 10 × 2.2 × log10(d_BP) + 10 × 4.0 × log10(d/d_BP)
-#   d_BP = 4 × h_BS × h_UT × f_c / c   (c = 3×10⁸ m/s)
-#
-# SINR via α back-calculation — P_tx and noise_floor cancel (sec. 5 of doc):
-#   SINR(d) = SINR_min + PL(d_edge) − PL(d) − A_seg
-#
-# 출처: 설계 문서 v3.1 (Autonomous V2X AI Routing Lab)
-#   TTI/numerology: 3GPP TS 38.211; MCS SE: 3GPP TS 38.214 Table 5.1.3.1-1
-#   2-Slope β: 3GPP TR 38.901 UMa LOS Table 7.4.1-1
-#   BW 근거: 4G [TS 36.101 단일반송파 최대], 5G [국내 3사 3.5GHz 100MHz 실배치]
-_TECH_PARAMS: dict[str, dict] = {
-    "4G": dict(
-        TTI=1.0,              # ms; numerology 0, SCS 15 kHz (3GPP TS 38.211)
-        f_c=2.0e9,            # Hz; LTE 2.0 GHz 대표 반송파
-        h_BS=24.0,            # m;  UMa 기지국 높이
-        h_UT=0.5,             # m;  차량 UE 안테나 높이
-        BW=20e6,              # Hz; LTE 단일반송파 최대 (3GPP TS 36.101)
-        d_edge=2000.0,        # m;  설계 앵커 — 도심 매크로 LTE 커버리지 반경
-        C_tech=100,           # vehicles; M/M/1 수용량 [설계 파라미터]
-        coverage_radius_m=400.0,
-        # ── 비무선 구간 지연 (3GPP TR 36.912, Aijaz et al. IEEE Commun. Surv. 2015) ──
-        backhaul_ms=8.0,      # S1-U 인터페이스(eNB→SGW): 광섬유 도심 편도 평균
-        core_ms=5.0,          # EPC 처리(SGW+PGW+MME): 각 노드 1-2ms × 복수 홉
-    ),
-    "5G": dict(
-        TTI=0.5,              # ms; numerology 1, SCS 30 kHz (국내 3.5GHz 실배치)
-        f_c=3.5e9,            # Hz; 5G NR 3.5 GHz
-        h_BS=24.0,
-        h_UT=0.5,
-        BW=100e6,             # Hz; 국내 3사 3.5GHz 각 100MHz 실배치 근거
-        d_edge=1000.0,        # m;  설계 앵커
-        C_tech=500,
-        coverage_radius_m=450.0,
-        # ── 비무선 구간 지연 (3GPP TR 38.913 §8.1.1, Patel et al. IEEE Access 2022) ──
-        backhaul_ms=3.0,      # NG3 인터페이스(gNB→UPF): CU/DU 분리 포함 편도
-        core_ms=2.0,          # 5GC 처리(UPF+SMF+AMF): MEC 배치 기준
-    ),
-    "6G": dict(
-        TTI=0.125,            # ms; [설계 가정] numerology 3, SCS 120 kHz 플레이스홀더
-        f_c=7.0e9,            # Hz; [설계 가정] upper mid-band 연구 주파수
-        h_BS=24.0,
-        h_UT=0.5,
-        BW=400e6,             # Hz; NR FR2 반송파 최대 (TS 38.101-2) 차용
-        d_edge=500.0,         # m;  설계 앵커
-        C_tech=2000,
-        coverage_radius_m=1000.0,
-        # ── 비무선 구간 지연 (IMT-2030 요구사항 기반 설계 가정) ──
-        backhaul_ms=0.5,      # 분산 RAN + 초저지연 광섬유 인터페이스
-        core_ms=0.5,          # 완전 분산 코어(제로트러스트 UPF 로컬 배치)
-    ),
-}
+# ── Latency model — formula_v31로 전면 이관 (설계문서 latency_formula_v3_1.md) ──
+# 기술별 파라미터·MCS 테이블·PL/SINR/α는 이제 app.services.latency.formula_v31이
+# 단일 출처다. 이 파일의 _L_total은 하위 호환 래퍼로만 남는다.
+from app.services.latency import formula_v31
 
-# ── MCS lookup table (3GPP TS 38.214 Table 5.1.3.1-1) ─────────────────────────
-# (최소 SINR dB [AWGN BLER 10% 근사], 스펙트럼 효율 bit/s/Hz)
-# SINR 문턱은 근사값 — 표준값은 스펙트럼 효율만; 출처: Sadhana 48:77 AWGN LUT
-_MCS_TABLE: list[tuple[float, float]] = [
-    (-6.0, 0.2344),   # MCS  0, QPSK
-    (-2.0, 0.6016),   # MCS  4, QPSK
-    ( 3.0, 1.3262),   # MCS  9, QPSK
-    ( 6.0, 1.6953),   # MCS 12, 16QAM
-    ( 9.0, 2.5703),   # MCS 16, 16QAM
-    (13.0, 3.3223),   # MCS 20, 64QAM
-    (17.0, 4.5234),   # MCS 24, 64QAM
-    (21.0, 5.9004),   # MCS 28, 64QAM
-]
-_SINR_MIN_DB: float = -6.0    # MCS 0 문턱 — 이하면 outage
-_L_OUTAGE_MS: float = 1000.0  # outage 유한 페널티 [설계 가정: 최적화 수렴 유지]
-# CAM 메시지 크기: ETSI EN 302 637-2 V1.4.1 §B.2 (일반 CAM 페이로드 300-800 바이트,
-# 대표값 800 바이트 = 6400 bits 사용)
-_PACKET_BITS: int   = 6_400
+# main.py 등 기존 임포트 호환용 별칭
+_RSU_COVERAGE_RADIUS_M = formula_v31.RSU_COVERAGE_RADIUS_M
+
+# A_seg = 3D LOS를 가로막는 건물 수 × 12 dB (명세 §7, 선형 누적·상한 없음)
+_A_SEG_PER_BUILDING_DB = 12.0
+
+# ── A_seg 사전계산 캐시 (명세 §7 — 매 스텝 재계산 방지) ─────────────────────────
+# 키: (차량 위치 1e-5도≈1m 격자, 노드 id/위치/안테나, 밀도 페널티, 건물셋 버전).
+# 경로 엣지 중점처럼 같은 지점을 반복 평가하는 호출(K-path 2초 주기 재점수)에 적중.
+_OBSTRUCTION_CACHE: dict[tuple, "BuildingObstructionResult"] = {}
+_OBSTRUCTION_CACHE_MAX = 20_000
 
 
-# ── RSU (Road Side Unit) coverage radii by network mode ───────────────────────
-# RSU는 교차로 폴에 4~8m 높이로 설치되는 PC5/사이드링크 전용 노드. 셀룰러 Uu 기지국보다
-# 커버리지 반경이 훨씬 작지만 도로 레벨 직접 통신이라 지연이 극히 낮다.
-# 출처: ETSI EN 302 663(ITS-G5), 3GPP TR 36.885(LTE-V2X), Rel-16 NR-V2X PC5 링크 예산
-_RSU_COVERAGE_RADIUS_M: dict[str, float] = {
-    "4G": 100.0,   # DSRC/LTE-V2X Mode 4 urban RSU, 실측 범위 50-150m
-    "5G": 150.0,   # NR-V2X PC5 urban RSU, 3GPP Rel-16 링크 예산 기준 ~150m
-    "6G": 250.0,   # IMT-2030 ultra-reliable V2X 확장 커버리지 목표
-}
+def reset_obstruction_cache() -> None:
+    _OBSTRUCTION_CACHE.clear()
 
 
 def _L_rsu(distance_m: float, coverage_radius_m: float) -> float:
@@ -153,6 +84,10 @@ def _material_a_seg_db(
     line_3857: LineString,
 ) -> tuple[float, str, float]:
     """Compute A_seg (total building penetration loss dB) from material + geometry.
+
+    [미사용 — 롤백 보존] v3.1 명세(§7)가 A_seg를 '차단 건물 수 × 12 dB'로 단순화하면서
+    analyze_vehicle_to_node에서 더 이상 호출하지 않는다. 재질 기반 모델로 되돌리려면
+    analyze_vehicle_to_node의 A_seg 계산부에서 이 함수를 다시 호출하면 된다.
 
     Returns (A_seg_db, confidence, total_crossed_length_m).
     """
@@ -189,84 +124,16 @@ def _L_total(
     network_mode: str,
     deficit_ratio: float = 0.0,
 ) -> tuple[float, float, float, float]:
-    """Compute L_total = L_base + L_transmission + L_queue (ms).  [설계 문서 v3.1]
+    """v3.1 통합 모델(formula_v31.compute_latency) 위임 래퍼 — 하위 호환용.
 
-    ① L_base = TTI × 0.5
-       패킷이 다음 슬롯 경계까지 기다리는 평균 시간 (균등분포 평균).
-       출처: Coll-Perales et al., IEEE TVT 2023; 3GPP TS 38.211 (TTI/numerology)
-
-    ② L_transmission = _PACKET_BITS / (SE × BW)
-       SINR → MCS → 스펙트럼 효율 → 처리량 → 전송 시간.
-       • 2-Slope 경로손실 (3GPP TR 38.901 UMa LOS Table 7.4.1-1):
-           d ≤ d_BP : PL = 10·2.2·log10(d)
-           d > d_BP : PL = 10·2.2·log10(d_BP) + 10·4.0·log10(d/d_BP)
-           d_BP = 4·h_BS·h_UT·f_c / c
-       • SINR α-역산 소거 (설계 문서 §5):
-           SINR(d) = SINR_min + PL(d_edge) − PL(d) − A_seg_db
-           (P_tx = 46 dBm, noise_floor = −95 dBm이 완전 소거됨)
-       • SINR < −6 dB → outage → L_OUTAGE = 1000 ms 반환
-       • MCS 표: 3GPP TS 38.214 Table 5.1.3.1-1 (SE); SINR 문턱은 AWGN 근사
-
-    ③ L_queue = TTI × ρ / (1 − ρ)
-       M/M/1 대기행렬, 서비스 시간 = 1 TTI 슬롯 [설계 가정].
-       ρ = n_vehicles / C_tech (최대 0.99 클램프).
-       deficit_ratio > 0이면 RB 할당 부족 선형 페널티 TTI × deficit_ratio 추가.
-       출처: Coll-Perales et al., IEEE TVT 2023
-
-    ④ L_transport = backhaul_ms + core_ms  (기술별 비무선 구간)
-       4G: backhaul 8ms(S1-U) + core 5ms(SGW+PGW+MME) = 13ms
-           출처: Aijaz et al., IEEE Commun. Surv. Tutorials 2015; 3GPP TR 36.912
-       5G: backhaul 3ms(NG3) + core 2ms(UPF+SMF) = 5ms
-           출처: 3GPP TR 38.913 §8.1.1; Patel et al., IEEE Access 2022
-       6G: backhaul 0.5ms + core 0.5ms = 1ms  [IMT-2030 목표 기반 설계 가정]
-
-    Returns (L_total, L_base, L_transmission, L_queue).
-    L_total은 L_transport를 포함한 셀룰러 Uu 구간 전체 지연.
+    반환 (L_total, L_base, L_transmission, L_queue). L_total은 RAN 구간만이며
+    구모델과 달리 백홀+코어(L_transport)를 포함하지 않는다 (명세 §1: RAN only).
     호출부는 l_signal_ms 변수명으로 L_transmission을 받아 저장함 (API 필드명 유지).
     """
-    p = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])
-    C_LIGHT = 3e8  # m/s
-
-    # ── ① L_base: 스케줄링 대기 ─────────────────────────────────────────────
-    TTI = p["TTI"]
-    L_base = TTI * 0.5
-
-    # ── ② 2-Slope 경로손실 ──────────────────────────────────────────────────
-    d = max(distance_m, 1.0)
-    d_BP = 4.0 * p["h_BS"] * p["h_UT"] * p["f_c"] / C_LIGHT
-
-    def _pl(dist: float) -> float:
-        if dist <= d_BP:
-            return 10.0 * 2.2 * log10(max(dist, 1.0))
-        return 10.0 * 2.2 * log10(d_BP) + 10.0 * 4.0 * log10(dist / d_BP)
-
-    # SINR — α·P_tx·noise_floor 소거 후 단순화 (설계 문서 §5)
-    SINR = _SINR_MIN_DB + _pl(p["d_edge"]) - _pl(d) - A_seg_db
-
-    # Outage: MCS 0 문턱 미만
-    if SINR < _SINR_MIN_DB:
-        return _L_OUTAGE_MS, 0.0, _L_OUTAGE_MS, 0.0
-
-    # MCS 선택: SINR을 만족하는 최고 MCS 스펙트럼 효율
-    se = _MCS_TABLE[0][1]
-    for sinr_thr, se_val in _MCS_TABLE:
-        if SINR >= sinr_thr:
-            se = se_val
-
-    throughput_bps = se * p["BW"]
-    L_transmission = round((_PACKET_BITS / throughput_bps) * 1000.0, 3)  # → ms
-
-    # ── ③ L_queue: M/M/1 (서비스 시간 = TTI) ───────────────────────────────
-    rho = min(n_vehicles / p["C_tech"], 0.99)
-    L_queue = round(TTI * rho / (1.0 - rho), 3)
-    if deficit_ratio > 0.0:
-        L_queue = round(L_queue + TTI * max(0.0, deficit_ratio), 3)
-
-    # ── ④ L_transport: 백홀 + 코어 네트워크 지연 (기술별 비무선 구간) ─────────
-    L_transport = round(p.get("backhaul_ms", 3.0) + p.get("core_ms", 2.0), 3)
-
-    total = round(L_base + L_transmission + L_queue + L_transport, 3)
-    return total, round(L_base, 3), round(L_transmission, 3), round(L_queue, 3)
+    r = formula_v31.compute_latency(
+        network_mode, distance_m, n_vehicles, A_seg_db, deficit_ratio,
+    )
+    return r["l_total_ms"], r["l_base_ms"], r["l_transmission_ms"], r["l_queue_ms"]
 
 
 def _is_blocked_3d(
@@ -293,13 +160,28 @@ def analyze_vehicle_to_node(
     buildings_gdf: gpd.GeoDataFrame,
     vehicle_density_penalty: float = 0.0,
 ) -> BuildingObstructionResult:
+    # ── §7 사전계산 캐시 — 같은 (지점, 노드) 쌍 반복 평가를 테이블 조회로 대체 ──
+    h_antenna = float(network_node.get("antenna_height_m") or _DEFAULT_ANTENNA_HEIGHT_M)
+    cache_key = (
+        round(vehicle_lat, 5), round(vehicle_lng, 5),          # ~1m 격자
+        str(network_node.get("id")),
+        round(float(network_node.get("lat") or 0.0), 5),
+        round(float(network_node.get("lng") or 0.0), 5),
+        round(h_antenna, 1),
+        round(vehicle_density_penalty, 2),
+        len(buildings_gdf),                                     # 건물셋 버전 근사
+    )
+    cached = _OBSTRUCTION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     line = LineString([(vehicle_lng, vehicle_lat), (network_node["lng"], network_node["lat"])])
     line_gdf = gpd.GeoDataFrame({"geometry": [line]}, crs="EPSG:4326").to_crs(3857)
     line_3857 = line_gdf.geometry.iloc[0]
     distance_m = float(line_gdf.length.iloc[0])
 
     if buildings_gdf.empty:
-        return BuildingObstructionResult(
+        result = BuildingObstructionResult(
             vehicle_id=vehicle_id,
             network_node_id=network_node["id"],
             distance_m=distance_m,
@@ -311,19 +193,22 @@ def analyze_vehicle_to_node(
             confidence="high",
             highlighted_buildings=[],
         )
+        _cache_obstruction(cache_key, result)
+        return result
 
     # 2D 경로와 교차하는 건물 후보
     search = buildings_gdf[buildings_gdf.geometry.intersects(line)].copy().reset_index(drop=True)
     search_3857 = search.to_crs(3857).copy().reset_index(drop=True) if not search.empty else search
 
-    h_antenna = float(network_node.get("antenna_height_m") or _DEFAULT_ANTENNA_HEIGHT_M)
-
-    # ── 3D LOS 필터 ────────────────────────────────────────────────────────────
+    # ── 3D LOS 필터 (명세 §7 — 2D 판정 금지) ──────────────────────────────────
     is_blocking: list[bool] = []
+    unknown_height_blockers = 0
     for i in range(len(search_3857)):
         bldg_h = float(search["height_m"].iloc[i] or 0.0) if "height_m" in search.columns else 0.0
         if bldg_h <= 0:
+            # 높이 미상 — 보수적으로 차단 처리하되 신뢰도를 낮춘다
             is_blocking.append(True)
+            unknown_height_blockers += 1
         else:
             blocked = _is_blocked_3d(
                 line_3857, search_3857.geometry.iloc[i], bldg_h,
@@ -333,13 +218,13 @@ def analyze_vehicle_to_node(
 
     mask = [bool(v) for v in is_blocking]
     search_bl = search[mask].copy()
-    search_bl_3857 = search_3857[mask].copy()
 
     count = int(len(search_bl))
     max_height = float(search_bl["height_m"].fillna(0).max()) if count and "height_m" in search_bl.columns else 0.0
 
-    # ── Material-based wall penetration loss ──────────────────────────────────
-    A_seg_db, confidence, crossed_length_m = _material_a_seg_db(search_bl, search_bl_3857, line_3857)
+    # ── A_seg = 차단 건물 수 × 12 dB (명세 §7 — 재질 기반 모델 대체, 상한 없음) ──
+    A_seg_db = round(count * _A_SEG_PER_BUILDING_DB, 2)
+    confidence = "high" if unknown_height_blockers == 0 else "medium"
 
     # latency_penalty_ms: building-only contribution shown on dashboard (ms)
     latency_penalty_ms = round(A_seg_db * 0.45, 2)
@@ -364,7 +249,7 @@ def analyze_vehicle_to_node(
             "geometry": coords,
         })
 
-    return BuildingObstructionResult(
+    result = BuildingObstructionResult(
         vehicle_id=vehicle_id,
         network_node_id=network_node["id"],
         distance_m=round(distance_m, 2),
@@ -376,6 +261,14 @@ def analyze_vehicle_to_node(
         confidence=confidence,
         highlighted_buildings=highlighted_buildings,
     )
+    _cache_obstruction(cache_key, result)
+    return result
+
+
+def _cache_obstruction(key: tuple, result: BuildingObstructionResult) -> None:
+    if len(_OBSTRUCTION_CACHE) >= _OBSTRUCTION_CACHE_MAX:
+        _OBSTRUCTION_CACHE.clear()
+    _OBSTRUCTION_CACHE[key] = result
 
 
 def analyze_candidates(
@@ -388,16 +281,14 @@ def analyze_candidates(
     vehicle_density_penalty: float = 0.0,
     network_mode: str = "5G",
 ) -> list[dict]:
-    bs_global_radius = _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])["coverage_radius_m"]
-    rsu_global_radius = _RSU_COVERAGE_RADIUS_M.get(network_mode, 150.0)
     results = []
     for node in candidate_nodes:
-        is_rsu = str(node.get("type") or "").lower() in ("rsu", "rsu_node", "roadside_unit")
-        # 노드 자신의 coverage_radius_m을 우선 사용하고, 없으면 기술 모드별 전역값으로 폴백.
-        # RSU는 150m, BS는 400~500m — 노드별 반경을 직접 쓰는 것이 더 정확하다.
-        node_coverage_radius = float(node.get("coverage_radius_m") or (
-            rsu_global_radius if is_rsu else bs_global_radius
-        ))
+        node_type = node.get("type") or node.get("node_type")
+        is_rsu = str(node_type or "").lower() in ("rsu", "rsu_node", "roadside_unit")
+        # 커버리지 반경은 노드 저장값이 아니라 평가 시점의 기술 모드로 실시간 결정
+        # (2026-07-16 결정) — 4G/5G/6G 전환이 기존 노드에도 즉시 반영된다.
+        # BS = d_edge(α 앵커, 셀 안에서는 무차폐 시 SINR ≥ SINR_MIN 보장), RSU = PC5 반경.
+        node_coverage_radius = formula_v31.resolve_coverage_radius(network_mode, node_type)
 
         obs = analyze_vehicle_to_node(
             vehicle_id=vehicle_id,
@@ -413,19 +304,26 @@ def analyze_candidates(
 
         edge_latency = float(node.get("edge_latency_ms", 5.0))
 
+        # RSRP — 연결 규칙(명세 §9)의 기준값. RSU는 명세 밖이지만 동일 수식으로
+        # 근사해 하나의 순위 축을 유지한다 (P_tx·α 동일 전제, 도로 레벨이라 A_seg 작음).
+        rsrp_dbm = round(formula_v31.compute_rsrp_dbm(
+            network_mode, obs.distance_m, obs.estimated_penetration_loss_db,
+        ), 2)
+        sinr_db = round(rsrp_dbm - formula_v31.NOISE_FLOOR_DBM, 2)
+        outage = False
+
         if is_rsu:
             # RSU — PC5 사이드링크. HARQ·큐잉 없음, 건물 차폐 영향 최소(도로 레벨 직접 통신).
-            # L_rsu: 거리 기반 선형 모델(1~3ms). PC5 브로드캐스트에도 RSU 처리+전달 지연
-            # (edge_latency_ms)은 존재하므로 합산한다.
-            # 출처: 3GPP TR 36.885 §A.1; ETSI TR 102 638 §4.3
+            # 명세 범위 밖이라 기존 선형 모델(1~3ms) 유지. RSU 처리+전달 지연
+            # (edge_latency_ms)은 합산한다. 출처: 3GPP TR 36.885 §A.1; ETSI TR 102 638 §4.3
             l_air_ms = _L_rsu(obs.distance_m, node_coverage_radius)
             l_base_ms = 1.0
             l_signal_ms = round(l_air_ms - 1.0, 3)
             l_queue_ms = 0.0
+            predicted_latency_ms = round(l_air_ms + edge_latency, 3)
         else:
-            # BS — 셀룰러 Uu 인터페이스: 공중 구간(스케줄링+전송+큐잉)만 계산.
-            # edge_latency_ms(백홀+5GC/EPC 처리)는 아래서 합산.
-            # 출처: 3GPP TS 38.211(TTI/MCS), 3GPP TR 38.901(경로손실 2-Slope), 3GPP TS 38.214
+            # BS — 셀룰러 Uu: v3.1 통합 모델(RAN only — 백홀/코어 없음).
+            # n_vehicles: ego + 배경 차량 + 차량 외 기기 + ITS 환산 부하 (유지 결정)
             n_vehicles = (
                 1
                 + int(node.get("n_background_vehicles", 0))
@@ -434,18 +332,20 @@ def analyze_candidates(
             )
             cap = float(node.get("capacity") or 100.0)
             deficit_ratio = float(node.get("deficit_rb", 0.0)) / max(cap, 1.0)
-            l_air_ms, l_base_ms, l_signal_ms, l_queue_ms = _L_total(
-                distance_m=obs.distance_m,
-                A_seg_db=obs.estimated_penetration_loss_db,
-                n_vehicles=n_vehicles,
-                network_mode=network_mode,
-                deficit_ratio=deficit_ratio,
+            r = formula_v31.compute_latency(
+                network_mode, obs.distance_m, n_vehicles,
+                obs.estimated_penetration_loss_db, deficit_ratio,
+            )
+            l_base_ms, l_signal_ms, l_queue_ms = (
+                r["l_base_ms"], r["l_transmission_ms"], r["l_queue_ms"],
+            )
+            outage = r["outage"]
+            # E2E = RAN + MEC/앱 처리(edge_latency_ms). outage면 L_OUTAGE 그대로.
+            predicted_latency_ms = (
+                formula_v31.L_OUTAGE_MS if outage
+                else round(r["l_total_ms"] + edge_latency, 3)
             )
 
-        # E2E 지연 = 공중 구간 + 백홀/코어/MEC 지연 (edge_latency_ms).
-        # 5G BS: 공중 2-4ms + 백홀+5GC 8-12ms → E2E 10-20ms (3GPP TR 38.913 §8.1.1)
-        # PC5 RSU: 공중 1-3ms + RSU 처리 ~1ms → E2E 2-4ms (ETSI GS MEC 003)
-        predicted_latency_ms = round(l_air_ms + edge_latency, 3)
         node_score = round(predicted_latency_ms, 2)
 
         results.append({
@@ -461,8 +361,13 @@ def analyze_candidates(
             "l_base_ms": l_base_ms,
             "l_signal_ms": l_signal_ms,
             "l_queue_ms": l_queue_ms,
+            "rsrp_dbm": rsrp_dbm,
+            "sinr_db": sinr_db,
+            "outage": outage,
             "node_score": node_score,
             "highlighted_buildings": obs.highlighted_buildings,
         })
-    results.sort(key=lambda item: (item["predicted_latency_ms"], item["node_score"]))
+    # 연결 규칙 (명세 §9, 기본 알고리즘 rsrp_max): RSRP 최대 기지국에 연결.
+    # 부하 기반 선택 금지 — 동률일 때만 낮은 예측 지연으로 타이브레이크.
+    results.sort(key=lambda item: (-item["rsrp_dbm"], item["predicted_latency_ms"]))
     return results

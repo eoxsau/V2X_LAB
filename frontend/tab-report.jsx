@@ -47,6 +47,7 @@ function algoLabel(key) {
     return r === 0 ? 'K-경로 최적' : `K-경로 ${r + 1}위`;
   }
   const MAP = {
+    tech_latency_v31: '기술모델 v3.1', rsrp_max: 'RSRP 최대',
     dijkstra: 'Dijkstra', astar: 'A*', baseline_dijkstra: '기본 Dijkstra',
     network_aware: '네트워크 가중치', network_weighted: '네트워크 가중치',
     lowest_latency_bs: 'Lowest Latency', highest_confidence_bs: 'Highest Confidence',

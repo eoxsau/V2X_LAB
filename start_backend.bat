@@ -1,5 +1,11 @@
 @echo off
 cd /d "%~dp0backend"
+rem Force UTF-8: on ko-KR Windows the console defaults to cp949, and printing a
+rem non-cp949 char (e.g. the em dash in [SIM] logs) raises UnicodeEncodeError,
+rem which kills the whole simulation thread.
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 echo [V2X Lab] Starting FastAPI backend on http://localhost:8001
 set "RELOAD_FLAG="
 if "%V2X_RELOAD%"=="1" set "RELOAD_FLAG=--reload"

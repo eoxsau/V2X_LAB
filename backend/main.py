@@ -12,6 +12,16 @@ import subprocess
 import sys
 import threading
 import time
+
+# 로그에 쓰이는 비-ASCII 문자(em dash, 한글 등)가 콘솔 기본 인코딩(한글 Windows=cp949)으로
+# 인코딩되지 않으면 print()가 UnicodeEncodeError를 던지고, 그게 호출 스레드를 통째로 죽인다
+# (시뮬레이션 스레드가 조용히 사라지는 원인이었음). start_backend.bat이 PYTHONUTF8을 설정하지만
+# uvicorn을 직접 실행하거나 IDE/Docker로 띄우면 그 설정이 없으므로 여기서 한 번 더 보장한다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # 재설정 불가한 스트림(파이프 래핑 등) — errors="replace" 없이도 대개 UTF-8이다
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from heapq import heappop, heappush
@@ -48,6 +58,16 @@ from app.services.standard_link.standard_link_repository import StandardLinkRepo
 from app.services.buildings.building_preprocessor import preprocess_buildings
 from app.services.buildings.building_repository import BuildingRepository
 from app.services.buildings.building_obstruction_analyzer import analyze_candidates
+
+try:
+    # v3.1 통합 latency 모델 — 커버리지 반경 실시간 해상 + 활성 기술 모드 주입
+    from app.services.latency.formula_v31 import (
+        resolve_coverage_radius as f31_resolve_coverage_radius,
+        set_active_mode as f31_set_active_mode,
+    )
+    F31_AVAILABLE = True
+except ImportError:
+    F31_AVAILABLE = False
 try:
     from app.services.routing.route_cost_function import (
         CostWeights,
@@ -411,7 +431,7 @@ _state = {
     "algorithm_metrics": {},
     "simulation_summary": None,
     "selected_algorithms": {},
-    "latency_algorithm": "full_composite_latency",
+    "latency_algorithm": "tech_latency_v31",
     "allocation_algorithm": "traffic_aware_allocation",
     "last_allocation_result": None,
     "algorithm_comparison": {"status": "idle"},
@@ -461,8 +481,10 @@ class SimConfigCostWeights(BaseModel):
 
 class SimConfigAlgorithmSelection(BaseModel):
     route_algorithm:                  str = "dijkstra"
-    latency_algorithm:                str = "full_composite_latency"
-    base_station_selection_algorithm: str = "lowest_latency_bs"
+    # v3.1 통합 모델이 기본값 — 기존 5종은 레지스트리에 남아 선택/롤백 가능
+    latency_algorithm:                str = "tech_latency_v31"
+    # v3.1 §9: RSRP 최대 연결이 기본값 — 기존 선택형 알고리즘 유지
+    base_station_selection_algorithm: str = "rsrp_max"
     resource_allocation_algorithm:    str = "traffic_aware_allocation"
 
 class SimConfigPolicyOptions(BaseModel):
@@ -609,6 +631,14 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         "bg_reroute_mode":      pol.bg_reroute_mode if pol.bg_reroute_mode in ("random", "congestion") else "random",
     }
     _state["simulation_config"] = cfg.model_dump()
+
+    # v3.1: 활성 기술 모드를 latency 모듈에 주입하고(경로비용의 rsrp_max·레지스트리
+    # 계산이 이 모드를 참조), 커버리지 반경을 새 모드 기준으로 즉시 재해상한다.
+    if F31_AVAILABLE:
+        f31_set_active_mode(_state["policy_options"]["network_mode"])
+    for _node_key in ("network_nodes", "synthetic_network_nodes"):
+        if _state.get(_node_key):
+            _apply_tech_coverage(_state[_node_key])
 
 
 class SimStartRequest(BaseModel):
@@ -1126,12 +1156,33 @@ def db_node_to_candidate(row: dict) -> dict:
     }
 
 
+def _resolved_network_mode() -> str:
+    return ((_state.get("policy_options") or {}).get("network_mode")) or "5G"
+
+
+def _apply_tech_coverage(nodes: list[dict]) -> list[dict]:
+    """커버리지 반경을 현재 network_mode 기준으로 실시간 재해상 (2026-07-16 결정).
+
+    노드에 저장된 고정값(구버전 500m 하드코딩 포함)은 무시한다 — BS는 d_edge
+    (4G 2000 / 5G 1000 / 6G 500m), RSU는 PC5 반경(100/150/250m). 이로써 4G/5G/6G
+    전환이 기존 배치 노드에도 즉시 반영된다.
+    """
+    if not F31_AVAILABLE:
+        return nodes
+    mode = _resolved_network_mode()
+    for n in nodes:
+        n["coverage_radius_m"] = f31_resolve_coverage_radius(
+            mode, n.get("type") or n.get("node_type"),
+        )
+    return nodes
+
+
 def merged_network_nodes() -> list[dict]:
     """User-created stations from DB; fall back to synthetic nodes only when none exist."""
     user_nodes = [db_node_to_candidate(row) for row in fetch_network_nodes(source="user_created")]
     if user_nodes:
-        return user_nodes
-    return list(_state.get("synthetic_network_nodes") or [])
+        return _apply_tech_coverage(user_nodes)
+    return _apply_tech_coverage(list(_state.get("synthetic_network_nodes") or []))
 
 
 def _get_ego_allocated_rb(connected_node: Optional[dict]) -> Optional[float]:
@@ -3727,13 +3778,19 @@ def simulation_thread(
     except Exception as e:
         import traceback
         msg = traceback.format_exc()
-        print(f"[SIM ERROR]\n{msg}", flush=True)
+        # 상태 정리를 로깅보다 먼저 한다 — print()가 실패하면(예: 콘솔 인코딩) 그 아래 줄에
+        # 도달하지 못해 sim_running이 True로 굳고 error도 안 실려서, 프런트는 "실행 중"인데
+        # 백엔드 스레드는 이미 죽은 상태가 된다. 정리가 로깅에 의존하면 안 된다.
         _state["error"] = str(e)
         _state["sim_running"] = False
         try:
             traci.close()
         except Exception:
             pass
+        try:
+            print(f"[SIM ERROR]\n{msg}", flush=True)
+        except Exception:
+            pass  # 로깅 실패가 이미 끝난 정리를 되돌리게 두지 않는다
 
 
 def can_run_sumo() -> tuple[bool, str | None]:
@@ -3748,11 +3805,13 @@ def can_run_sumo() -> tuple[bool, str | None]:
     return True, None
 
 
-def reset_simulation_state() -> None:
-    _state["network_ready"] = False
-    _state["net_file"] = None
-    _state["osm_file"] = None
-    _state["mock_graph"] = None
+def reset_runtime_state() -> None:
+    """시뮬레이션 런타임 상태만 초기화 — 구역(bbox)/도로망/기지국/ITS 동기화는 유지.
+
+    페이지 새로고침(bootReset)·이탈(beforeunload)이 쓰는 리셋. 이전에는 이 경로가
+    reset_simulation_state()를 통째로 불러서, 새로고침만 해도 백엔드의 구역과 변환된
+    도로망까지 사라졌다(기지국은 DB라 살아남아 비대칭) — 구역 증발의 원인.
+    """
     _state["sim_running"] = False
     _state["vehicle_pos"] = None
     _state["route_edges"] = []
@@ -3760,11 +3819,6 @@ def reset_simulation_state() -> None:
     _state["sim_mode"] = "idle"
     _state["error"] = None
     _state["warning"] = None
-    _state["current_bbox"] = None
-    _state["traffic_sync"] = None
-    _state["download_log"] = []
-    _state["network_nodes"] = []
-    _state["synthetic_network_nodes"] = []
     _state["route_buildings"] = None
     _state["network_telemetry"] = None
     _state["building_debug"] = {"sample_links": [], "warnings": []}
@@ -3785,11 +3839,28 @@ def reset_simulation_state() -> None:
     _state["background_vehicles"] = []
     _state["background_vehicle_ids"] = []
     _state["algorithm_comparison"] = {"status": "idle"}
-    # Stage-1: keep simulation_config across resets (user's saved config persists)
-    _state["policy_options"] = None
     _state["sim_origin"] = None
     _state["sim_dest"] = None
     _state["sim_vehicle_count"] = 1
+
+
+def reset_simulation_state() -> None:
+    """전체 초기화 — 런타임 + 구역/도로망/노드/ITS까지.
+
+    setup-network 시작 시(새 구역으로 교체)와 '전체 초기화' 버튼이 사용한다.
+    """
+    reset_runtime_state()
+    _state["network_ready"] = False
+    _state["net_file"] = None
+    _state["osm_file"] = None
+    _state["mock_graph"] = None
+    _state["current_bbox"] = None
+    _state["traffic_sync"] = None
+    _state["download_log"] = []
+    _state["network_nodes"] = []
+    _state["synthetic_network_nodes"] = []
+    # Stage-1: keep simulation_config across resets (user's saved config persists)
+    _state["policy_options"] = None
 
 
 def _store_simulation_summary() -> None:
@@ -4019,6 +4090,22 @@ async def setup_network(req: SetupRequest):
         except Exception as e:
             _state["error"] = str(e)
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/setup-network/status")
+def setup_network_status():
+    """현재 백엔드에 로드된 구역 상태 — 새로고침한 프런트가 구역 사각형을 복원하는 용도.
+
+    구역(bbox)은 기지국과 달리 DB가 아니라 _state(메모리)에만 있어서, 페이지를
+    새로고침하면 지도의 사각형만 사라지고 백엔드는 여전히 network_ready였다.
+    프런트는 지도 초기화 직후 이걸 호출해 bbox가 있으면 다시 그린다.
+    (백엔드 재시작 시에는 bbox도 함께 사라지므로 그때는 복원할 것이 없음 — 정직한 동작.)
+    """
+    return {
+        "network_ready": bool(_state.get("network_ready")),
+        "bbox": _state.get("current_bbox"),
+        "sim_mode": _state.get("sim_mode"),
+    }
 
 
 @app.get("/api/setup-network/info")
@@ -4849,7 +4936,9 @@ async def resume_simulation():
 
 
 @app.post("/api/simulation/reset")
-async def reset_simulation():
+async def reset_simulation(scope: str = "full"):
+    """scope="runtime": 차량/경로/텔레메트리만 리셋, 구역·도로망은 유지 (새로고침용).
+    scope="full"(기본, 하위호환): 구역·도로망·노드까지 전부 초기화."""
     global _stop_event, _sim_thread, _pause_event
     _pause_event.clear()  # 일시정지 해제 후 종료
     _stop_event.set()
@@ -4867,8 +4956,11 @@ async def reset_simulation():
     _sim_thread = None
     _stop_event = threading.Event()
     _pause_event = threading.Event()
-    reset_simulation_state()
-    return {"ok": True}
+    if scope == "runtime":
+        reset_runtime_state()
+    else:
+        reset_simulation_state()
+    return {"ok": True, "scope": scope if scope == "runtime" else "full"}
 
 
 def _find_free_port(start: int = 8002) -> int:
@@ -5640,7 +5732,11 @@ def _network_node_response(row: dict) -> dict:
         "load": row.get("load"),
         "congestion_score": row.get("congestion_score"),
         "edge_latency_ms": row.get("edge_latency_ms"),
-        "coverage_radius_m": row.get("coverage_radius_m"),
+        # 저장값 대신 현재 기술 모드 기준 반경 — 지도 커버리지 원이 모드 전환을 따라감
+        "coverage_radius_m": (
+            f31_resolve_coverage_radius(_resolved_network_mode(), row.get("node_type"))
+            if F31_AVAILABLE else row.get("coverage_radius_m")
+        ),
         "source": row.get("source"),
         "antenna_height_m": row.get("antenna_height_m"),
         "antenna_placement": row.get("antenna_placement"),
