@@ -2,20 +2,30 @@
 const API = window.location.origin;
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
+/* started: 한 번이라도 실행되면 true, 초기화(reset)해야만 false로 돌아간다.
+   실행 설정(알고리즘·가중치·네트워크 세대)은 "초기화된 상태"에서만 바꿀 수 있어야 하므로,
+   running만으로는 부족하다 — 일시정지(pause)도 running=false지만 이미 시작된 런이라
+   설정을 바꾸면 주행 경로(옛 설정)와 텔레메트리(새 설정)가 섞인다. configLocked() 참조. */
 function simReducer(s, a) {
   switch (a.type) {
-    case 'start':   return { ...s, running: true };
+    case 'start':   return { ...s, running: true, started: true };
     case 'pause':   return { ...s, running: false };
-    case 'reset':   return { ...s, running: false, elapsed: 0, tick: 0 };
+    case 'reset':   return { ...s, running: false, started: false, elapsed: 0, tick: 0 };
     case 'tick':    return { ...s, elapsed: s.elapsed + 1, tick: s.tick + 1 };
     case 'mode':    return { ...s, mode: a.v };
     default: return s;
   }
 }
 
+/* 실행 설정 잠금 여부 — 실행 중이거나 이미 시작된 런이 있으면 true.
+   해제하려면 "전체 초기화"로 리셋해야 한다. */
+function configLocked(sim) {
+  return !!(sim && (sim.running || sim.started));
+}
+
 function App() {
   const [tab, setTab] = useState(() => location.hash.replace('#', '') || 'simulation');
-  const [sim, dispatch] = React.useReducer(simReducer, { running: false, elapsed: 0, tick: 0, mode: '5G' });
+  const [sim, dispatch] = React.useReducer(simReducer, { running: false, started: false, elapsed: 0, tick: 0, mode: '5G' });
   const [bootReady, setBootReady]      = useState(false);
 
   // Lite/Professional 모드 게이트 — 선택 전엔 LandingPage만 보여준다(아래 return 직전 분기).

@@ -202,6 +202,10 @@ function runCustomWeightedPolicy(policy, features) {
 }
 
 function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setAppMode }) {
+  // 실행 설정 잠금 — 시뮬레이션이 시작된 뒤에는 초기화 전까지 변경 불가.
+  // 이 탭의 저장(PUT /api/simulation/config)은 백엔드 전역에 "즉시" 반영되므로,
+  // 실행 중 변경하면 주행 경로와 지연·자원할당 계산이 서로 다른 설정을 쓰게 된다.
+  const isConfigLocked = configLocked(sim);
   const [tech, setTech] = useState(sim.mode === '6G' ? '6G' : '5G');
   const [vals, setVals] = useState(() => {
     const o = {}; DATA.params.forEach(p => { if (p.type !== 'tech') o[p.v] = p.def; }); return o;
@@ -346,7 +350,9 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
       </Card>
 
       {/* tech selector */}
-      <Card title="네트워크 모드" en="Network technology" style={{ marginBottom: 18 }}>
+      <Card title="네트워크 모드" en="Network technology" style={{ marginBottom: 18 }}
+        right={isConfigLocked ? <span className="cfg-lock-note">실행 중 잠김 — 초기화 후 변경</span> : null}>
+        <fieldset className={'cfg-lock' + (isConfigLocked ? ' locked' : '')} disabled={isConfigLocked}>
         <div className="row gap12 wrap">
           {[['4G', '4G LTE', 'L_base 10ms · 표준'], ['5G', '5G NR', 'L_base 1ms · 현재'], ['6G', '6G-like', 'L_base 0.1ms · 연구목표']].map(([k, name, desc]) => (
             <button key={k} onClick={() => applyTech(k)} style={{
@@ -364,6 +370,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
             </button>
           ))}
         </div>
+        </fieldset>
         <div className="row gap8" style={{ marginTop: 14, padding: '10px 13px', background: 'var(--warn-tint)', borderRadius: 9, fontSize: 11, color: 'var(--warn-ink, var(--warn))' }}>
           <Icon.warn size={14} style={{ flex: '0 0 auto', marginTop: 1 }} />
           <span style={{ lineHeight: 1.45 }}>6G 수치는 확정 표준이 아닌 연구 목표값입니다 (표준 확정 예정: Release 21, ~2029년). C_tech는 설계 파라미터로 3GPP/ITU 규정값이 아닙니다.</span>
@@ -371,7 +378,15 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
       </Card>
 
       {mode === 'pro' && (
-      <Card title="기술 파라미터" en="Technical parameters" right={<span className="mono muted" style={{ fontSize: 10 }}>{tech} 프리셋 적용됨</span>} style={{ padding: 0 }}>
+      <Card title="기술 파라미터" en="Technical parameters"
+        right={
+          <div className="row gap8" style={{ alignItems: 'center' }}>
+            {isConfigLocked && <span className="cfg-lock-note">실행 중 잠김 — 초기화 후 변경</span>}
+            <span className="mono muted" style={{ fontSize: 10 }}>{tech} 프리셋 적용됨</span>
+          </div>
+        }
+        style={{ padding: 0 }}>
+        <fieldset className={'cfg-lock' + (isConfigLocked ? ' locked' : '')} disabled={isConfigLocked}>
         <div className="tbl-wrap">
           <table className="tbl">
             <thead><tr><th>파라미터<span className="en">Parameter</span></th><th>변수<span className="en">Variable</span></th><th style={{ width: 160 }}>값<span className="en">Value</span></th><th>설명<span className="en">Description</span></th></tr></thead>
@@ -393,6 +408,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
             </tbody>
           </table>
         </div>
+        </fieldset>
       </Card>
       )}
 
@@ -413,20 +429,35 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
       <Card title="시뮬레이션 알고리즘 설정" en="Simulation config (Stage 1)"
         right={
           <div className="row gap8">
-            <button className="btn" onClick={resetConfig}>초기화</button>
-            <button className={'btn ' + (cfgSaved ? 'good' : 'primary')} onClick={saveConfig}>
-              {cfgSaved ? <><Icon.check size={13} /> 저장됨</> : <><Icon.check size={13} /> 저장</>}
-            </button>
+            {isConfigLocked
+              ? <span className="cfg-lock-note">실행 중 잠김 — 초기화 후 변경</span>
+              : (<>
+                  <button className="btn" onClick={resetConfig}>초기화</button>
+                  <button className={'btn ' + (cfgSaved ? 'good' : 'primary')} onClick={saveConfig}>
+                    {cfgSaved ? <><Icon.check size={13} /> 저장됨</> : <><Icon.check size={13} /> 저장</>}
+                  </button>
+                </>)}
           </div>
         }
         style={{ marginTop: 18 }}
       >
+        {isConfigLocked && (
+          <div className="row gap8" style={{ marginBottom: 14, padding: '9px 12px', background: 'var(--warn-tint)', borderRadius: 8, fontSize: 11, color: 'var(--warn-ink, var(--warn))', flexWrap: 'wrap' }}>
+            <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
+            <span style={{ lineHeight: 1.5 }}>
+              시뮬레이션이 시작된 상태라 설정을 변경할 수 없습니다. 실행 중 변경하면 주행 경로(시작 시점 설정)와
+              지연·자원할당(변경된 설정)이 뒤섞여 결과를 신뢰할 수 없게 됩니다.
+              시뮬레이션 탭에서 <b>전체 초기화</b> 후 다시 설정하세요.
+            </span>
+          </div>
+        )}
         {cfgErrors.length > 0 && (
           <div className="row gap8" style={{ marginBottom: 14, padding: '9px 12px', background: 'var(--err-tint,#fff0f0)', borderRadius: 8, fontSize: 11, color: 'var(--err,#c00)', flexWrap: 'wrap' }}>
             <Icon.warn size={13} style={{ flex: '0 0 auto' }} />
             <span>{cfgErrors.join(' · ')}</span>
           </div>
         )}
+        <fieldset className={'cfg-lock' + (isConfigLocked ? ' locked' : '')} disabled={isConfigLocked}>
 
         {/* Cost Weights */}
         <div className="muted" style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', marginBottom: 8 }}>COST WEIGHTS</div>
@@ -573,6 +604,7 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
             </tbody>
           </table>
         </div>
+        </fieldset>
       </Card>
       )}
 

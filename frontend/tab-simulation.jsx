@@ -994,6 +994,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
   const ready    = area && originDone && destDone;
+  // 실행 설정(알고리즘·네트워크 세대) 잠금 — 시작 후에는 초기화 전까지 변경 불가.
+  // 일시정지 상태도 잠긴다(이미 시작된 런이므로).
+  const isConfigLocked = configLocked(sim);
 
   /* ── marker builders ────────────────────────────────────────── */
   function pinIcon(color, faded) {
@@ -1363,8 +1366,15 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }, [backgroundVehicles, showLayers.vehicles]);
 
   /* ── mode interaction handlers ───────────────────────────────── */
+  // 실행이 시작되면 지도 상호작용 모드도 강제 해제한다 — 패널만 잠그면, 잠기기 직전에
+  // 켜둔 모드(구역 그리기·기지국 배치/삭제 등)가 지도에서 그대로 살아있어 우회로가 된다.
+  useEffect(() => {
+    if (isConfigLocked && mode) setMode(null);
+  }, [isConfigLocked, mode]);
+
   useEffect(() => {
     const map = mapObj.current; if (!map) return;
+    if (isConfigLocked) return;   // 잠금 중에는 어떤 지도 핸들러도 붙이지 않는다
     if (mode === 'area') {
       map.dragging.disable();
       map.getContainer().style.cursor = 'crosshair';
@@ -1418,7 +1428,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       map.getContainer().style.cursor = 'crosshair';
       return () => { map.getContainer().style.cursor = ''; };
     }
-  }, [mode]);
+  }, [mode, isConfigLocked]);
 
   /* ── user-created base station create / delete ───────────────── */
   async function createStation(lat, lng, nodeTypeOverride) {
@@ -2001,6 +2011,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             ))}
           </div>
 
+          {/* ── 실행 설정 전체 잠금 영역 ────────────────────────────────────
+              구역·ITS·경로 지점·차량 수·기지국/RSU·네트워크 세대·알고리즘·실험 트리거까지,
+              한 번 시작하면 전부 잠긴다(시작 시점 설정으로 런이 고정되므로). 아래 진행률·
+              텔레메트리 등 "읽기 전용 표시"는 이 영역 밖이라 계속 선명하게 보인다. */}
+          {isConfigLocked && (
+            <div className="row gap8" style={{ padding: '9px 12px', background: 'var(--warn-tint)', borderRadius: 9,
+              fontSize: 10.5, color: 'var(--warn-ink, var(--warn))', lineHeight: 1.5 }}>
+              <Icon.warn size={13} style={{ flex: '0 0 auto', marginTop: 1 }} />
+              <span>실행이 시작되어 <b>설정이 잠겼습니다</b>. 주행 경로·기지국 배치는 시작 시점 값으로
+                고정됩니다. 바꾸려면 <b>시나리오 초기화</b> 후 다시 설정하세요.</span>
+            </div>
+          )}
+          <fieldset
+            className={'cfg-lock' + (isConfigLocked ? ' locked' : '')}
+            disabled={isConfigLocked}
+            style={{ display: 'flex', flexDirection: 'column', gap: 18 }}
+          >
+
           {/* area */}
           <div className="col gap8">
             <div className="field">
@@ -2241,9 +2269,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             )}
           </div>
 
-          {/* network generation — UI only (not wired to backend) */}
+          {/* network generation — policy_options.network_mode로 백엔드에 전달됨 */}
           <div className="field">
-            <label>네트워크 세대 <span className="en">NETWORK GEN</span></label>
+            <label>
+              네트워크 세대 <span className="en">NETWORK GEN</span>
+              {isConfigLocked && <span className="cfg-lock-note" style={{ marginLeft: 6 }}>실행 중 잠김</span>}
+            </label>
             <div className="seg" style={{ display: 'flex', width: '100%' }}>
               {[['4g', '4G'], ['5g', '5G'], ['6g', '6G-like']].map(([v, lbl]) => (
                 <button key={v} className={networkGen === v ? 'active' : ''} style={{ flex: 1 }} onClick={() => setNetworkGen(v)}>
@@ -2374,7 +2405,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           {/* algorithms — Pro 전용 (Lite는 simConfig의 기본 알고리즘을 그대로 사용) */}
           {appMode === 'pro' && (
           <div className="field">
-            <label>알고리즘 <span className="en">ALGORITHMS</span></label>
+            <label>
+              알고리즘 <span className="en">ALGORITHMS</span>
+              {isConfigLocked && <span className="cfg-lock-note" style={{ marginLeft: 6 }}>실행 중 잠김</span>}
+            </label>
             <div className="col gap8">
               <AlgorithmGroup groupKey="route" label="경로 알고리즘" options={ROUTE_ALGORITHMS} />
               <AlgorithmGroup groupKey="latency" label="지연시간 알고리즘" options={LATENCY_ALGORITHMS} />
@@ -2423,6 +2457,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
           </div>
           )}
+
+          </fieldset>
+          {/* ── 잠금 영역 끝 — 아래는 읽기 전용 표시 ───────────────────────── */}
 
           {/* progress bar */}
           {vehiclePos && (

@@ -285,3 +285,25 @@ table.tbl td.r, table.tbl th.r { text-align: right; }
 /* tab content — kept always-visible; no entrance animation, because a
    backgrounded preview iframe pauses CSS animations at the 0% (hidden) frame */
 .fade { opacity: 1; }
+
+/* ── 실행 설정 잠금 (configLocked) ─────────────────────────────────────────
+   시뮬레이션이 시작된 뒤에는 알고리즘·가중치·네트워크 세대를 바꿀 수 없다.
+   실행 중 변경하면 주행 경로(옛 설정)와 텔레메트리·자원할당(새 설정)이 섞여
+   한 실험 안에 두 설정이 공존하게 되기 때문. "전체 초기화" 후에만 다시 열린다.
+
+   <fieldset disabled>로 감싸므로 내부 input/select/button은 네이티브로 비활성화되고
+   (키보드 탭 이동까지 차단), pointer-events가 div 기반 onClick(Toggle 등)까지 막는다. */
+fieldset.cfg-lock { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.cfg-lock.locked {
+  opacity: 0.45;
+  filter: saturate(0.25);
+  pointer-events: none;
+  user-select: none;
+  cursor: not-allowed;
+}
+.cfg-lock-note {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10px; font-weight: 500; padding: 2px 7px; border-radius: 5px;
+  background: var(--warn-tint); color: var(--warn-ink, var(--warn));
+  white-space: nowrap;
+}
