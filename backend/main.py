@@ -275,6 +275,9 @@ WORK_DIR = Path(__file__).parent / "networks"
 WORK_DIR.mkdir(exist_ok=True)
 MAX_SETUP_AREA_KM2        = 25.0   # Overpass API 모드 상한 (대용량 다운로드 불안정)
 MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 단위 커버)
+# RSU 안테나 높이 — C-V2X 표준 도로변 폴 높이 고정값. RSU는 교차로 폴 설치라 건물 높이를
+# 쓰지 않고 항상 이 값을 쓴다(옥상 스냅 대상 아님). 수동/자동 배치 모두 이 상수를 참조.
+RSU_ANTENNA_HEIGHT_M      = 6.0
 DEFAULT_LOCAL_PBF = Path.home() / "Desktop" / "south-korea-260711.osm.pbf"
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
@@ -5839,7 +5842,7 @@ async def create_network_node(req: NetworkNodeCreateRequest):
             "edge_latency_ms": 1.0,  # PC5 접속 지연 ≈ 1ms
             "coverage_radius_m": cov_r,
             "source": "user_created",
-            "antenna_height_m": 6.0,
+            "antenna_height_m": RSU_ANTENNA_HEIGHT_M,
             "antenna_placement": "pole",
         }
     else:
@@ -5886,6 +5889,175 @@ async def reset_user_created_nodes():
     return {"ok": True, "deleted": deleted}
 
 
+class AutoPlaceRequest(BaseModel):
+    n_bs: int = 0
+    n_rsu: int = 0
+    method: str = "random"               # "random"=블루노이즈 균등 / "sa"=SA 최적화 배치
+    network_mode: Optional[str] = None   # 기본: 현재 정책 모드
+    spread: int = 10                     # Best-Candidate 분산 강도(m). 1=순수난수, 클수록 균등
+    seed: Optional[int] = None           # 재현용
+    replace_existing: bool = False       # True면 기존 user_created 노드 먼저 삭제(번호 1부터)
+
+
+@app.post("/network-nodes/auto-place")
+async def auto_place_network_nodes(req: AutoPlaceRequest):
+    """지정 개수의 BS/RSU를 도로망에 자동 배치하고 user_created로 저장한다.
+
+    method:
+      - "random": Best-Candidate 블루노이즈로 '고르게 흩뿌리기'. 지연 최소화가 아니라 사용자가
+                  일일이 찍는 수고를 덜기 위한 균등 배치. SpatialGrid로 수천 개도 빠르다.
+      - "sa":     SA 최적화 배치. 현재 수요 모델(ITS 있으면 ITS, 없으면 균일 폴백) 기준으로
+                  M/M/1 지연을 낮추는 위치를 찾는다. ※ radiation model 기반 수요는 아직 미반영.
+
+    공통: BS는 건물 옥상 스냅, RSU는 교차로(degree≥3) 노드. 번호는 기존 최대치 뒤로 이어 붙인다.
+    """
+    if not postgis_available():
+        raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 저장할 수 없습니다.")
+    if _state.get("sim_running"):
+        raise HTTPException(status_code=409, detail="시뮬레이션 실행 중에는 자동 배치를 할 수 없습니다. 먼저 중지하세요.")
+
+    graph = _state.get("mock_graph")
+    if not graph or not graph.get("nodes"):
+        raise HTTPException(status_code=400, detail="구역이 설정되지 않았습니다. 먼저 시뮬레이션 탭에서 구역을 설정하세요.")
+
+    # 사용자 원본 bbox — mock_graph는 클리핑되지 않아 구역 밖 노드를 포함하므로, 배치 후보를
+    # 이 bbox 안으로 제한한다(자동·SA 배치 모두). 없으면(구버전 상태) 필터 없이 진행.
+    user_bbox = _state.get("current_bbox")
+
+    n_bs = max(0, int(req.n_bs))
+    n_rsu = max(0, int(req.n_rsu))
+    if n_bs + n_rsu == 0:
+        raise HTTPException(status_code=400, detail="배치할 개수를 지정하세요 (n_bs 또는 n_rsu > 0).")
+
+    method = req.method if req.method in ("random", "sa") else "random"
+    mode = req.network_mode if req.network_mode in ("4G", "5G", "6G") else \
+        (_state.get("policy_options") or {}).get("network_mode", "5G")
+    spread = max(1, int(req.spread))
+
+    from app.services.placement.auto_placement import build_pool, blue_noise_place, nearest_neighbor_cv, PlacePoint
+    from app.services.placement.sa_placement import optimize_placement
+    from app.services.buildings.bs_placement import resolve_placement
+    from app.services.buildings.building_obstruction_analyzer import _RSU_COVERAGE_RADIUS_M
+
+    if req.replace_existing:
+        delete_user_created_network_nodes()
+
+    warnings: list[str] = []
+    placed_bs: list[dict] = []
+    placed_rsu: list[dict] = []
+    cv_bs = cv_rsu = 0.0
+
+    # 기존 user_created 노드 → 번호 시작점 + anchor(그 근처는 피해서 배치). BS/RSU는 서로 독립
+    # 레이어이므로 같은 base anchor(기존 노드)만 공유하고, 서로를 anchor로 밀어내지는 않는다.
+    existing = fetch_network_nodes(source="user_created")
+    bs_base = max_user_station_number()
+    rsu_base = sum(1 for n in existing if str(n.get("node_type") or "").lower() in ("rsu", "rsu_node"))
+    base_anchors = [(float(n["lat"]), float(n["lng"])) for n in existing
+                    if n.get("lat") is not None and n.get("lng") is not None]
+
+    # SA용 ITS(peak) — 없으면 sa_placement가 균일 수요로 폴백
+    sa_its: list[dict] = []
+    if method == "sa":
+        try:
+            _d = TRAFFIC_FUSION_ENGINE.current_traffic(time_period="peak")
+            sa_its = (_d or {}).get("links") or []
+        except Exception:
+            sa_its = []
+
+    loop = asyncio.get_event_loop()
+
+    async def _positions(node_type: str, n: int, seed: Optional[int]) -> list:
+        """method에 따라 배치 위치(PlacePoint 리스트)를 산출한다."""
+        if method == "sa":
+            # SA는 CPU 집약적이라 executor에서 (이벤트 루프 차단 방지)
+            res = await loop.run_in_executor(None, lambda: optimize_placement(
+                graph=graph, its_links=sa_its, N=n, network_mode=mode,
+                node_type=node_type, time_period="peak", seed=seed, bbox=user_bbox,
+            ))
+            return [PlacePoint(node_id=str(p["id"]), lat=float(p["lat"]), lng=float(p["lng"]))
+                    for p in res.placed]
+        pool = build_pool(graph, node_type, bbox=user_bbox)
+        if not pool:
+            return []
+        if len(pool) < n:
+            label = "RSU 교차로(degree≥3)" if node_type == "rsu" else "BS 도로 노드"
+            warnings.append(f"{label} 후보가 {len(pool)}개뿐이라 요청 {n}개 대신 {len(pool)}개만 배치합니다.")
+        return blue_noise_place(pool, n, m=spread, seed=seed, anchors=base_anchors)
+
+    # ── BS: 위치 산출 → 옥상 스냅 → 저장 ───────────────────────────────────────
+    if n_bs > 0:
+        bs_pts = await _positions("bs", n_bs, req.seed)
+        cv_bs = nearest_neighbor_cv(bs_pts)
+        seen: list[tuple[float, float]] = []
+        num = bs_base
+        for p in bs_pts:
+            placement = resolve_placement(p.lat, p.lng, BUILDING_REPOSITORY, search_radius_m=100.0)
+            # 옥상 스냅으로 두 BS가 같은 건물에 겹치면 하나만
+            if any(haversine_m(placement.lat, placement.lng, sx, sy) < 5.0 for sx, sy in seen):
+                continue
+            seen.append((placement.lat, placement.lng))
+            num += 1
+            saved = insert_network_node({
+                "id": f"user-bs-{uuid4().hex[:10]}",
+                "name": f"기지국 {num}",
+                "node_type": "base_station",
+                "lat": placement.lat,
+                "lng": placement.lng,
+                "capacity": 100.0,
+                "load": 0.0,
+                "congestion_score": 0.0,
+                "edge_latency_ms": 3.0,
+                "coverage_radius_m": 500.0,
+                "source": "user_created",
+                "antenna_height_m": placement.antenna_height_m,
+                "antenna_placement": placement.placement_type,
+            })
+            if saved:
+                placed_bs.append(_network_node_response(saved))
+
+    # ── RSU: 위치 산출 → 저장 (스냅 불필요, 이미 교차로 노드) ─────────────────────
+    if n_rsu > 0:
+        rsu_seed = (req.seed + 1) if req.seed is not None else None
+        rsu_pts = await _positions("rsu", n_rsu, rsu_seed)
+        if not rsu_pts and method != "sa":
+            warnings.append("RSU 후보 교차로(degree≥3)가 없어 RSU를 배치하지 못했습니다.")
+        cv_rsu = nearest_neighbor_cv(rsu_pts)
+        cov = _RSU_COVERAGE_RADIUS_M.get(mode, 150.0)
+        num = rsu_base
+        for p in rsu_pts:
+            num += 1
+            saved = insert_network_node({
+                "id": f"user-rsu-{uuid4().hex[:10]}",
+                "name": f"RSU-{num}",
+                "node_type": "rsu",
+                "lat": p.lat,
+                "lng": p.lng,
+                "capacity": 50.0,
+                "load": 0.0,
+                "congestion_score": 0.0,
+                "edge_latency_ms": 1.0,
+                "coverage_radius_m": cov,
+                "source": "user_created",
+                "antenna_height_m": RSU_ANTENNA_HEIGHT_M,
+                "antenna_placement": "pole",
+            })
+            if saved:
+                placed_rsu.append(_network_node_response(saved))
+
+    _refresh_active_network_nodes()
+    return {
+        "ok": True,
+        "method": method,
+        "placed_bs": placed_bs,
+        "placed_rsu": placed_rsu,
+        "n_bs": len(placed_bs),
+        "n_rsu": len(placed_rsu),
+        "uniformity_cv": {"bs": round(cv_bs, 3), "rsu": round(cv_rsu, 3)},
+        "network_mode": mode,
+        "warnings": warnings,
+    }
+
+
 @app.post("/network-nodes/reapply-placement")
 async def reapply_placement_to_existing_nodes():
     """기존 user_created 기지국 전체에 건물 탐색 재배치를 적용한다.
@@ -5898,6 +6070,11 @@ async def reapply_placement_to_existing_nodes():
     updated, skipped = 0, 0
     results = []
     for row in rows:
+        # RSU는 옥상 재배치 대상이 아니다 — 교차로 폴 설치이며 높이는 고정값(6m)으로 유지한다.
+        # (BS 옥상 스냅 로직을 RSU에 적용하면 엉뚱한 건물 높이로 덮어써지는 문제 방지)
+        if str(row.get("node_type") or "").lower() in ("rsu", "rsu_node"):
+            skipped += 1
+            continue
         orig_lat = float(row["lat"])
         orig_lng = float(row["lng"])
         p = resolve_placement(orig_lat, orig_lng, BUILDING_REPOSITORY, search_radius_m=100.0)

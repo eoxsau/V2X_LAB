@@ -18,6 +18,8 @@ import random as _rng_module
 from dataclasses import dataclass, field
 from typing import Optional
 
+from app.services.geo.spatial_grid import SpatialGrid
+
 # ── 기술 파라미터 — SA 최적화 전용 근사 모델의 사본 ────────────────────────────
 # 주의: L_base/P_tx/alpha/beta 등은 formula_v31(설계문서 v3.1)과 다른 구식 근사식
 # (_L_total_sa)의 파라미터다 — SA 반복 성능을 위해 유지. 단 coverage_radius_m은
@@ -120,11 +122,14 @@ def _coverage_radius(network_mode: str, node_type: str) -> float:
 def build_candidates_from_graph(
     graph: dict,
     node_type: str = "bs",
+    bbox: Optional[dict] = None,
 ) -> list[Candidate]:
     """mock_graph 노드에서 후보 집합을 생성한다.
 
     BS: 모든 노드 (최대 _MAX_CANDIDATES개 샘플)
     RSU: 차수(degree) >= 3 인 교차로 노드만 (더 엄격한 입지 조건)
+    bbox({s,w,n,e})가 주어지면 그 안의 노드만 후보로 삼는다(mock_graph는 클리핑되지 않아
+    구역 밖 노드까지 포함하므로 — 사용자 원본 bbox로 걸러 구역 안에만 배치되게 한다).
     """
     nodes = graph.get("nodes", {})
     adjacency = graph.get("adjacency", {})
@@ -134,6 +139,10 @@ def build_candidates_from_graph(
         lat = data.get("lat")
         lng = data.get("lng")
         if lat is None or lng is None:
+            continue
+        if bbox is not None and not (
+            bbox["s"] <= float(lat) <= bbox["n"] and bbox["w"] <= float(lng) <= bbox["e"]
+        ):
             continue
         degree = len(adjacency.get(nid, []))
         if node_type == "rsu" and degree < 3:
@@ -223,18 +232,22 @@ def _assign_demand(
     """
     assignment: dict[str, list[int]] = {str(i): [] for i in range(len(placement))}
     uncovered: list[int] = []
+    if not placement:
+        return assignment, list(range(len(demand)))
+
+    # 배치 BS에 공간 그리드를 씌워 수요점마다 "커버 반경 내 최근접 BS"를 O(1)로 조회.
+    # 기존 이중 루프 O(수요×배치)를 O(수요)로 낮춘다 (셀 = 커버 반경).
+    grid = SpatialGrid(
+        list(range(len(placement))),
+        coords_fn=lambda ci: (placement[ci].lat, placement[ci].lng),
+        cell_size_m=coverage_m,
+    )
     for di, dp in enumerate(demand):
-        best_dist = float("inf")
-        best_ci: Optional[int] = None
-        for ci, cand in enumerate(placement):
-            d = _haversine_m(dp.lat, dp.lng, cand.lat, cand.lng)
-            if d <= coverage_m and d < best_dist:
-                best_dist = d
-                best_ci = ci
-        if best_ci is not None:
-            assignment[str(best_ci)].append(di)
-        else:
+        ci, _d = grid.nearest(dp.lat, dp.lng, max_radius_m=coverage_m)
+        if ci is None:
             uncovered.append(di)
+        else:
+            assignment[str(ci)].append(di)
     return assignment, uncovered
 
 
@@ -327,21 +340,34 @@ def _delta_cost(
     node_type: str,
     out_ci: int,
     in_cand: Candidate,
+    demand_grid: Optional[SpatialGrid] = None,
 ) -> float:
     """Delta evaluation: swap placement[out_ci] ↔ in_cand 의 비용 변화량.
 
     coverage 반경 내 영향받는 수요점만 재계산한다.
     전체 재계산 대비 규모가 클수록 속도 이득이 크다.
+
+    demand_grid: 수요점(고정) 공간 그리드. 주어지면 영향수요 스캔을 O(D)→O(영향수요)로.
+                 (sa_run에서 1회 구축해 전달) 없으면 기존 O(D) 선형 스캔으로 폴백.
     """
     coverage_m = _coverage_radius(network_mode, node_type)
     removed = placement[out_ci]
 
     # 영향받는 수요점: 제거된 BS 또는 추가될 BS의 커버리지 안에 있는 것들
     affected_di: set[int] = set()
-    for di, dp in enumerate(demand):
-        if (_haversine_m(dp.lat, dp.lng, removed.lat, removed.lng) <= coverage_m or
-                _haversine_m(dp.lat, dp.lng, in_cand.lat, in_cand.lng) <= coverage_m):
-            affected_di.add(di)
+    if demand_grid is not None:
+        # 그리드로 후보를 좁히되(투영, 여유 2%), 최종 포함 판정은 원본과 동일한 haversine로 해
+        # 선형 스캔과 정확히 같은 영향수요 집합을 얻는다(투영 경계 오차로 delta가 어긋나지 않게).
+        for src in (removed, in_cand):
+            for di, _d in demand_grid.within(src.lat, src.lng, coverage_m * 1.02):
+                dp = demand[di]
+                if _haversine_m(dp.lat, dp.lng, src.lat, src.lng) <= coverage_m:
+                    affected_di.add(di)
+    else:
+        for di, dp in enumerate(demand):
+            if (_haversine_m(dp.lat, dp.lng, removed.lat, removed.lng) <= coverage_m or
+                    _haversine_m(dp.lat, dp.lng, in_cand.lat, in_cand.lng) <= coverage_m):
+                affected_di.add(di)
 
     if not affected_di:
         return 0.0  # swap이 어떤 수요점도 건드리지 않음
@@ -396,6 +422,14 @@ def sa_run(
     placement = [candidates[i] for i in current]
     current_cost, _ = _full_cost(placement, demand, network_mode, node_type)
 
+    # 수요점은 SA 전 구간 고정 → 그리드를 1회만 만들어 매 반복 delta 평가의 영향수요 스캔에 재사용.
+    # 셀 = 커버 반경(within 조회 반경과 일치). 대규모 수요에서 반복당 O(D)→O(영향수요)로.
+    _demand_grid = SpatialGrid(
+        list(range(len(demand))),
+        coords_fn=lambda di: (demand[di].lat, demand[di].lng),
+        cell_size_m=_coverage_radius(network_mode, node_type),
+    ) if demand else None
+
     best_indices = list(current)
     best_cost = current_cost
     T = T0
@@ -412,7 +446,8 @@ def sa_run(
         in_ci = rng.choice(not_placed)
         in_cand = candidates[in_ci]
 
-        delta = _delta_cost(placement, demand, network_mode, node_type, out_pos, in_cand)
+        delta = _delta_cost(placement, demand, network_mode, node_type, out_pos, in_cand,
+                            demand_grid=_demand_grid)
 
         if delta < 0 or rng.random() < math.exp(-delta / max(T, 1e-6)):
             # 수락
@@ -505,14 +540,16 @@ def optimize_placement(
     n_random: int = 2,
     sa_iter: int = 2000,
     seed: Optional[int] = None,
+    bbox: Optional[dict] = None,
 ) -> PlacementResult:
     """배치 최적화 최상위 진입점.
 
     graph: mock_graph (nodes/adjacency)
     its_links: TRAFFIC_FUSION_ENGINE.current_traffic(time_period)["links"]
     N: 설치할 기지국 수
+    bbox: 주어지면 후보를 그 안으로 제한(사용자 원본 구역 밖 배치 방지).
     """
-    candidates = build_candidates_from_graph(graph, node_type=node_type)
+    candidates = build_candidates_from_graph(graph, node_type=node_type, bbox=bbox)
     if not candidates:
         return PlacementResult(
             time_period=time_period, network_mode=network_mode, node_type=node_type,

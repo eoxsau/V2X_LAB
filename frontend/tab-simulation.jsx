@@ -638,6 +638,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const stationMarkers = useRef({});   // 기지국 마커 풀 (id → circleMarker) — networkTelemetry가 초당 10회 들어와도 매번 재생성하지 않음
   const candidateMarkers = useRef({}); // 후보 노드 마커 풀 (id → circleMarker), 위와 동일한 이유
   const buildingsSigRef = useRef(null); // 직전에 그린 차폐 건물 집합의 서명 — 안 바뀌었으면 폴리곤 다시 안 그림
+  // 기지국 배치 더블클릭 가드 — Leaflet은 더블클릭 시 click 이벤트를 2번 발생시켜(doubleClickZoom:false여도
+  // 중복 click은 안 막힘) 같은 좌표에 기지국이 2개(1·2번) 꽂히던 문제를 막는다. 마지막으로 처리한 클릭의
+  // {시각, 좌표}를 기억했다가 "같은 지점(≈3m) + 400ms 이내" 재클릭이면 두 번째를 무시한다.
+  const lastBsClickRef = useRef(null);
 
   const KR_CENTER = [36.4, 127.9], KR_ZOOM = 7;
 
@@ -1420,7 +1424,17 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
     if (mode === 'bs_create') {
       map.getContainer().style.cursor = 'crosshair';
-      const onClick = (e) => { createStation(e.latlng.lat, e.latlng.lng); };
+      const onClick = (e) => {
+        const { lat, lng } = e.latlng;
+        const now = Date.now();
+        const last = lastBsClickRef.current;
+        // 더블클릭이 뿜는 두 번째 click(같은 지점 ≈3m, 400ms 이내)은 무시 — 한 제스처당 기지국 1개.
+        // 다른 지점을 빠르게 연속 배치하는 정상 동작은 좌표가 달라 차단되지 않는다.
+        if (last && now - last.t < 400 &&
+            Math.abs(lat - last.lat) < 3e-5 && Math.abs(lng - last.lng) < 3e-5) return;
+        lastBsClickRef.current = { t: now, lat, lng };
+        createStation(lat, lng);
+      };
       map.on('click', onClick);
       return () => { map.off('click', onClick); map.getContainer().style.cursor = ''; };
     }
@@ -1486,6 +1500,35 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       }));
     } catch (e) {
       setStationsErr(e.message);
+    }
+  }
+
+  // method: 'random'(블루노이즈 균등) | 'sa'(최적화). counts={bs,rsu}. setBusy로 버튼별 로딩 표시.
+  async function placeNodes(placeMethod, counts, replace, setBusy) {
+    if (!area || (counts.bs + counts.rsu) === 0) return;
+    setStationsErr(null);
+    setBusy(true);
+    try {
+      const res = await fetch(`${api}/network-nodes/auto-place`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          n_bs: counts.bs,
+          n_rsu: counts.rsu,
+          method: placeMethod,
+          network_mode: networkGen.toUpperCase(),
+          spread: 10,
+          replace_existing: replace,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || '배치 실패');
+      await loadStations();
+      if (body.warnings && body.warnings.length) setStationsErr(body.warnings.join(' '));
+    } catch (e) {
+      setStationsErr(e.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1595,6 +1638,26 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [stationType, setStationType] = useState('bs'); // 'bs' | 'rsu' — 생성 버튼 클릭 시 어떤 노드를 만들지
   const tryBsCreate = () => { if (area) setMode(mode === 'bs_create' ? null : 'bs_create'); };
   const tryBsDelete = () => { if (area) setMode(mode === 'bs_delete' ? null : 'bs_delete'); };
+
+  // 배치 방식 — 'manual'(직접 클릭) | 'auto'(랜덤 균등). 최적화(SA)는 별도 섹션.
+  const [placeMode, setPlaceMode] = useState('manual');
+  // 자동 배치(랜덤·블루노이즈) 개수/상태. 항상 '기존 지우고 새로'(replace) — 누적 추가는 미지원.
+  const [autoN, setAutoN] = useState({ bs: 0, rsu: 0 });
+  const [autoPlacing, setAutoPlacing] = useState(false);
+  // 최적화 배치(SA) 개수/상태 — 랜덤과 독립적으로 개수 지정 가능
+  const [saN, setSaN] = useState({ bs: 0, rsu: 0 });
+  const [saPlacing, setSaPlacing] = useState(false);
+  // 통신모드별 목표 간격(m). 5G≈450m→약 5개/km²(2km²당 10개). BS·RSU 동일 밀도(5/km²).
+  const BS_SPACING_M = { '4g': 550, '5g': 450, '6g': 350 };
+  // 구역/모드가 바뀌면 권장 개수 재산출 (사용자가 입력란을 고치면 다음 변경 전까지 그 값 유지)
+  useEffect(() => {
+    if (!area) return;
+    const km2 = areaKm2(area);
+    const s = BS_SPACING_M[networkGen] || 450;
+    const n = Math.max(1, Math.round((km2 * 1e6) / (s * s)));
+    setAutoN({ bs: n, rsu: n });
+    setSaN({ bs: n, rsu: n });
+  }, [area, networkGen]);
 
   // SA 비교군
   const [saCompareRunning, setSaCompareRunning] = useState(false);
@@ -2304,21 +2367,63 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </span>
                 </span>
               </div>
-              <Seg value={stationType} onChange={setStationType}
-                options={[{ v: 'bs', label: 'BS (기지국)' }, { v: 'rsu', label: 'RSU' }]} />
-              {stationType === 'rsu' && (
-                <div className="muted" style={{ fontSize: 10.5 }}>
-                  RSU는 PC5 사이드링크(~1–3ms, 범위 150m) — 교차로에 자동 스냅됩니다
+              {/* 배치 방식 선택 — 수동(직접 클릭) vs 자동(랜덤 균등) */}
+              <Seg value={placeMode} onChange={setPlaceMode}
+                options={[{ v: 'manual', label: '수동 배치' }, { v: 'auto', label: '자동 배치' }]} />
+
+              {/* 수동 배치 — 기존 방식(BS/RSU 선택 후 지도 클릭) */}
+              {placeMode === 'manual' && (
+                <div className="col gap8">
+                  <Seg value={stationType} onChange={setStationType}
+                    options={[{ v: 'bs', label: 'BS (기지국)' }, { v: 'rsu', label: 'RSU' }]} />
+                  {stationType === 'rsu' && (
+                    <div className="muted" style={{ fontSize: 10.5 }}>
+                      RSU는 PC5 사이드링크(~1–3ms, 범위 150m) — 교차로에 자동 스냅됩니다
+                    </div>
+                  )}
+                  <div className="row gap8">
+                    <button className={'btn sm ' + (mode === 'bs_create' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area} onClick={tryBsCreate}>
+                      <Icon.antenna size={13} /> {mode === 'bs_create' ? '지도 클릭…' : (stationType === 'rsu' ? 'RSU 배치' : 'BS 배치')}
+                    </button>
+                    <button className={'btn sm ' + (mode === 'bs_delete' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area || stations.length === 0} onClick={tryBsDelete}>
+                      <Icon.antenna size={13} /> {mode === 'bs_delete' ? '제거할 곳 클릭…' : '제거'}
+                    </button>
+                  </div>
                 </div>
               )}
-              <div className="row gap8">
-                <button className={'btn sm ' + (mode === 'bs_create' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area} onClick={tryBsCreate}>
-                  <Icon.antenna size={13} /> {mode === 'bs_create' ? '지도 클릭…' : (stationType === 'rsu' ? 'RSU 배치' : 'BS 배치')}
-                </button>
-                <button className={'btn sm ' + (mode === 'bs_delete' ? 'accent' : '')} style={{ flex: 1 }} disabled={!area || stations.length === 0} onClick={tryBsDelete}>
-                  <Icon.antenna size={13} /> {mode === 'bs_delete' ? '제거할 곳 클릭…' : '제거'}
-                </button>
-              </div>
+
+              {/* 자동 배치 — 면적 기반 권장 개수로 도로망에 고르게(랜덤·블루노이즈) 배치 */}
+              {placeMode === 'auto' && (
+                <div style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
+                  <div className="muted" style={{ fontSize: 10, marginBottom: 8, lineHeight: 1.45 }}>
+                    {area
+                      ? `면적 ${areaKm2(area).toFixed(1)}km² · ${networkGen.toUpperCase()} 기준 권장값 (수정 가능) — 도로망에 고르게(랜덤) 배치`
+                      : '구역을 먼저 설정하세요'}
+                  </div>
+                  <div className="row gap8" style={{ marginBottom: 8 }}>
+                    <label style={{ flex: 1, fontSize: 11, color: 'var(--ink-2)' }}>
+                      BS
+                      <input type="number" min="0" value={autoN.bs} disabled={!area}
+                        onChange={e => setAutoN(v => ({ ...v, bs: Math.max(0, parseInt(e.target.value) || 0) }))}
+                        style={{ width: '100%', marginTop: 3 }} />
+                    </label>
+                    <label style={{ flex: 1, fontSize: 11, color: 'var(--ink-2)' }}>
+                      RSU
+                      <input type="number" min="0" value={autoN.rsu} disabled={!area}
+                        onChange={e => setAutoN(v => ({ ...v, rsu: Math.max(0, parseInt(e.target.value) || 0) }))}
+                        style={{ width: '100%', marginTop: 3 }} />
+                    </label>
+                  </div>
+                  <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
+                    누르면 기존 배치를 지우고 새로 배치합니다 (번호 1부터).
+                  </div>
+                  <button className="btn sm block accent" disabled={!area || autoPlacing || (autoN.bs + autoN.rsu) === 0}
+                    onClick={() => placeNodes('random', autoN, true, setAutoPlacing)}>
+                    <Icon.antenna size={13} /> {autoPlacing ? '배치 중…' : `배치 (BS ${autoN.bs} · RSU ${autoN.rsu})`}
+                  </button>
+                </div>
+              )}
+
               {stations.length > 0 && (
                 <div className="row gap8">
                   <button className="btn sm block" onClick={reapplyPlacement} title="기존 기지국을 가장 가까운 건물 옥상으로 재배치합니다" style={{ flex: 1 }}>
@@ -2329,6 +2434,37 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </button>
                 </div>
               )}
+
+              {/* 최적화 배치(SA) — 선택창 아래. 지정 개수를 지연 최소화 위치에 배치·저장 */}
+              <div style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
+                <div style={{ fontSize: 11.5, fontWeight: 700, marginBottom: 2 }}>
+                  최적화 배치 <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>— SA로 지연 최소화 위치에</span>
+                </div>
+                <div className="muted" style={{ fontSize: 10, marginBottom: 8, lineHeight: 1.45 }}>
+                  지정 개수를 SA 최적화로 배치합니다. ※ 수요 모델은 아직 임시(ITS 있으면 ITS, 없으면 균일) — radiation model 반영 전.
+                </div>
+                <div className="row gap8" style={{ marginBottom: 8 }}>
+                  <label style={{ flex: 1, fontSize: 11, color: 'var(--ink-2)' }}>
+                    BS
+                    <input type="number" min="0" value={saN.bs} disabled={!area}
+                      onChange={e => setSaN(v => ({ ...v, bs: Math.max(0, parseInt(e.target.value) || 0) }))}
+                      style={{ width: '100%', marginTop: 3 }} />
+                  </label>
+                  <label style={{ flex: 1, fontSize: 11, color: 'var(--ink-2)' }}>
+                    RSU
+                    <input type="number" min="0" value={saN.rsu} disabled={!area}
+                      onChange={e => setSaN(v => ({ ...v, rsu: Math.max(0, parseInt(e.target.value) || 0) }))}
+                      style={{ width: '100%', marginTop: 3 }} />
+                  </label>
+                </div>
+                <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
+                  누르면 기존 배치를 지우고 새로 배치합니다 (번호 1부터).
+                </div>
+                <button className="btn sm block" disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0}
+                  onClick={() => placeNodes('sa', saN, true, setSaPlacing)}>
+                  <Icon.antenna size={13} /> {saPlacing ? '최적화 중…' : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
+                </button>
+              </div>
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
 

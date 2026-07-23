@@ -80,6 +80,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.services.geo.spatial_grid import SpatialGrid
+
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAX_CANDIDATES: int = 5       # maximum outgoing edges per step
@@ -262,6 +264,26 @@ class V2XRoutingEnv:
         self._graph = graph
         self._road_nodes = road_nodes
         self._bs_nodes = bs_nodes
+        # 공간 인덱스 — BS는 에피소드 동안 고정이므로 그리드를 1회만 만들어 매 스텝
+        # 최근접/커버리지 조회를 O(N)→O(1)로. 대규모 배치(수백~수천 노드)에서 학습·평가가
+        # 노드 수에 선형으로 느려지던 병목을 제거한다. (셀 = 전형적 커버 반경 ~400m)
+        self._bs_grid = SpatialGrid(
+            bs_nodes,
+            coords_fn=lambda bs: (float(bs.get("lat", 0.0)), float(bs.get("lng", 0.0))),
+            cell_size_m=400.0,
+        ) if bs_nodes else None
+        self._bs_max_cov_m = max(
+            (float(bs.get("coverage_radius_m", 400.0)) for bs in bs_nodes), default=400.0
+        )
+        # avg/min BS 부하는 에피소드 동안 불변(환경이 부하를 변경하지 않음) → 1회 선계산해
+        # 매 스텝 전체 BS 순회 재계산을 제거한다.
+        _loads = [
+            float(bs.get("load", bs.get("current_load", 0.0)))
+            / max(float(bs.get("capacity", 100.0)), 1.0)
+            for bs in bs_nodes
+        ]
+        self._avg_bs_load = sum(_loads) / len(_loads) if _loads else 0.0
+        self._min_bs_load = min(_loads) if _loads else 0.0
         self._origin_id = origin_id
         self._dest_id = dest_id
         self._buildings_gdf = buildings_gdf
@@ -565,13 +587,9 @@ class V2XRoutingEnv:
         dist_m = _haversine_m(cur_lat, cur_lng, self._dest_lat, self._dest_lng)
         progress = _clip01(1.0 - dist_m / max(self._initial_dist_m, 1.0))
 
-        loads = [
-            float(bs.get("load", bs.get("current_load", 0.0)))
-            / max(float(bs.get("capacity", 100.0)), 1.0)
-            for bs in self._bs_nodes
-        ]
-        avg_load = sum(loads) / len(loads) if loads else 0.0
-        min_load = min(loads) if loads else 0.0
+        # 정적 선계산값(부하는 에피소드 동안 불변)
+        avg_load = self._avg_bs_load
+        min_load = self._min_bs_load
 
         best_bs = self._nearest_bs(cur_lat, cur_lng)
         cur_bs_id = str(best_bs["id"]) if best_bs else None
@@ -710,15 +728,10 @@ class V2XRoutingEnv:
         }
 
     def _nearest_bs(self, lat: float, lng: float) -> Optional[dict]:
-        if not self._bs_nodes:
+        if self._bs_grid is None:
             return None
-        best, best_d = None, float("inf")
-        for bs in self._bs_nodes:
-            d = _haversine_m(lat, lng, float(bs.get("lat", 0)), float(bs.get("lng", 0)))
-            if d < best_d:
-                best_d = d
-                best = bs
-        return best
+        bs, _d = self._bs_grid.nearest(lat, lng)
+        return bs
 
     def _estimate_latency(self, lat: float, lng: float, bs: Optional[dict]) -> float:
         if bs is None:
@@ -738,15 +751,12 @@ class V2XRoutingEnv:
         return _clip01(dist_m / max(2.0 * cov_r, 1.0))
 
     def _future_connectivity(self, edges: list[EdgeInfo]) -> float:
-        if not edges:
+        if not edges or self._bs_grid is None:
             return 0.0
         covered = 0
         for e in edges:
-            for bs in self._bs_nodes:
-                d = _haversine_m(
-                    e.midpoint_lat, e.midpoint_lng,
-                    float(bs.get("lat", 0)), float(bs.get("lng", 0)),
-                )
+            # 커버 반경이 BS마다 다르므로, 최대 반경 안의 BS만 추려(그리드) 각자의 반경으로 판정.
+            for bs, d in self._bs_grid.within(e.midpoint_lat, e.midpoint_lng, self._bs_max_cov_m):
                 if d <= float(bs.get("coverage_radius_m", 400.0)):
                     covered += 1
                     break
