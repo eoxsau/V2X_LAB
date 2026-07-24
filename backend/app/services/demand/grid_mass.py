@@ -33,6 +33,26 @@ class Zone:
     n_buildings: int
 
 
+def cell_of(
+    lat: float,
+    lng: float,
+    cell_size_m: float,
+    ref_lat: float,
+    origin_shift_m: tuple[float, float] = (0.0, 0.0),
+) -> tuple[int, int]:
+    """(lat,lng) → 격자 셀 인덱스 (ix, iy). build_zones와 동일 투영·원점 규칙.
+
+    존(건물)과 엣지(도로)를 같은 셀에 정렬하려면 양쪽 다 이 함수를 써야 한다
+    (TAZ 매핑에서 필수). ref_lat·origin_shift_m 을 build_zones와 동일하게 넘길 것.
+    """
+    coslat = math.cos(math.radians(ref_lat)) or 1e-6
+    x = lng * coslat * _M_PER_DEG_LAT
+    y = lat * _M_PER_DEG_LAT
+    cell = max(float(cell_size_m), 1.0)
+    ox, oy = origin_shift_m
+    return (int(math.floor((x - ox) / cell)), int(math.floor((y - oy) / cell)))
+
+
 def _projector(ref_lat: float):
     coslat = math.cos(math.radians(ref_lat)) or 1e-6
 
