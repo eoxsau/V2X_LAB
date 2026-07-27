@@ -690,7 +690,7 @@ def build_scenario_metadata(state: dict) -> dict:
     {
       scenario_id, batch_id, sheet_id, seed, vehicle_count,
       origin_lat, origin_lng, dest_lat, dest_lng,
-      sim_mode, network_mode, traffic_time_period,
+      sim_mode, network_mode, traffic_time_period, demand_scale_pct,
       route_algorithm, latency_algorithm, allocation_algorithm,
       cost_weights: { w_distance, w_time, w_latency, w_load,
                       w_handover, w_blockage, w_coverage_risk },
@@ -751,7 +751,10 @@ def build_scenario_metadata(state: dict) -> dict:
         # mode
         "sim_mode":                state.get("sim_mode", "idle"),
         "network_mode":            policy.get("network_mode", "5G"),
+        # ⚠️ traffic_time_period는 생성 교통에서는 무의미하다(§2-8). 재현성을 위해
+        # 실제로 수요를 정하는 값은 demand_scale_pct다.
         "traffic_time_period":     policy.get("traffic_time_period", "peak"),
+        "demand_scale_pct":        policy.get("demand_scale_pct", 100.0),
         # algorithms
         "route_algorithm":         policy.get("route_algorithm") or algos_cfg.get("route_algorithm", ""),
         "latency_algorithm":       state.get("latency_algorithm", ""),

@@ -506,7 +506,10 @@ class SimConfigPolicyOptions(BaseModel):
     other_device_lambda:  float = 30.0  # 차량 외 기기 순간 활성 밀도 (기기/km²) — 총 밀도 ~300/km²의 활성 비율 ~10% 적용
                                          # 출처: Gonzalez-Martin et al. IEEE TVT 2019; 3GPP TR 38.901 Urban Macro 시나리오
     network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
-    traffic_time_period:  str   = "peak"  # (폐기 예정) ITS 첨두/비첨두 버킷 — 생성 교통이 대체
+    traffic_time_period:  str   = "peak"  # ⚠️ 폐기 예정. 생성 교통을 쓸 때는 아무 효과가 없다.
+                                         # ITS 첨두/비첨두 버킷 선택용이었으나, 수요는 이제
+                                         # demand_scale_pct + 시간곡선이 정한다(진행문서 §2-8).
+                                         # 프론트가 아직 보내므로 필드만 유지한다.
     demand_scale_pct:     float = 100.0 # 기준 교통량(N*) 대비 %. 10~300. 생성 교통의 총 통행 수를 정한다.
                                          # N*는 구역마다 자동 산정(demand/calibration.py, 진행문서 §5-C).
                                          # 100% = 정체가 "생겼다 풀리는" 수준.
@@ -4530,10 +4533,19 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
         (_state.get("policy_options") or {}).get("other_device_lambda", 300.0),
         _rng,
     )
-    _seed_its_congestion_load(
-        _state.get("network_nodes") or [],
-        (_state.get("policy_options") or {}).get("traffic_time_period", "peak"),
-    )
+    # ITS 혼잡도를 기지국 부하로 환산하는 경로 — **생성 교통을 쓸 때는 건너뛴다.**
+    # 생성 교통에서는 배경 차량이 이미 _refresh_realtime_bs_vehicle_counts로 기지국에
+    # 배정돼 부하를 만든다. 여기에 ITS 혼잡도까지 더하면 같은 혼잡을 두 번 세는 셈이다
+    # (진행문서 §2-8 — ITS 동기화를 제거하기로 한 것과 같은 이유).
+    if current_traffic_scenario(build=False) is None:
+        _seed_its_congestion_load(
+            _state.get("network_nodes") or [],
+            (_state.get("policy_options") or {}).get("traffic_time_period", "peak"),
+        )
+    else:
+        for _n in (_state.get("network_nodes") or []):
+            _n["its_congestion_score"] = 0.0
+            _n["n_its_load"] = 0
     # algorithm_config uses frontend key names (latency, resource_allocation) and
     # backend key names (latency_algorithm, allocation_algorithm) — accept both.
     _lat_alg = (
@@ -6350,13 +6362,24 @@ async def optimize_placement_endpoint(req: PlacementOptimizeRequest):
     mode = req.network_mode if req.network_mode in ("4G", "5G", "6G") else "5G"
     ntype = req.node_type if req.node_type in ("bs", "rsu") else "bs"
 
+    # 생성 교통이 있으면 수요는 **한 벌뿐**이다 — 첨두/비첨두라는 두 버킷이 없다.
+    # 피크 스냅샷 하나로 최적화하고, 응답에는 같은 결과를 두 키에 담는다.
+    # (진행문서 §2-8에서 첨두↔비첨두 비교 화면을 없애기로 결정했으나, 프론트 정리는
+    #  아직이라 응답 형태를 유지해 화면이 깨지지 않게 한다. `demand_source`로 구분 가능.)
+    _scn = await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
+    _gen_demand = _scn.demand_points if (_scn is not None and _scn.demand_points) else None
+    _periods = ("peak",) if _gen_demand else ("peak", "off_peak")
+
     results = {}
-    for period in ("peak", "off_peak"):
-        try:
-            its_data = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=period)
-            its_links = (its_data or {}).get("links") or []
-        except Exception:
+    for period in _periods:
+        if _gen_demand:
             its_links = []
+        else:
+            try:
+                its_data = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=period)
+                its_links = (its_data or {}).get("links") or []
+            except Exception:
+                its_links = []
 
         result = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -6371,6 +6394,7 @@ async def optimize_placement_endpoint(req: PlacementOptimizeRequest):
                 n_random=req.n_random,
                 sa_iter=req.sa_iter,
                 seed=req.seed,
+                demand=_gen_demand,
             ),
         )
         results[period] = {
@@ -6388,7 +6412,7 @@ async def optimize_placement_endpoint(req: PlacementOptimizeRequest):
         }
 
     peak = results["peak"]
-    off = results["off_peak"]
+    off = results.get("off_peak", peak)   # 생성 교통이면 수요가 한 벌이라 같은 결과
     # 두 최적 배치 간 겹치는 위치 수
     peak_ids = {p["id"] for p in peak["placed"]}
     off_ids  = {p["id"] for p in off["placed"]}
@@ -6398,12 +6422,16 @@ async def optimize_placement_endpoint(req: PlacementOptimizeRequest):
         "ok": True,
         "peak": peak,
         "off_peak": off,
+        # 수요 출처를 명시한다 — "generated"면 첨두/비첨두 비교는 의미가 없다(같은 결과).
+        "demand_source": "generated" if _gen_demand else "its_or_uniform",
+        "demand_summary": _scn.to_summary() if _scn is not None else None,
         "comparison": {
             "overlap_count": overlap_count,
             "overlap_pct": round(overlap_count / max(n, 1) * 100, 1),
             "peak_cost_ms": peak["cost_final_ms"],
             "off_peak_cost_ms": off["cost_final_ms"],
             "cost_diff_ms": round(peak["cost_final_ms"] - off["cost_final_ms"], 3),
+            "identical": bool(_gen_demand),
         },
     }
 
@@ -6461,12 +6489,17 @@ async def compare_placement_with_sa(req: PlacementCompareRequest):
     if not edge_data:
         raise HTTPException(status_code=400, detail="경로를 계산할 수 없습니다. 먼저 시뮬레이션을 실행하여 경로를 설정하세요.")
 
-    # ── 3. ITS 교통량 조회 ──────────────────────────────────────────────────
-    try:
-        its_data  = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=req.traffic_time_period)
-        its_links = (its_data or {}).get("links") or []
-    except Exception:
+    # ── 3. 수요 확보 — 생성 교통이 1순위, 없으면 ITS ────────────────────────
+    _scn = await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
+    _gen_demand = _scn.demand_points if (_scn is not None and _scn.demand_points) else None
+    if _gen_demand:
         its_links = []
+    else:
+        try:
+            its_data  = TRAFFIC_FUSION_ENGINE.current_traffic(time_period=req.traffic_time_period)
+            its_links = (its_data or {}).get("links") or []
+        except Exception:
+            its_links = []
 
     # ── 4. SA 최적화 실행 ───────────────────────────────────────────────────
     sa_placed_bs:  list[dict] = []
@@ -6482,6 +6515,7 @@ async def compare_placement_with_sa(req: PlacementCompareRequest):
             network_mode=mode,
             node_type=node_type,
             time_period=req.traffic_time_period,
+            demand=_gen_demand,
             n_greedy=req.n_greedy,
             n_random=req.n_random,
             sa_iter=req.sa_iter,
