@@ -78,6 +78,7 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
 | `geo/spatial_grid.py` | 순수파이썬 공간 해시 그리드 (scipy 없이 O(1) 최근접/반경) | `SpatialGrid(items, coords_fn, cell_size_m).nearest()/within()/add()` |
 | `demand/grid_mass.py` | §3·§4 격자 존 + 건물 질량 | `build_zones(buildings=[(lat,lng,mass)], cell_size_m, ref_lat, origin_shift_m) → [Zone]`; `cell_of(lat,lng,cell,ref_lat,shift)`; `zone_stats()` |
 | `demand/radiation.py` | §6 radiation OD | `radiation_od_matrix(masses, coords, total_trips, lam=0.9999) → [ODFlow(i,j,trips)]`; `od_summary()` |
+| **`demand/pipeline.py`** | **§7 오케스트레이터** | **`generate_demand(net_file, out_dir, total_trips, ..., time_profile=None) → DemandResult`** — net.xml 하나로 routes.xml까지. 함정 4개(net_bbox·parquet 직접·ASCII 스테이징·최대 SCC) 전부 내부 흡수. `DemandResult.survival_rate/routing_rate/stats`; `od_time_slices()`; `ascii_temp_base()`; `sumo_binary()` |
 | `demand/assignment.py` | §7·§8 배정 준비 | `read_net(path)`(한 번 읽어 재사용); **`net_bbox(net, margin_m=300)`** (실제 도로 범위 — 건물 조회 bbox는 반드시 이걸로); **`build_taz(net, cell, ref_lat, largest_component_only=True)`** (최대 승용차 SCC만 담음); **`component_summary(net)`** (고립 섬 진단); `write_taz_xml()`; **`write_od_o_format(..., keep_intra_zone=True)`** (o==d 살림); **`map_zones_to_taz(zones, taz, cell_size_m, max_reassign_m=900)`** (도로 없는 존 → 최근접 도로존 재배정); **`taz_mapping_summary()`** (자기셀/재배정/버림 진단) |
 
 > `Zone`: `ix, iy, center_lat, center_lng, mass, n_buildings`. 존↔엣지 정렬은 **동일 `ref_lat`·
@@ -379,7 +380,13 @@ Overpass가 bbox에 걸친 way의 **전 노드**를 반환하므로, 멀리 뻗�
   ```
 - **od2trips 반올림:** OD 라인마다 소수 통행을 정수로 반올림하므로 총량이 몇 % 넘칠 수 있다
   (안양·의왕 라인 2,352개 → 생존율 100.6%). 100%를 넘어도 오류가 아니다.
-- **O-format:** 첫 줄 `$OR;D2`, 다음 `begin_h end_h`(시 단위), `factor`, 이후 `origin dest count`.
+- **⚠️ O-format 시각은 `HH.MM`(시.분)이다 — 소수 시간이 아니다 (2026-07-27 실측):**
+  `7.00 7.30` → 정확히 **1800초** 창, `7.00 7.50` → **3000초** 창. 즉 `7.50`은 7.5시간이
+  아니라 **7시 50분**. 정시(7.0/8.0)만 쓰는 동안엔 우연히 맞아떨어져 안 드러나고,
+  시간대 슬라이스를 넣는 순간 구간이 겹치고 창 밖으로 샌다.
+  `write_od_o_format`은 **소수 시간을 받아 내부에서 `_hhmm()`으로 변환**하므로 호출부는
+  그냥 `7.5`(=7시 30분)라고 넘기면 된다.
+- **O-format:** 첫 줄 `$OR;D2`, 다음 `begin_h end_h`(**HH.MM**), `factor`, 이후 `origin dest count`.
 - **TAZ 파일:** `<tazs><taz id="ix_iy"><tazSource id=edge weight=len/><tazSink .../></taz></tazs>`.
 - **CRS:** 건물 parquet 4326. 면적은 `to_crs(5186).area`. 원본 shp는 5186.
 - **건물 파일명 NFD:** `os.listdir`가 자모분리형 반환 → `unicodedata.normalize('NFC', s)` 후 매칭.
@@ -410,16 +417,20 @@ backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py area-1b5adb59
 기대값 — 영등포: 존 61 / OD적재 95.7% / trip 4812 / 차량 4812(100%) / 최종 **96.2%**.
 안양·의왕: 존 49 / OD적재 100% / trip 5030 / 차량 5030(100%) / 최종 **100.6%**.
 
-1. **오케스트레이터 모듈화** — `smoke_demand_pipeline.py`의 흐름을 `backend/app/services/demand/`
-   아래 정식 모듈로. 모듈 3개는 **아직 앱 어디에서도 import되지 않는다**(고아 상태 —
-   스모크 스크립트만 씀). od2trips만 ASCII 스테이징(§7), 건물은 parquet 직접(§4),
-   bbox는 `net_bbox`(§5-A 해결 4).
-2. **시간대 OD 슬라이스** — `write_od_o_format`이 이미 `begin_h/end_h/factor`를 받으므로
-   24h 곡선(`시간대_프로파일.csv`)으로 **반복 호출**만 하면 됨.
+1. ~~**오케스트레이터 모듈화**~~ → ✅ **완료** (커밋 `b627ecc`). `demand/pipeline.py`의
+   `generate_demand()` 하나로 net.xml → routes.xml. 함정 4개 내부 흡수.
+   그 과정에서 **O-format 시각이 `HH.MM`** 이라는 걸 발견해 고쳤다(§7).
+2. **시간대 OD 슬라이스 적용** — 배관은 완성됐다(`time_profile` 인자 + `od_time_slices()`,
+   3구간 검증 완료). 남은 건 **24h 곡선(`시간대_프로파일.csv`)을 읽어 창에 맞게 잘라
+   넘기는 것**과 **창 길이 결정**(§6).
 3. **동적 SUMO** — 예열 → 피크 스냅샷 → 엣지별 교통량 → 배치 수요.
    ⚠️ `sumo` 본체의 한글 경로 내성은 **아직 미검증**(§7) — 여기서 확인할 것.
-4. **N\* 레벨 튜닝** — 이제 가능하다. 생존율이 안정됐으므로 `TOTAL_TRIPS`를 올려가며
+   (`pipeline.ascii_temp_base()`가 이미 있으니 필요하면 그대로 재사용.)
+4. **N\* 레벨 튜닝** — 이제 가능하다. 생존율이 안정됐으므로 `total_trips`를 올려가며
    피크가 도로 용량을 넘는 지점을 찾는다(v2 §5-1·§5-3).
-5. **UI 정리** — ITS·첨두/비첨두 제거, 수요 배율 n 노브. **프론트는 반드시 상의 후 함께.**
+5. **앱 배선** — `generate_demand`를 `main.py`에 연결(구역·시나리오당 1회 + 캐시).
+   `_inject_bg_vehicle`(균일 랜덤) → 생성 교통, `build_demand_from_graph`(균일 5.0) →
+   피크 스냅샷 밀도.
+6. **UI 정리** — ITS·첨두/비첨두 제거, 수요 배율 n 노브. **프론트는 반드시 상의 후 함께.**
 
 > 참고 명령/데이터는 §4·§5·§7에 다 있음. 모듈은 `backend/app/services/demand/`에 준비됨.
