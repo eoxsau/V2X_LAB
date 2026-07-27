@@ -405,6 +405,7 @@ if FRONTEND_DIR.exists():
 _state = {
     "network_ready": False,
     "net_file": None,      # path to .net.xml
+    "traffic_preparing": False,  # 백그라운드 교통 준비 중 여부
     "traffic_scenario": None,  # demand.scenario.TrafficScenario — 생성 교통 1세트(구역·배율당 1회)
     "osm_file": None,      # path to downloaded .osm
     "mock_graph": None,    # parsed OSM road graph for fallback mode
@@ -3193,6 +3194,51 @@ def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] 
     )
 
 
+def _prepare_traffic_async() -> None:
+    """구역 설정 직후 백그라운드로 교통(N* 포함)을 미리 만들어 둔다.
+
+    N* 보정은 시뮬을 5~6회 돌리므로 처음 한 번은 수 분이 걸린다. 이걸 첫 시뮬레이션
+    시작이나 첫 배치 때까지 미루면 사용자가 버튼을 누른 뒤 몇 분을 기다리게 되고,
+    무엇보다 **수요 배율 UI가 "총 몇 대"인지 표시할 수 없다**(N*를 모르므로).
+    구역을 정하는 순간부터 백그라운드로 돌려두면 사용자가 출발지·도착지를 찍는 동안
+    끝나 있을 가능성이 높다.
+    """
+    def _run():
+        try:
+            _state["traffic_preparing"] = True
+            current_traffic_scenario()
+        except Exception as exc:
+            print(f"[DEMAND] 백그라운드 교통 준비 실패: {exc}", flush=True)
+        finally:
+            _state["traffic_preparing"] = False
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@app.get("/api/demand/status")
+async def demand_status():
+    """수요 배율 UI가 쓰는 상태 — N*와 현재 배율에서의 예상 차량 수.
+
+    `ready=false`면 아직 준비 중(N* 보정에 수 분). 프론트는 폴링해서
+    준비되면 총 차량 수를 표시한다.
+    """
+    pol = _state.get("policy_options") or {}
+    pct = float(pol.get("demand_scale_pct", 100.0))
+    sc = current_traffic_scenario(build=False)
+    if sc is None:
+        return {
+            "ready": False,
+            "preparing": bool(_state.get("traffic_preparing")),
+            "demand_scale_pct": pct,
+            "network_ready": bool(_state.get("network_ready")),
+        }
+    return {
+        "ready": True,
+        "preparing": False,
+        "demand_scale_pct": pct,
+        **sc.to_summary(),
+    }
+
+
 def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     """Convert OSM to SUMO network with netconvert.
 
@@ -4286,6 +4332,7 @@ async def setup_network(req: SetupRequest):
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
             _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
+            _prepare_traffic_async()            # N* 포함 교통을 미리 만들어 둔다(백그라운드)
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e}
@@ -4478,6 +4525,7 @@ async def setup_network_region(req: RegionSetupRequest):
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
             _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
+            _prepare_traffic_async()            # N* 포함 교통을 미리 만들어 둔다(백그라운드)
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {

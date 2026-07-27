@@ -666,19 +666,18 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [openAlgorithmGroup, setOpenAlgorithmGroup] = useState(null);
   const [selectedAlgorithms, setSelectedAlgorithms] = useState(DEFAULT_ALGORITHM_SELECTION);
   const [networkGen, setNetworkGen] = useState('5g'); // 4g · 5g · 6g — UI only, not wired to backend
-  const [vehicleCount, setVehicleCount] = useState(1); // 다중차량 실험군 — 타겟 1대 + 배경 차량 (vehicleCount - 1)대
-
-  // ITS 첨두/비첨두 교통 — Pro 전용. 어느 버킷을 이번 시뮬레이션에 쓸지(트래픽 편향/배경차량 샘플링).
-  const [trafficPeriod, setTrafficPeriod] = useState(() => simConfig?.policy_options?.traffic_time_period || 'peak');
-  const [trafficSyncing, setTrafficSyncing] = useState(false);
-  const [trafficSyncInfo, setTrafficSyncInfo] = useState(null);
-  const [trafficSyncError, setTrafficSyncError] = useState(null);
-  // 시트 전환 시 loadSheetConfig가 simConfig를 통째로 교체하므로, 거기 실려온
-  // traffic_time_period로 셀렉터 표시를 맞춘다(없으면 기존 값 유지).
+  // 교통량 배율(%) — 기준 교통량 N*의 몇 %를 흘릴지. 10~300.
+  // 예전의 "다중 차량 대수"를 대체한다. 배경 차량 대수는 이제 입력이 아니라 **결과**다
+  // (N* × 배율과 24h 시간곡선이 정하고, 동시 주행 대수는 Little's Law로 따라옴).
+  const [demandScalePct, setDemandScalePct] = useState(
+    () => simConfig?.policy_options?.demand_scale_pct ?? 100);
+  // 백엔드가 준 N*·예상 차량 수. 구역 설정 직후엔 준비 중일 수 있어 폴링한다.
+  const [demandStatus, setDemandStatus] = useState(null);
+  // 시트 전환 시 simConfig가 통째로 바뀌므로 슬라이더 표시를 거기 맞춘다.
   useEffect(() => {
-    const p = simConfig?.policy_options?.traffic_time_period;
-    if (p) setTrafficPeriod(p);
-  }, [simConfig?.policy_options?.traffic_time_period]);
+    const v = simConfig?.policy_options?.demand_scale_pct;
+    if (v != null) setDemandScalePct(v);
+  }, [simConfig?.policy_options?.demand_scale_pct]);
   const [openPanel, setOpenPanel] = useState('control'); // null · 'control' · 'scenario' — 우측 FAB로 띄우는 플로팅 패널, 처음 열 때는 컨트롤 패널이 기본으로 열려있음
 
   // ── 행정구역 선택 (전국 OSM PBF 기반) ──────────────────────────
@@ -710,7 +709,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     : (simLogs || []);
 
   function currentConfigSnapshot() {
-    return { origin, dest, vehicleCount, selectedAlgorithms, networkGen, simConfig };
+    return { origin, dest, demandScalePct, selectedAlgorithms, networkGen, simConfig };
   }
 
   function loadSheetConfig(sheet) {
@@ -751,9 +750,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     // 웹소켓 위치 업데이트가 새로 만든 시트로 잘못 캡처된다.
     if (sim.running) { try { await fetch(`${api}/api/simulation/stop`, { method: 'POST' }); } catch (_) {} }
 
-    // 새 시트 config: 공유 환경(origin/dest/vehicleCount)은 현재 전역값으로 초기화,
+    // 새 시트 config: 공유 환경(origin/dest/demandScalePct)은 현재 전역값으로 초기화,
     // 알고리즘은 기본값으로 리셋 — mini map 표시 및 배치 실행에 origin/dest 참조 가능하도록 저장.
-    const blankConfig = { origin, dest, vehicleCount, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig };
+    const blankConfig = { origin, dest, demandScalePct, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig };
     const newSheet = { id: `sheet-${Date.now()}`, name: `Sheet ${sheets.length + 1}`, config: blankConfig, result: null, status: 'draft' };
     const next = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s).concat(newSheet);
     setSheets(next); saveSimSheets(next);
@@ -824,7 +823,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }, [vehiclePos?.arrived]);
 
   async function runAllSheetsAsBatch() {
-    // 공유 환경(origin/dest/vehicleCount)이 설정된 경우에만 배치 실행 가능
+    // 공유 환경(origin/dest/demandScalePct)이 설정된 경우에만 배치 실행 가능
     if (!origin || !dest) { setBatchError('출발지·도착지를 먼저 설정하세요.'); return; }
 
     const allSheets = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
@@ -837,7 +836,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         mode: 'route_metrics',
         origin: origin,
         dest: dest,
-        vehicle_count: vehicleCount,
+        vehicle_count: 1,   // 타겟 차량만. 배경 차량은 demand_scale_pct가 정한다(백엔드 생성 교통)
         algorithm_config: s.config.selectedAlgorithms || {},
         simulation_config: {
           ...(s.config.simConfig || {}),
@@ -940,7 +939,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         mode: 'route_metrics',
         source: 'param_batch',
         origin, dest,
-        vehicle_count: vehicleCount,
+        vehicle_count: 1,   // 타겟 차량만. 배경 차량은 demand_scale_pct가 정한다(백엔드 생성 교통)
         algorithm_config: selectedAlgorithms,
         simulation_config: cfgOverride,
       };
@@ -1524,6 +1523,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       const body = await res.json();
       if (!res.ok) throw new Error(body.detail || '배치 실패');
       await loadStations();
+      setPlaceResult(body.optimization || null);
       if (body.warnings && body.warnings.length) setStationsErr(body.warnings.join(' '));
     } catch (e) {
       setStationsErr(e.message);
@@ -1544,7 +1544,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           origin,
           dest,
           network_mode: networkGen.toUpperCase(),
-          traffic_time_period: trafficPeriod || 'peak',
           n_greedy: 2,
           n_random: 2,
           sa_iter: 2000,
@@ -1599,29 +1598,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }
 
-  /* ── ITS 첨두/비첨두 교통 동기화 (Pro 전용) ───────────────────── */
-  async function syncTraffic() {
-    if (!area) return;
-    setTrafficSyncing(true);
-    setTrafficSyncError(null);
-    try {
-      const res = await fetch(`${api}/traffic/sync-its`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bbox: { minX: area.w, maxX: area.e, minY: area.s, maxY: area.n },
-          time_period: trafficPeriod,
-        }),
-      });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.detail || 'ITS 동기화 실패');
-      setTrafficSyncInfo(body);
-    } catch (e) {
-      setTrafficSyncError(e.message);
-    } finally {
-      setTrafficSyncing(false);
-    }
-  }
+  /* ── 교통 준비 상태 폴링 ──────────────────────────────────────
+     구역을 정하면 백엔드가 백그라운드로 교통을 만든다(N* 보정 포함, 처음엔 수 분).
+     준비되면 N*와 예상 차량 수를 받아 배율 슬라이더 옆에 띄운다. */
+  useEffect(() => {
+    if (!area) { setDemandStatus(null); return; }
+    let alive = true;
+    const tick = async () => {
+      try {
+        const res = await fetch(`${api}/demand/status`);
+        if (!res.ok) return;
+        const body = await res.json();
+        if (alive) setDemandStatus(body);
+      } catch { /* 준비 중 네트워크 오류는 무시 — 다음 틱에 다시 본다 */ }
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, [area, api]);
 
   /* ── button actions ──────────────────────────────────────────── */
   const tryArea   = () => setMode(mode === 'area' ? null : 'area');
@@ -1641,6 +1635,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
 
   // 배치 방식 — 'manual'(직접 클릭) | 'auto'(랜덤 균등). 최적화(SA)는 별도 섹션.
   const [placeMode, setPlaceMode] = useState('manual');
+  // 최적화 배치 결과 진단 — 백엔드 auto-place 응답의 optimization 블록
+  const [placeResult, setPlaceResult] = useState(null);
   // 자동 배치(랜덤·블루노이즈) 개수/상태. 항상 '기존 지우고 새로'(replace) — 누적 추가는 미지원.
   const [autoN, setAutoN] = useState({ bs: 0, rsu: 0 });
   const [autoPlacing, setAutoPlacing] = useState(false);
@@ -1721,7 +1717,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             ...(simConfig || {}),
             policy_options: { ...(simConfig?.policy_options || {}), network_mode: networkGen.toUpperCase() },
           },
-          vehicle_count: vehicleCount,
+          vehicle_count: 1,   // 타겟 차량만. 배경 차량은 demand_scale_pct가 정한다(백엔드 생성 교통)
           // DB simulation_runs에 이 런을 시트별로 태깅 — 시트 이름으로 분리해서 조회/비교할 수 있게.
           sheet_id: sheets[activeSheetIdx]?.id || null,
           sheet_name: sheets[activeSheetIdx]?.name || null,
@@ -1767,7 +1763,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSheets(prev => {
       const next = prev.map((s, i) => i === activeSheetIdx ? {
         ...s,
-        config: { origin: null, dest: null, vehicleCount: 1, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig },
+        config: { origin: null, dest: null, demandScalePct: 100, selectedAlgorithms: DEFAULT_ALGORITHM_SELECTION, networkGen, simConfig },
         result: null,
         status: 'draft',
       } : s);
@@ -1929,9 +1925,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             <LegendRow shape="circle" color="#FF8F00" label="RSU">
               <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{stations.filter(s=>s.node_type==='rsu').length}개</span>
             </LegendRow>
-            {vehicleCount > 1 && (
+            {(backgroundVehicles?.length || 0) > 0 && (
               <LegendRow shape="circle" color="#9AA5B1" label="배경 차량">
-                <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{backgroundVehicles?.length || 0}대</span>
+                <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{backgroundVehicles.length}대</span>
               </LegendRow>
             )}
           </div>
@@ -2249,26 +2245,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             )}
           </div>
 
-          {/* ITS 첨두/비첨두 교통 동기화 — Pro 전용 (학부생 대상 Lite는 기본값 '첨두시'를 조용히 사용) */}
-          {appMode === 'pro' && (
-            <div className="field">
-              <label>실시간 교통 데이터 <span className="en">ITS TRAFFIC</span></label>
-              <Seg value={trafficPeriod} onChange={(v) => {
-                setTrafficPeriod(v);
-                setSimConfig(cfg => ({ ...(cfg || {}), policy_options: { ...(cfg?.policy_options || {}), traffic_time_period: v } }));
-              }} options={[{ v: 'peak', label: '첨두시' }, { v: 'off_peak', label: '비첨두시' }]} />
-              <div className="row gap8" style={{ marginTop: 8 }}>
-                <button className="btn sm" disabled={!area || trafficSyncing} onClick={syncTraffic}>
-                  {trafficSyncing ? '동기화 중…' : <><Icon.reset size={13} /> ITS 동기화</>}
-                </button>
-                {trafficSyncInfo?.last_sync_time && (
-                  <Chip tone="good" dot>마지막 동기화 {new Date(trafficSyncInfo.last_sync_time).toLocaleTimeString('ko-KR')}</Chip>
-                )}
-              </div>
-              {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 4 }}>먼저 구역을 설정하세요</div>}
-              {trafficSyncError && <div style={{ fontSize: 10.5, marginTop: 4, color: 'var(--bad)' }}>{trafficSyncError}</div>}
-            </div>
-          )}
+          {/* ITS 동기화 + 첨두/비첨두 셀렉터는 제거됨 (2026-07-27).
+              교통은 이제 건물 질량 → radiation OD → SUMO로 생성하며, 시간대별 분포는
+              24시간 곡선이 담당한다. ITS 속도 덮어쓰기는 생성 교통과 같은 혼잡을 두 번
+              세는 것이라 백엔드에서도 건너뛴다. 대신 아래 "교통량" 배율 노브가 대체한다. */}
 
           {/* waypoints */}
           <div className="field">
@@ -2300,34 +2280,66 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           </div>
           )}
 
-          {/* multi-vehicle experimental group — background vehicle count */}
+          {/* 교통량 — 기준 교통량(N*) 대비 배율. 예전 "다중 차량 대수"를 대체한다.
+              대수는 이제 입력이 아니라 결과다(N* × 배율 × 24h 곡선 → Little's Law). */}
           <div className="field">
-            <label>다중 차량 대수 <span className="en">VEHICLE COUNT</span></label>
-            <input
-              className="input"
-              type="number"
-              min="1"
-              max="20000"
-              step="1"
-              value={vehicleCount}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10);
-                setVehicleCount(Number.isFinite(v) ? Math.max(1, v) : 1);
-              }}
-              onBlur={(e) => {
-                const v = parseInt(e.target.value, 10);
-                setVehicleCount(Number.isFinite(v) && v >= 1 ? v : 1);
-              }}
-              style={{ width: '100%' }}
-            />
-            {vehicleCount > 1 && (
-              <div className="muted" style={{ fontSize: 10.5, marginTop: 4 }}>
-                타겟 차량 1대 + 배경 차량 {vehicleCount - 1}대가 구역 안을 무작위로 이동하며 기지국 자원할당에 함께 반영됩니다.
+            <label>교통량 <span className="en">DEMAND SCALE</span></label>
+            <div className="row" style={{ alignItems: 'center', gap: 10 }}>
+              <input
+                type="range" min="10" max="300" step="5"
+                value={demandScalePct}
+                disabled={!area}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  setDemandScalePct(v);
+                  setSimConfig(cfg => ({ ...(cfg || {}), policy_options: {
+                    ...(cfg?.policy_options || {}), demand_scale_pct: v } }));
+                }}
+                style={{ flex: 1 }}
+              />
+              <span className="num" style={{ minWidth: 52, textAlign: 'right', fontWeight: 600 }}>
+                {demandScalePct}%
+              </span>
+            </div>
+
+            {/* 총 차량 수 — N*가 준비돼야 계산할 수 있다 */}
+            {!area ? (
+              <div className="muted" style={{ fontSize: 10.5, marginTop: 6 }}>먼저 구역을 설정하세요</div>
+            ) : !demandStatus?.ready ? (
+              <div className="muted" style={{ fontSize: 10.5, marginTop: 6 }}>
+                {demandStatus?.preparing
+                  ? '기준 교통량(N*)을 산정하는 중입니다… 처음 한 번은 몇 분 걸립니다.'
+                  : '교통 준비 대기 중…'}
               </div>
-            )}
-            {vehicleCount > 2000 && (
-              <div className="muted" style={{ fontSize: 10.5, marginTop: 4, color: 'var(--warn)' }}>
-                대수가 많을수록 도로 규모에 비해 비현실적인 혼잡이 발생할 수 있습니다 (시작 시 서버가 안내 메시지를 표시합니다).
+            ) : (
+              <div style={{ fontSize: 10.5, marginTop: 6 }}>
+                <div>
+                  기준 교통량 <span className="num">{demandStatus.n_star?.toLocaleString()}</span>
+                  {' × '}{demandScalePct}% ={' '}
+                  <span className="num" style={{ fontWeight: 600 }}>
+                    약 {Math.round((demandStatus.n_star || 0) * demandScalePct / 100).toLocaleString()}대
+                  </span>
+                  <span className="muted"> / 창(07:00~09:00)</span>
+                </div>
+                {demandScalePct === demandStatus.demand_scale_pct && (
+                  <div className="muted" style={{ marginTop: 2 }}>
+                    실제 생성 {demandStatus.n_vehicles?.toLocaleString()}대
+                    {demandStatus.vehicle_count_error_pct != null &&
+                      Math.abs(demandStatus.vehicle_count_error_pct) >= 10 && (
+                      <span style={{ color: 'var(--warn)' }}>
+                        {' '}({demandStatus.vehicle_count_error_pct > 0 ? '+' : ''}
+                        {demandStatus.vehicle_count_error_pct}% — 배율이 낮으면 오차가 커집니다)
+                      </span>
+                    )}
+                    {' · 동시 주행 피크 '}
+                    <span className="num">{demandStatus.peak_running?.toLocaleString()}</span>대
+                  </div>
+                )}
+                {demandScalePct !== demandStatus.demand_scale_pct && (
+                  <div className="muted" style={{ marginTop: 2 }}>
+                    시뮬레이션을 시작하면 이 배율로 교통을 다시 만듭니다.
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -2367,9 +2379,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </span>
                 </span>
               </div>
-              {/* 배치 방식 선택 — 수동(직접 클릭) vs 자동(랜덤 균등) */}
+              {/* 배치 방식 — 수동 / 랜덤 / 최적화 세 가지를 같은 위상으로 (2026-07-27 통일).
+                  예전엔 [수동|자동] 셀렉터 아래에 최적화 배치가 따로 떠 있어 위상이 어긋났다. */}
               <Seg value={placeMode} onChange={setPlaceMode}
-                options={[{ v: 'manual', label: '수동 배치' }, { v: 'auto', label: '자동 배치' }]} />
+                options={[{ v: 'manual', label: '수동' }, { v: 'random', label: '랜덤' }, { v: 'sa', label: '최적화' }]} />
 
               {/* 수동 배치 — 기존 방식(BS/RSU 선택 후 지도 클릭) */}
               {placeMode === 'manual' && (
@@ -2392,8 +2405,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 </div>
               )}
 
-              {/* 자동 배치 — 면적 기반 권장 개수로 도로망에 고르게(랜덤·블루노이즈) 배치 */}
-              {placeMode === 'auto' && (
+              {/* 랜덤 배치 — 면적 기반 권장 개수로 도로망에 고르게(블루노이즈) 뿌린다 */}
+              {placeMode === 'random' && (
                 <div style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
                   <div className="muted" style={{ fontSize: 10, marginBottom: 8, lineHeight: 1.45 }}>
                     {area
@@ -2435,13 +2448,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 </div>
               )}
 
-              {/* 최적화 배치(SA) — 선택창 아래. 지정 개수를 지연 최소화 위치에 배치·저장 */}
+              {/* 최적화 배치(SA) — 생성 교통의 피크 스냅샷을 수요로 써서 지연 최소화 */}
+              {placeMode === 'sa' && (
               <div style={{ padding: '10px 12px', background: 'var(--surface-2)', borderRadius: 9, border: '1px solid var(--border)' }}>
-                <div style={{ fontSize: 11.5, fontWeight: 700, marginBottom: 2 }}>
-                  최적화 배치 <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>— SA로 지연 최소화 위치에</span>
-                </div>
                 <div className="muted" style={{ fontSize: 10, marginBottom: 8, lineHeight: 1.45 }}>
-                  지정 개수를 SA 최적화로 배치합니다. ※ 수요 모델은 아직 임시(ITS 있으면 ITS, 없으면 균일) — radiation model 반영 전.
+                  생성 교통의 가장 붐비는 시점을 수요로 삼아, BS와 RSU를 <b>함께</b> 최적화합니다.
+                  BS는 건물 옥상, RSU는 교차로가 후보입니다.
                 </div>
                 <div className="row gap8" style={{ marginBottom: 8 }}>
                   <label style={{ flex: 1, fontSize: 11, color: 'var(--ink-2)' }}>
@@ -2460,11 +2472,26 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
                   누르면 기존 배치를 지우고 새로 배치합니다 (번호 1부터).
                 </div>
-                <button className="btn sm block" disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0}
+                <button className="btn sm block accent" disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0}
                   onClick={() => placeNodes('sa', saN, true, setSaPlacing)}>
-                  <Icon.antenna size={13} /> {saPlacing ? '최적화 중…' : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
+                  <Icon.antenna size={13} /> {saPlacing ? '최적화 중… (건물 차폐 계산 포함, 수십 초)' : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
                 </button>
+                {placeResult && (
+                  <div style={{ fontSize: 10, marginTop: 8, lineHeight: 1.5 }}>
+                    <div>무작위 배치 <span className="num">{placeResult.random_baseline_ms?.toFixed(1)}</span> ms
+                      {' → 최적화 '}<span className="num" style={{ fontWeight: 600 }}>{placeResult.cost_final_ms?.toFixed(1)}</span> ms
+                      {placeResult.gain_vs_random_pct != null && (
+                        <span style={{ color: 'var(--good)', fontWeight: 600 }}> ({placeResult.gain_vs_random_pct.toFixed(1)}% 개선)</span>
+                      )}
+                    </div>
+                    <div className="muted">
+                      음영(outage) {placeResult.outage_pct?.toFixed(1)}% · 미커버 {placeResult.uncovered_pct?.toFixed(1)}%
+                      {' · 후보 BS '}{placeResult.n_candidates_bs}{' / RSU '}{placeResult.n_candidates_rsu}
+                    </div>
+                  </div>
+                )}
               </div>
+              )}
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
 

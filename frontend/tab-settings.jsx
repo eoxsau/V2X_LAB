@@ -22,7 +22,7 @@ const DEFAULT_SIM_CONFIG = {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
     traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
-    traffic_time_period: 'peak', bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
+    demand_scale_pct: 100, bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
   },
 };
 
@@ -65,8 +65,9 @@ function validateSimulationConfig(config) {
     errors.push('policy_options.other_device_lambda: must be a number 0–2000');
   if (pol.network_mode !== undefined && !['4G', '5G', '6G'].includes(pol.network_mode))
     errors.push('policy_options.network_mode: must be "4G", "5G", or "6G"');
-  if (pol.traffic_time_period !== undefined && !['peak', 'off_peak'].includes(pol.traffic_time_period))
-    errors.push('policy_options.traffic_time_period: must be "peak" or "off_peak"');
+  if (pol.demand_scale_pct !== undefined &&
+      (typeof pol.demand_scale_pct !== 'number' || pol.demand_scale_pct < 10 || pol.demand_scale_pct > 300))
+    errors.push('policy_options.demand_scale_pct: must be a number between 10 and 300');
   if (pol.bg_reroute_prob !== undefined && (typeof pol.bg_reroute_prob !== 'number' || pol.bg_reroute_prob < 0 || pol.bg_reroute_prob > 1))
     errors.push('policy_options.bg_reroute_prob: must be a number 0–1');
   if (pol.bg_reroute_mode !== undefined && !['random', 'congestion'].includes(pol.bg_reroute_mode))
@@ -113,8 +114,8 @@ function mergeWithDefaultConfig(userConfig) {
       merged.policy_options.other_device_lambda = Math.min(pol.other_device_lambda, 2000);
     if (typeof pol.network_mode === 'string' && ['4G', '5G', '6G'].includes(pol.network_mode))
       merged.policy_options.network_mode = pol.network_mode;
-    if (typeof pol.traffic_time_period === 'string' && ['peak', 'off_peak'].includes(pol.traffic_time_period))
-      merged.policy_options.traffic_time_period = pol.traffic_time_period;
+    if (typeof pol.demand_scale_pct === 'number')
+      merged.policy_options.demand_scale_pct = Math.max(10, Math.min(300, pol.demand_scale_pct));
     if (typeof pol.bg_reroute_prob === 'number' && pol.bg_reroute_prob >= 0)
       merged.policy_options.bg_reroute_prob = Math.min(pol.bg_reroute_prob, 1);
     if (typeof pol.bg_reroute_mode === 'string' && ['random', 'congestion'].includes(pol.bg_reroute_mode))

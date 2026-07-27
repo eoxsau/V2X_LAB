@@ -247,7 +247,7 @@ function ScenarioTab({ simConfig, setSimConfig, mode: appMode }) {
           <div className="sub">
             {mode === 'config'
               ? '자연어 또는 JSON/코드로 시나리오를 설명하면 시뮬레이션 설정 변경안을 제안합니다'
-              : '자연어로 시나리오 묶음을 설명하면 LLM이 출발지·목적지·차량 수를 제안하고, 실제 도로망에 맞춰 자동 보정한 뒤 즉시 일괄 평가합니다'}
+              : '자연어로 시나리오 묶음을 설명하면 LLM이 출발지·목적지·교통량 배율을 제안하고, 실제 도로망에 맞춰 자동 보정한 뒤 즉시 일괄 평가합니다'}
           </div>
         </div>
         {mode === 'config' && appMode === 'pro'
@@ -352,7 +352,7 @@ function ScenarioTab({ simConfig, setSimConfig, mode: appMode }) {
         <textarea
           className="input"
           style={{ width: '100%', height: 'auto', minHeight: 90, fontFamily: 'var(--sans)', fontSize: 13, lineHeight: 1.6, padding: '12px 14px', resize: 'vertical' }}
-          placeholder="예: 퇴근시간 혼잡 시나리오 5개를 만들어줘. 차량 수는 다양하게 섞어줘."
+          placeholder="예: 혼잡 시나리오 5개를 만들어줘. 교통량은 50%부터 250%까지 다양하게 섞어줘."
           value={genDesc}
           onChange={e => setGenDesc(e.target.value)}
         />
@@ -381,7 +381,7 @@ function ScenarioTab({ simConfig, setSimConfig, mode: appMode }) {
           <div className="tbl-wrap" style={{ marginTop: 14 }}>
             <table className="tbl">
               <thead>
-                <tr><th></th><th>레이블</th><th>모드</th><th className="r">차량 수</th><th className="r">seed</th></tr>
+                <tr><th></th><th>레이블</th><th>모드</th><th className="r">교통량</th><th className="r">seed</th></tr>
               </thead>
               <tbody>
                 {genScenarios.map((s, i) => (
@@ -389,7 +389,7 @@ function ScenarioTab({ simConfig, setSimConfig, mode: appMode }) {
                     <td><input type="checkbox" checked={!!s._selected} onChange={() => toggleGenSelect(i)} /></td>
                     <td>{s.label}</td>
                     <td><Chip tone="brand">{s.mode}</Chip></td>
-                    <td className="r"><span className="num">{s.vehicle_count}</span></td>
+                    <td className="r"><span className="num">{s.demand_scale_pct != null ? s.demand_scale_pct + '%' : (s.vehicle_count ?? '—')}</span></td>
                     <td className="r"><span className="num muted">{s.seed}</span></td>
                   </tr>
                 ))}

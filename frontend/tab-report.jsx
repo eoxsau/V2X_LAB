@@ -1850,7 +1850,7 @@ function SectionMetadata({ bundle }) {
         {/* ── algorithm selection ── */}
         <Card title="알고리즘 설정" en="Algorithm config">
           <KVRow label="네트워크 모드"      value={meta?.network_mode} />
-          <KVRow label="교통 시간대"        value={meta?.traffic_time_period === 'peak' ? '첨두시 (peak)' : '비첨두시 (off_peak)'} />
+          <KVRow label="교통량 배율"        value={meta?.demand_scale_pct != null ? `기준의 ${meta.demand_scale_pct}%` : null} />
           <KVRow label="경로 알고리즘"      value={algoLabel(meta?.route_algorithm)} />
           <KVRow label="지연 알고리즘"      value={algoLabel(meta?.latency_algorithm)} />
           <KVRow label="BS 선택 알고리즘"   value={algoLabel(meta?.bs_selection_algorithm)} />

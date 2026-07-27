@@ -351,17 +351,15 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const latTone = latency !== null ? latencyTone(latency) : null;
   const latTxt  = latency !== null ? latency.toFixed(1) : '—';
 
-  /* CBR — Gonzalez-Martin et al., IEEE TVT 2019 §IV.A
-     CBR = 1 − exp(−ρ·R_tx·f_CAM·T_RRI)
-     ρ = vehicle_count / route_distance_m, R_tx = BS coverage radius (m)
-     f_CAM = 10 Hz (ETSI EN 302 637-2), T_RRI = 0.1 s (3GPP TS 36.331) */
-  const _cbrVehicleCount = parseInt(simConfig?.vehicle_count || 1);
-  const _cbrRouteDistM   = (routeEdges?.total_distance_m || 1000);
-  const _cbrRho          = _cbrVehicleCount / Math.max(_cbrRouteDistM, 1);
-  const _cbrRtx          = connNodeObj?.coverage_radius_m || 200;
-  const cbrVal = hasLive
-    ? Math.min(1 - Math.exp(-_cbrRho * _cbrRtx * 10 * 0.1), 1)
-    : (routeEdges?.cbr_avg ?? null);
+  /* CBR — 백엔드 계산값을 그대로 쓴다 (report_builder.compute_cbr_per_edge).
+     2026-07-27 이전에는 여기서 자체 계산했는데 두 가지가 모두 틀렸다:
+       ρ  : vehicle_count / route_distance_m — 경로에 차가 고르게 깔렸다는 가정.
+            실측에서 상위 10% 엣지가 교통량의 75%를 점유하므로 병목을 크게 과소평가한다.
+       공식: 1 − exp(−ρ·R_tx·f_CAM·T_RRI) — 인용한 논문(Gonzalez-Martin, IEEE TVT 2019)에
+            **존재하지 않는 식**이다. 논문의 CBR은 식 (34) N_E/N(자원 점유율)이고,
+            f_CAM×T_RRI = 10Hz×0.1s = 1이라 지수가 사실상 이웃 차량 수가 되어 포화됐다.
+     백엔드는 엣지별 실측 밀도 + 논문 식으로 고쳤고, 논문의 검증값(ρ=0.1 → 0.23)을 재현한다. */
+  const cbrVal = routeEdges?.cbr_avg ?? null;
   const cbrTone = cbrVal === null ? null : cbrVal > 0.65 ? 'bad' : cbrVal > 0.45 ? 'warn' : 'good';
 
   /* PIR P99 — geometric distribution upper bound, 3GPP TR 37.885 §A.2.4
@@ -411,7 +409,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   }, [mode, subTab]);
 
   // ── SA 배치 최적화 ──────────────────────────────────────────────────────────
-  const [placementConfig, setPlacementConfig] = useState({ n_stations: 3, network_mode: '5G', node_type: 'bs' });
+  const [placementConfig, setPlacementConfig] = useState({ n_bs: 3, n_rsu: 4, network_mode: '5G' });
   const [placementRunning, setPlacementRunning] = useState(false);
   const [placementResult, setPlacementResult] = useState(null);
   const [placementError, setPlacementError] = useState(null);
@@ -420,10 +418,17 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
     setPlacementRunning(true);
     setPlacementError(null);
     try {
-      const res = await fetch('http://127.0.0.1:8001/api/placement/optimize', {
+      // joint SA(BS+RSU 동시)는 auto-place가 제공한다 — method:'sa'
+      const res = await fetch('http://127.0.0.1:8001/network-nodes/auto-place', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...placementConfig, n_greedy: 2, n_random: 2, sa_iter: 2000 }),
+        body: JSON.stringify({
+          n_bs: placementConfig.n_bs,
+          n_rsu: placementConfig.n_rsu,
+          method: 'sa',
+          network_mode: placementConfig.network_mode,
+          replace_existing: true,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || '최적화 실패');
@@ -1366,26 +1371,32 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
         );
       })()}
 
-      {/* ── SA 배치 최적화 ──────────────────────────────────────────── */}
-      <Card title="기지국 배치 최적화" en="SA Placement Optimizer" style={{ marginBottom: 18 }}>
+      {/* ── SA 배치 최적화 (v2) ──────────────────────────────────────
+          2026-07-27 개편: 첨두↔비첨두 두 벌 비교를 없앴다. 교통 수요가 생성 교통
+          한 벌로 통일되면서 두 버킷이라는 개념 자체가 사라졌기 때문(백엔드도 단일 실행).
+          대신 BS·RSU를 함께 지정하고(설계 A안), 무작위 배치 대비 이득을 보여준다. */}
+      <Card title="기지국·RSU 배치 최적화" en="SA Placement Optimizer" style={{ marginBottom: 18 }}>
         <div className="muted" style={{ fontSize: 11.5, lineHeight: 1.6, marginBottom: 14 }}>
-          Simulated Annealing(SA) 기반 최적 배치 탐색. ITS 교통량을 차량 수요로 사용하며
-          첨두(peak) / 비첨두(off-peak) 를 각각 독립 최적화해 비교합니다.
-          초기화: greedy forward selection (warm-start) + random 병렬 실행 후 최선 선택.
+          생성 교통의 가장 붐비는 시점을 차량 수요로 삼아, BS(건물 옥상)와 RSU(교차로)를
+          <b> 함께</b> 최적화합니다. 건물 차폐(A_seg)와 큐 혼잡을 모두 반영합니다.
+          초기화: greedy warm-start + random 병렬 실행 후 최선 선택.
         </div>
         <div className="row gap8" style={{ flexWrap: 'wrap', marginBottom: 14, alignItems: 'center' }}>
-          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>기지국 수</label>
-          <input type="number" min={1} max={10} value={placementConfig.n_stations}
-            onChange={e => setPlacementConfig(c => ({ ...c, n_stations: Math.max(1, Math.min(10, +e.target.value)) }))}
+          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>BS</label>
+          <input type="number" min={0} max={20} value={placementConfig.n_bs}
+            onChange={e => setPlacementConfig(c => ({ ...c, n_bs: Math.max(0, Math.min(20, +e.target.value)) }))}
+            style={{ width: 60, padding: '4px 8px', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}
+          />
+          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>RSU</label>
+          <input type="number" min={0} max={20} value={placementConfig.n_rsu}
+            onChange={e => setPlacementConfig(c => ({ ...c, n_rsu: Math.max(0, Math.min(20, +e.target.value)) }))}
             style={{ width: 60, padding: '4px 8px', fontSize: 12, border: '1px solid var(--border)', borderRadius: 6 }}
           />
           <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>기술</label>
           <Seg value={placementConfig.network_mode} onChange={v => setPlacementConfig(c => ({ ...c, network_mode: v }))}
             options={[{ v: '4G', label: '4G' }, { v: '5G', label: '5G' }, { v: '6G', label: '6G' }]} />
-          <label style={{ fontSize: 12, color: 'var(--ink-2)' }}>노드 유형</label>
-          <Seg value={placementConfig.node_type} onChange={v => setPlacementConfig(c => ({ ...c, node_type: v }))}
-            options={[{ v: 'bs', label: 'BS' }, { v: 'rsu', label: 'RSU' }]} />
-          <button className="btn primary sm" onClick={runPlacementOptimize} disabled={placementRunning}
+          <button className="btn primary sm" onClick={runPlacementOptimize}
+            disabled={placementRunning || (placementConfig.n_bs + placementConfig.n_rsu) === 0}
             style={{ marginLeft: 8 }}>
             {placementRunning ? <><Icon.reset size={12} className="spin" /> 최적화 중…</> : <><Icon.antenna size={12} /> 최적화 실행</>}
           </button>
@@ -1394,57 +1405,45 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
           <div style={{ color: 'var(--bad)', fontSize: 12, marginBottom: 10 }}>{placementError}</div>
         )}
         {placementResult && (() => {
-          const { peak, off_peak, comparison } = placementResult;
+          const o = placementResult.optimization || {};
+          const placed = placementResult.placed || [];
           const rows = [
-            { label: '최종 평균 지연 (ms)', peak: peak.cost_final_ms.toFixed(2), off: off_peak.cost_final_ms.toFixed(2) },
-            { label: 'SA 개선율 (%)', peak: peak.improvement_pct.toFixed(1) + '%', off: off_peak.improvement_pct.toFixed(1) + '%' },
-            { label: '미커버 수요 비율 (%)', peak: peak.uncovered_demand_pct.toFixed(1) + '%', off: off_peak.uncovered_demand_pct.toFixed(1) + '%' },
-            { label: '탐색 후보 수', peak: peak.n_candidates, off: off_peak.n_candidates },
-            { label: '수요점 수', peak: peak.n_demand_points, off: off_peak.n_demand_points },
+            { label: '무작위 배치 대비 개선', value: o.gain_vs_random_pct != null ? o.gain_vs_random_pct.toFixed(1) + '%' : '—', good: true },
+            { label: '최종 평균 지연', value: o.cost_final_ms != null ? o.cost_final_ms.toFixed(2) + ' ms' : '—' },
+            { label: '무작위 기준선', value: o.random_baseline_ms != null ? o.random_baseline_ms.toFixed(2) + ' ms' : '—' },
+            { label: '음영(outage) 비율', value: o.outage_pct != null ? o.outage_pct.toFixed(1) + '%' : '—' },
+            { label: '미커버 수요', value: o.uncovered_pct != null ? o.uncovered_pct.toFixed(1) + '%' : '—' },
+            { label: '탐색 후보 (BS / RSU)', value: `${o.n_candidates_bs ?? '—'} / ${o.n_candidates_rsu ?? '—'}` },
+            { label: '채점 횟수', value: o.n_evaluations != null ? o.n_evaluations.toLocaleString() : '—' },
           ];
           return (
             <div>
-              <div className="row gap8" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
-                <Chip tone="good">
-                  배치 일치: {comparison.overlap_count}/{peak.placed.length} ({comparison.overlap_pct}%)
-                </Chip>
-                <Chip tone={comparison.cost_diff_ms > 0 ? 'warn' : 'good'}>
-                  첨두-비첨두 지연 차: {comparison.cost_diff_ms > 0 ? '+' : ''}{comparison.cost_diff_ms.toFixed(2)} ms
-                </Chip>
-              </div>
-              <div className="tbl-wrap">
-                <table className="tbl">
-                  <thead>
-                    <tr>
-                      <th>지표</th>
-                      <th>첨두 (Peak)</th>
-                      <th>비첨두 (Off-peak)</th>
+              <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse', marginBottom: 12 }}>
+                <tbody>
+                  {rows.map(r => (
+                    <tr key={r.label} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '6px 4px', color: 'var(--ink-2)' }}>{r.label}</td>
+                      <td style={{ padding: '6px 4px', textAlign: 'right', fontFamily: 'var(--mono)',
+                                   fontWeight: r.good ? 700 : 400, color: r.good ? 'var(--good)' : 'inherit' }}>
+                        {r.value}
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map(r => (
-                      <tr key={r.label}>
-                        <td style={{ color: 'var(--ink-2)', fontSize: 12 }}>{r.label}</td>
-                        <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.peak}</td>
-                        <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.off}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                {[['첨두 최적 배치', peak], ['비첨두 최적 배치', off_peak]].map(([label, r]) => (
-                  <div key={label} style={{ background: 'var(--surface-2)', borderRadius: 10, padding: '10px 14px' }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>{label}</div>
-                    {r.placed.map((p, i) => (
-                      <div key={p.id} className="row" style={{ fontSize: 11.5, gap: 8, marginBottom: 4 }}>
-                        <span className="chip" style={{ fontSize: 10, padding: '1px 6px' }}>#{i + 1}</span>
-                        <span style={{ fontFamily: 'var(--mono)', color: 'var(--ink-2)' }}>
-                          {p.lat.toFixed(5)}, {p.lng.toFixed(5)}
-                        </span>
-                        <span className="muted" style={{ fontSize: 10 }}>deg={p.degree}</span>
-                      </div>
-                    ))}
+                  ))}
+                </tbody>
+              </table>
+              <div style={{ fontSize: 11.5, fontWeight: 700, marginBottom: 6 }}>배치 위치 ({placed.length}개)</div>
+              <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+                {placed.map((p, i) => (
+                  <div key={p.id || i} className="row" style={{ fontSize: 11.5, gap: 8, marginBottom: 4 }}>
+                    <span className="chip" style={{ fontSize: 10, padding: '1px 6px' }}>
+                      {p.node_type === 'rsu' ? 'RSU' : 'BS'}
+                    </span>
+                    <span style={{ fontFamily: 'var(--mono)', color: 'var(--ink-2)' }}>
+                      {p.lat?.toFixed(5)}, {p.lng?.toFixed(5)}
+                    </span>
+                    {p.height_m != null && (
+                      <span className="muted" style={{ fontSize: 10 }}>h={p.height_m.toFixed(0)}m</span>
+                    )}
                   </div>
                 ))}
               </div>
