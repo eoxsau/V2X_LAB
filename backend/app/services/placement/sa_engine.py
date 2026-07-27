@@ -181,6 +181,7 @@ def optimize(
     rng = _rng_module.Random(seed)
 
     results: list[tuple[list[int], float, float]] = []   # (idx, final, initial)
+    random_inits: list[float] = []   # 무작위 배치의 비용 — "최적화가 얼마나 벌었나"의 기준선
 
     for _ in range(max(n_greedy, 0)):
         init = greedy_forward_init(ev, bs_pool, rsu_pool, n_bs, n_rsu)
@@ -193,6 +194,7 @@ def optimize(
         init = (rng.sample(bs_pool, n_bs) if n_bs else []) + \
                (rng.sample(rsu_pool, n_rsu) if n_rsu else [])
         init_cost = ev(init).cost_ms
+        random_inits.append(init_cost)     # 최적화 이득의 기준선
         idx, cost = sa_run(ev, init, type_of, pool_by_type, n_iter=sa_iter,
                            rng=_rng_module.Random(rng.randint(0, 10 ** 9)))
         results.append((idx, cost, init_cost))
@@ -224,5 +226,18 @@ def optimize(
         outage_pct=round(final.outage_pct, 2),
         n_candidates_bs=len(bs_pool), n_candidates_rsu=len(rsu_pool),
         n_evaluations=ev.n,
-        stats={"station_load": final.station_load, "n_starts": len(results)},
+        stats={
+            "station_load": final.station_load,
+            "n_starts": len(results),
+            # ⚠️ improvement_pct는 "SA가 자기 출발점 대비 얼마나 벌었나"라, warm-start가
+            # 이미 좋으면 0에 가깝게 나온다(실측: greedy 87.04 → SA 86.94, -0.1%).
+            # 최적화 전체의 가치는 **무작위 배치 대비**로 봐야 드러난다
+            # (같은 조건 실측: 무작위 671.66 → 최종 86.94, -87.1%).
+            "random_baseline_ms": (round(sum(random_inits) / len(random_inits), 3)
+                                   if random_inits else None),
+            "gain_vs_random_pct": (
+                round((sum(random_inits) / len(random_inits) - final.cost_ms)
+                      / max(sum(random_inits) / len(random_inits), 1e-9) * 100, 2)
+                if random_inits else None),
+        },
     )

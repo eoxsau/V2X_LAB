@@ -3150,6 +3150,49 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
     return sc
 
 
+def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] = None):
+    """현재 구역에 BS n_bs개 + RSU n_rsu개를 **함께** 최적화한다 (배치설계 v2).
+
+    구식 `sa_placement.optimize_placement`를 대체한다. 바뀐 점:
+      * 목적함수가 런타임과 **같은** formula_v31 (구식은 최대 17배 어긋나고 방향까지 뒤집혔음)
+      * 건물 차폐 A_seg 반영 (구식은 A_seg=0 — RSU가 선택될 수 없는 구조였다)
+      * BS 후보 = 건물 옥상 / RSU 후보 = 교차로 (구식은 둘 다 mock_graph 노드)
+      * 후보 밀도 = d_edge/K (구식은 구역 크기와 무관한 상수 300개)
+      * 타입 보존형 joint SA (구식은 BS/RSU를 따로 돌려 상호작용을 못 봄)
+
+    ⚠️ 무겁다(A_seg 사전계산 포함 수십 초). async 엔드포인트에서 직접 부르지 말 것 —
+       `run_in_executor`로 감쌀 것.
+
+    Returns: PlacementResult | None (net·건물·수요가 없으면 None → 호출부가 폴백)
+    """
+    net_file = _state.get("net_file")
+    if not net_file or not Path(net_file).exists():
+        return None
+    scn = current_traffic_scenario(build=False)
+    if scn is None or not scn.peak_edge_loads:
+        print("[PLACE-V2] 생성 교통이 없어 구식 경로로 폴백합니다", flush=True)
+        return None
+
+    from app.services.demand.assignment import read_net, net_bbox, routable_edges
+    from app.services.placement.optimizer import (demand_from_edge_loads,
+                                                  optimize_placement_for_area)
+
+    net = read_net(str(net_file))
+    bbox = net_bbox(net, margin_m=0)
+    buildings = BUILDING_REPOSITORY.query_by_bbox_parquet(*bbox)
+    demand = demand_from_edge_loads(scn.peak_edge_loads, net)
+    if not demand:
+        return None
+
+    return optimize_placement_for_area(
+        net, buildings, demand, n_bs, n_rsu, tech=tech,
+        cache_dir=str(WORK_DIR / "_aseg"),
+        routable_edge_ids=routable_edges(net),
+        seed=seed,
+        log=lambda m: print(f"[PLACE-V2] {m}", flush=True),
+    )
+
+
 def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     """Convert OSM to SUMO network with netconvert.
 
@@ -6187,10 +6230,30 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
 
     loop = asyncio.get_event_loop()
 
+    # ── SA(v2): BS와 RSU를 **한 번에** 최적화한다 (배치설계 v2 §6-2 joint) ──────
+    # 예전에는 _positions("bs")·_positions("rsu")를 따로 불러 staged로 돌렸는데,
+    # 그러면 BS 위치가 RSU의 가치를 바꾸는 상호작용을 못 본다. 여기서 한 번 돌리고
+    # 결과를 타입별로 나눠 쓴다. 실패하면 아래 구식 경로로 자연히 폴백된다.
+    _v2: dict[str, list] = {}
+    _v2_result = None
+    if method == "sa":
+        _v2_result = await loop.run_in_executor(
+            None, lambda: optimize_placement_v2(n_bs, n_rsu, mode, req.seed))
+        if _v2_result is not None and _v2_result.placed:
+            for p in _v2_result.placed:
+                _v2.setdefault(p["node_type"], []).append(
+                    PlacePoint(node_id=str(p["id"]), lat=float(p["lat"]), lng=float(p["lng"])))
+            warnings.append(
+                f"SA(v2) 배치: 비용 {_v2_result.cost_final_ms:.2f} ms "
+                f"(무작위 대비 {_v2_result.stats.get('gain_vs_random_pct', 0):+.1f}%), "
+                f"미커버 {_v2_result.uncovered_pct:.1f}%, outage {_v2_result.outage_pct:.1f}%")
+
     async def _positions(node_type: str, n: int, seed: Optional[int]) -> list:
         """method에 따라 배치 위치(PlacePoint 리스트)를 산출한다."""
+        if method == "sa" and _v2:
+            return _v2.get(node_type, [])
         if method == "sa":
-            # SA는 CPU 집약적이라 executor에서 (이벤트 루프 차단 방지)
+            # v2가 못 돌았을 때만 구식 경로 (생성 교통·건물이 없는 구역)
             res = await loop.run_in_executor(None, lambda: optimize_placement(
                 graph=graph, its_links=sa_its, N=n, network_mode=mode,
                 node_type=node_type, time_period="peak", seed=seed, bbox=user_bbox,
@@ -6277,6 +6340,20 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
         "uniformity_cv": {"bs": round(cv_bs, 3), "rsu": round(cv_rsu, 3)},
         "network_mode": mode,
         "warnings": warnings,
+        # SA(v2) 진단 — 프론트가 아직 안 쓰지만 결과의 근거를 남겨둔다
+        "optimization": None if _v2_result is None else {
+            "engine": "sa_v2",
+            "cost_initial_ms": _v2_result.cost_initial_ms,
+            "cost_final_ms": _v2_result.cost_final_ms,
+            "improvement_pct": _v2_result.improvement_pct,
+            "random_baseline_ms": _v2_result.stats.get("random_baseline_ms"),
+            "gain_vs_random_pct": _v2_result.stats.get("gain_vs_random_pct"),
+            "uncovered_pct": _v2_result.uncovered_pct,
+            "outage_pct": _v2_result.outage_pct,
+            "n_candidates_bs": _v2_result.n_candidates_bs,
+            "n_candidates_rsu": _v2_result.n_candidates_rsu,
+            "n_evaluations": _v2_result.n_evaluations,
+        },
     }
 
 

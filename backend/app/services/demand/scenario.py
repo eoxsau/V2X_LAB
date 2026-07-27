@@ -141,6 +141,10 @@ def build_traffic_scenario(
                 log(f"교통 캐시 적중: {data['total_trips']:.0f}통행 ({cache_f.name})")
                 sc = TrafficScenario(**{k: v for k, v in data.items() if k != "demand_points"})
                 sc.demand_points = _rebuild_demand_points(data.get("demand_points") or [])
+                # 캐시 키가 net **내용 해시**라 같은 내용의 다른 경로에도 적중한다.
+                # 그때 net_file이 예전 경로로 남으면 호출부의 "이 구역 것이 맞나" 검사가
+                # 어긋나 매번 다시 만들게 된다(2026-07-27 실측). 요청 경로로 갱신한다.
+                sc.net_file = str(net_file)
                 return sc
         except Exception as exc:
             log(f"교통 캐시 무시 (읽기 실패: {exc})")
