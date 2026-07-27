@@ -401,6 +401,28 @@ FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount("/app", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="static")
 
+
+@app.middleware("http")
+async def _no_cache_html(request, call_next):
+    """index.html은 항상 재검증하게 만든다.
+
+    ⚠️ 2026-07-27 발견 — 프론트를 고쳐도 브라우저에 안 보이는 문제의 진짜 원인:
+        index.html은 `<script src="tab-simulation.jsx?v=20260723b">`처럼 **버전 쿼리**로
+        JSX 캐시를 무효화한다. 그런데 정작 index.html 자신에게는 Cache-Control이 없어
+        (StaticFiles는 last-modified/etag만 보낸다) 브라우저가 휴리스틱으로 캐시해버린다.
+        그러면 **새 버전 문자열이 적힌 index.html을 아예 안 받아오므로** JSX 버전을
+        올려도 소용이 없다. 사용자가 매번 하드 리로드(Ctrl+Shift+R)를 해야 했다.
+
+    `no-store`가 아니라 `no-cache`인 이유: 재검증만 강제하고 ETag는 살린다.
+    내용이 안 바뀌었으면 304로 끝나 비용이 거의 없다.
+    JSX/CSS는 버전 쿼리가 캐시를 관리하므로 손대지 않는다.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/app") and \
+            response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
 # ── Global state ──────────────────────────────────────────────────────────────
 _state = {
     "network_ready": False,
