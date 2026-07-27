@@ -38,9 +38,27 @@ TECH_CONFIG: dict[str, dict] = {
     "6G": dict(f_c=7.0e9, numerology=3, TTI=0.125, BW=400e6, d_edge=500.0,  C_tech=2000),
 }
 
-# RSU(PC5 사이드링크) 커버리지 — 명세 범위 밖, 기존 값 유지
-# 출처: ETSI EN 302 663(ITS-G5), 3GPP TR 36.885, Rel-16 NR-V2X PC5 링크 예산
-RSU_COVERAGE_RADIUS_M: dict[str, float] = {"4G": 100.0, "5G": 150.0, "6G": 250.0}
+# ── RSU(노변장치) — 이종 유닛 파라미터 (배치설계 v2 §3) ────────────────────────
+#
+# 설계 원칙(§3-3): RSU의 작은 커버리지를 **안테나 높이 하나**로 표현한다.
+#   h_RSU를 낮추면 → d_BP가 줄고 → 4.0 기울기가 일찍 시작해 → 빨리 감쇠한다.
+#   d_edge를 따로 상수로 박으면 같은 사실을 두 채널로 말하는 role-overlap이 된다.
+#
+# 설계 원칙(§3-2): 타입 간 결합 파라미터는 **딱 하나**만 둔다 → ΔP(송신전력 격차).
+#   α는 타입별로 각자 역산하므로 링크 단위 SINR은 P_tx 절대값과 무관하지만,
+#   BS↔RSU를 비교하려면 두 타입의 상대 세기를 정하는 값이 하나 필요하다.
+#
+# ⚠️ 2026-07-27 변경 — 이전 상수 {4G:100, 5G:150, 6G:250}는 폐기했다:
+#   * 코드 주석에 "명세 범위 밖, 기존 값 유지"라고 적혀 있었듯 물리 유도값이 아니었다.
+#   * 세대가 올라갈수록 **커지는** 규약이라, BS(2000>1000>500)와 정반대였다.
+#     주파수가 높을수록 감쇠가 크다는 같은 물리를 BS만 따르고 RSU는 안 따르는 모순.
+#   * h_RSU=5m + ΔP=20dB로 유도하면 4G 312 / 5G 156 / 6G 62 m — BS와 규약이 일치하고,
+#     5G 156m는 폐기한 상수 150m와 사실상 같아 기존 5G 결과의 연속성도 유지된다.
+_RSU_TYPES = ("rsu", "rsu_node", "roadside_unit")
+H_RSU = 5.0                # m — 노변 폴 높이 (배치설계 v2 §10-A 확정)
+DELTA_P_RSU_DB = 20.0      # dB — BS 대비 RSU 송신전력 격차 = 유일한 타입 간 결합 파라미터.
+                           # RSU P_tx = 46 − 20 = 26 dBm. PC5/ITS-G5 노변장치 일반
+                           # EIRP 23~33 dBm 범위 안이라 방어 가능(§3-2).
 
 # ── MCS 테이블 (명세 §6-1, 세 기술 공통) ────────────────────────────────────────
 # (최소 SINR dB, 스펙트럼 효율 bit/s/Hz)
@@ -65,9 +83,43 @@ def _pl(d: float, d_bp: float) -> float:
 
 
 # ── 초기화: d_BP·α 계산 + 검증 (명세 §3-1, §4 — 하드코딩 금지) ───────────────────
+#
+# BS: d_edge가 앵커 → α를 역산.
+# RSU: h_RSU가 물리적 원인 → d_BP가 정해지고, ΔP만큼 낮은 전력으로 BS와 **같은 셀엣지
+#      판정기준(PL 예산)** 에 도달하는 거리를 풀어 d_edge를 **유도**한다. 그 d_edge로 α 역산.
+#      → 높이 하나가 커버리지·차폐·엣지를 일관되게 지배한다(§3-3).
 for _cfg in TECH_CONFIG.values():
     _cfg["d_BP"] = 4.0 * H_BS * H_UT * _cfg["f_c"] / C_LIGHT
     _cfg["alpha"] = P_TX_DBM - NOISE_FLOOR_DBM - SINR_MIN_DB - _pl(_cfg["d_edge"], _cfg["d_BP"])
+
+
+def _solve_d_edge(pl_budget_db: float, d_bp: float) -> float:
+    """PL(d) = pl_budget 을 만족하는 d. PL이 d에 단조증가라 이분 탐색이 안전하다."""
+    lo, hi = 1.0, 1.0e5
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if _pl(mid, d_bp) < pl_budget_db:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+RSU_CONFIG: dict[str, dict] = {}
+for _tech, _cfg in TECH_CONFIG.items():
+    _dbp = 4.0 * H_RSU * H_UT * _cfg["f_c"] / C_LIGHT
+    # BS가 자기 셀엣지에서 쓰는 PL 예산에서 ΔP를 뺀 만큼이 RSU의 예산
+    _budget = _pl(_cfg["d_edge"], _cfg["d_BP"]) - DELTA_P_RSU_DB
+    _d_edge = _solve_d_edge(_budget, _dbp)
+    RSU_CONFIG[_tech] = dict(
+        f_c=_cfg["f_c"], numerology=_cfg["numerology"], TTI=_cfg["TTI"], BW=_cfg["BW"],
+        d_BP=_dbp, d_edge=_d_edge,
+        # 용량 비율 — 결합 파라미터를 늘리지 않도록 ΔP와 같은 근거(작은 유닛)에 묶어
+        # BS의 1/10으로 고정한다. 절대값보다 비율이 방어 가능하다(§10-A).
+        C_tech=max(_cfg["C_tech"] // 10, 1),
+        # α는 자기 d_edge·자기 d_BP·자기 P_tx로 역산 — 전제 ②(하드코딩 금지) 준수
+        alpha=(P_TX_DBM - DELTA_P_RSU_DB) - NOISE_FLOOR_DBM - SINR_MIN_DB - _pl(_d_edge, _dbp),
+    )
 
 _EXPECTED_ALPHA = {"4G": 60.1, "5G": 76.5, "6G": 87.6}
 for _tech, _exp in _EXPECTED_ALPHA.items():
@@ -77,6 +129,32 @@ for _tech, _exp in _EXPECTED_ALPHA.items():
             f"formula_v31: alpha 검증 실패 — {_tech} 기대 {_exp}, 계산 {_got:.2f}. "
             f"PL 구현(특히 d_BP 분기)을 확인하세요 (명세 §4)."
         )
+
+# RSU도 같은 방식으로 검증한다 — 유도 경로(h_RSU → d_BP → d_edge → α)가 바뀌면 즉시 걸린다.
+_EXPECTED_RSU_D_EDGE = {"4G": 312.0, "5G": 156.0, "6G": 62.0}
+for _tech, _exp in _EXPECTED_RSU_D_EDGE.items():
+    _got = RSU_CONFIG[_tech]["d_edge"]
+    if abs(_got - _exp) > 2.0:
+        raise RuntimeError(
+            f"formula_v31: RSU d_edge 검증 실패 — {_tech} 기대 {_exp}m, 계산 {_got:.1f}m. "
+            f"H_RSU/DELTA_P_RSU_DB를 의도적으로 바꿨다면 이 기대값도 함께 갱신하세요."
+        )
+
+# 폐기된 상수의 이름을 유지하되 유도값을 담는다 — 기존 import 경로 호환용.
+RSU_COVERAGE_RADIUS_M: dict[str, float] = {
+    _t: round(_c["d_edge"], 1) for _t, _c in RSU_CONFIG.items()
+}
+
+
+def resolve_unit(tech: str, node_type: str | None = None) -> dict:
+    """(기술, 유닛 타입) → 파라미터 묶음. BS면 TECH_CONFIG, RSU면 RSU_CONFIG.
+
+    RSU는 d_BP·d_edge·α·C_tech가 전부 다르다(h_RSU=5m, ΔP=20dB에서 유도).
+    타입을 안 넘기면 BS로 본다 — 기존 호출부 호환.
+    """
+    if str(node_type or "").lower() in _RSU_TYPES:
+        return RSU_CONFIG.get(tech.upper(), RSU_CONFIG["5G"])
+    return _resolve_tech(tech)
 
 
 def _resolve_tech(tech: str) -> dict:
@@ -98,20 +176,27 @@ def get_active_mode() -> str:
 
 
 # ── 공개 계산 함수 ──────────────────────────────────────────────────────────────
-def path_loss(tech: str, d: float) -> float:
-    p = _resolve_tech(tech)
+def path_loss(tech: str, d: float, node_type: str | None = None) -> float:
+    p = resolve_unit(tech, node_type)
     return _pl(d, p["d_BP"])
 
 
-def compute_rsrp_dbm(tech: str, d: float, a_seg_db: float = 0.0) -> float:
-    """P_rx = P_tx − α − PL(d) − A_seg (명세 §5). §9의 연결 규칙 기준값."""
-    p = _resolve_tech(tech)
-    return P_TX_DBM - p["alpha"] - _pl(d, p["d_BP"]) - a_seg_db
+def compute_rsrp_dbm(tech: str, d: float, a_seg_db: float = 0.0,
+                     node_type: str | None = None) -> float:
+    """P_rx = P_tx − α − PL(d) − A_seg (명세 §5). §9의 연결 규칙 기준값.
+
+    RSU는 P_tx가 ΔP만큼 낮고 α도 그에 맞춰 역산돼 있으므로, 타입만 넘기면
+    두 유닛의 수신세기를 같은 척도에서 비교할 수 있다(배치설계 v2 §3-2).
+    """
+    p = resolve_unit(tech, node_type)
+    p_tx = P_TX_DBM - (DELTA_P_RSU_DB if str(node_type or "").lower() in _RSU_TYPES else 0.0)
+    return p_tx - p["alpha"] - _pl(d, p["d_BP"]) - a_seg_db
 
 
-def compute_sinr_db(tech: str, d: float, a_seg_db: float = 0.0) -> float:
+def compute_sinr_db(tech: str, d: float, a_seg_db: float = 0.0,
+                    node_type: str | None = None) -> float:
     """SINR = P_rx − noise_floor. 간섭 I=0 (SNR 근사, 명세 §5)."""
-    return compute_rsrp_dbm(tech, d, a_seg_db) - NOISE_FLOOR_DBM
+    return compute_rsrp_dbm(tech, d, a_seg_db, node_type) - NOISE_FLOOR_DBM
 
 
 def compute_latency(
@@ -120,6 +205,7 @@ def compute_latency(
     n_vehicles: float,
     a_seg_db: float = 0.0,
     deficit_ratio: float = 0.0,
+    node_type: str | None = None,
 ) -> dict:
     """
     명세 §1의 compute_latency. 반환 dict:
@@ -127,8 +213,8 @@ def compute_latency(
       outage(bool), sinr_db, rsrp_dbm, spectral_efficiency
     l_total_ms는 RAN 구간만 — edge_latency_ms(MEC 등) 합산은 호출부 책임.
     """
-    p = _resolve_tech(tech)
-    sinr = compute_sinr_db(tech, d, a_seg_db)
+    p = resolve_unit(tech, node_type)
+    sinr = compute_sinr_db(tech, d, a_seg_db, node_type)
     rsrp = sinr + NOISE_FLOOR_DBM
 
     # Outage 판정이 세 구성요소 합산보다 먼저 (명세 §10 체크리스트)
@@ -163,9 +249,6 @@ def compute_latency(
     }
 
 
-_RSU_TYPES = ("rsu", "rsu_node", "roadside_unit")
-
-
 def resolve_coverage_radius(tech: str, node_type: str | None) -> float:
     """
     기술 모드 기반 커버리지 반경 (2026-07-16 결정: 노드에 저장된 고정값 대신
@@ -173,9 +256,7 @@ def resolve_coverage_radius(tech: str, node_type: str | None) -> float:
     BS의 셀 경계는 d_edge — α 역산 앵커라서 d_edge 안에서는 차폐가 없는 한
     SINR ≥ SINR_MIN이 보장되는, 수식상 자연스러운 반경이다.
     """
-    if str(node_type or "").lower() in _RSU_TYPES:
-        return RSU_COVERAGE_RADIUS_M.get(tech, 150.0)
-    return _resolve_tech(tech)["d_edge"]
+    return resolve_unit(tech, node_type)["d_edge"]
 
 
 # ── LATENCY_REGISTRY 등록 — 경로비용(evaluate_path)이 이 기본값을 통해 사용 ──────
