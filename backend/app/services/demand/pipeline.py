@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -308,10 +309,14 @@ def generate_demand(
     _od2trips_and_duarouter(net_path, taz_file, od_files, trips_file, routes_file, log)
 
     n_trips = trips_file.read_text(encoding="utf-8").count("<trip ")
-    n_vehicles = routes_file.read_text(encoding="utf-8").count("<vehicle ")
+    routes_txt = routes_file.read_text(encoding="utf-8")
+    n_vehicles = routes_txt.count("<vehicle ")
     log(f"trip {n_trips}개 → 차량 {n_vehicles}개 "
         f"(라우팅률 {n_vehicles / max(n_trips, 1) * 100:.1f}%, "
         f"생존율 {n_vehicles / total_trips * 100:.1f}%)")
+
+    ff_cost_s, ff_len_m = _freeflow_means(routes_txt)
+    log(f"자유류 통행시간 평균 {ff_cost_s:.1f}초 | 경로길이 평균 {ff_len_m:.0f}m")
 
     result = DemandResult(
         net_file=net_path,
@@ -337,12 +342,28 @@ def generate_demand(
             "trips_dropped": round(dropped, 1),
             "n_slices": len(slices),
             "n_od_lines": n_od_lines,
+            # 자유류(= 다른 차가 없다고 가정) 평균. N* 해석적 시드의 재료(§5-C).
+            "freeflow_travel_s": round(ff_cost_s, 2),
+            "freeflow_route_m": round(ff_len_m, 1),
         },
     )
     if result.routing_rate < 0.9:
         log("⚠️ 라우팅률 90% 미만 — 승용차 그래프 고립 성분을 의심할 것(§5-A). "
             "component_summary의 isolated_edges 확인.")
     return result
+
+
+def _freeflow_means(routes_txt: str) -> tuple[float, float]:
+    """경로파일 → (평균 자유류 통행시간 s, 평균 경로길이 m).
+
+    duarouter가 `--write-costs --route-length`로 넣어준 `<route cost=".." routeLength="..">`를
+    읽는다. **자유류** 값이라 다른 차의 영향이 없고, 그래서 통행량 수준과 무관하게 일정하다 —
+    N* 시드를 아무 기준 통행량에서 뽑아도 되는 이유다(§5-C 1단계).
+    """
+    costs = [float(m) for m in re.findall(r'<route[^>]*\scost="([\d.]+)"', routes_txt)]
+    lens = [float(m) for m in re.findall(r'<route[^>]*\srouteLength="([\d.]+)"', routes_txt)]
+    return (sum(costs) / len(costs) if costs else 0.0,
+            sum(lens) / len(lens) if lens else 0.0)
 
 
 def _od2trips_and_duarouter(
@@ -396,6 +417,9 @@ def _od2trips_and_duarouter(
             "-o", s_rou,
             "--ignore-errors",
             "--no-warnings",
+            # 경로마다 자유류 통행시간(cost, 초)·경로길이(routeLength, m)를 함께 기록.
+            # N* 해석적 시드가 이 값을 쓴다 — 시뮬레이션 0회로 T_ff를 얻는 근거(§5-C).
+            "--write-costs", "--route-length",
         ], log)
 
         shutil.copy(s_trips, trips_file)
