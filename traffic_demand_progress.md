@@ -78,6 +78,7 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
 | `geo/spatial_grid.py` | 순수파이썬 공간 해시 그리드 (scipy 없이 O(1) 최근접/반경) | `SpatialGrid(items, coords_fn, cell_size_m).nearest()/within()/add()` |
 | `demand/grid_mass.py` | §3·§4 격자 존 + 건물 질량 | `build_zones(buildings=[(lat,lng,mass)], cell_size_m, ref_lat, origin_shift_m) → [Zone]`; `cell_of(lat,lng,cell,ref_lat,shift)`; `zone_stats()` |
 | `demand/radiation.py` | §6 radiation OD | `radiation_od_matrix(masses, coords, total_trips, lam=0.9999) → [ODFlow(i,j,trips)]`; `od_summary()` |
+| **`demand/time_profile.py`** | **§5 6단계 시간곡선** | `load_hourly_profile()` (24h CSV → 비율 24개); **`build_time_profile(begin_h, end_h, step_min=15, interpolate=True)`** → `[(b,e,share)]`; `profile_summary()` (굴곡 확인용 막대) |
 | **`demand/pipeline.py`** | **§7 오케스트레이터** | **`generate_demand(net_file, out_dir, total_trips, ..., time_profile=None) → DemandResult`** — net.xml 하나로 routes.xml까지. 함정 4개(net_bbox·parquet 직접·ASCII 스테이징·최대 SCC) 전부 내부 흡수. `DemandResult.survival_rate/routing_rate/stats`; `od_time_slices()`; `ascii_temp_base()`; `sumo_binary()` |
 | `demand/assignment.py` | §7·§8 배정 준비 | `read_net(path)`(한 번 읽어 재사용); **`net_bbox(net, margin_m=300)`** (실제 도로 범위 — 건물 조회 bbox는 반드시 이걸로); **`build_taz(net, cell, ref_lat, largest_component_only=True)`** (최대 승용차 SCC만 담음); **`component_summary(net)`** (고립 섬 진단); `write_taz_xml()`; **`write_od_o_format(..., keep_intra_zone=True)`** (o==d 살림); **`map_zones_to_taz(zones, taz, cell_size_m, max_reassign_m=900)`** (도로 없는 존 → 최근접 도로존 재배정); **`taz_mapping_summary()`** (자기셀/재배정/버림 진단) |
 
@@ -319,7 +320,13 @@ Overpass가 bbox에 걸친 way의 **전 노드**를 반환하므로, 멀리 뻗�
 
 ## 6. 미결정 사항 (다음 채팅에서 정할 것)
 
-- **시뮬레이션 창 길이** — 예열 몇 분 + 상승~피크 어디까지(예: 07:00~09:00).
+- ~~**시뮬레이션 창 길이**~~ → ✅ **결정**: **07:00~09:00, 15분 8구간** (2026-07-27).
+  단 **예열 길이는 미정** — 창 앞에 몇 분을 붙일지는 동적 SUMO에서 정한다.
+  (예열은 od2trips 첫 구간 부풀림(§7)도 함께 흡수한다.)
+- **창 안 굴곡이 1.26배뿐이라는 점** — 07~09시는 아침 첨두의 *고원* 위라 자연 곡선만으로는
+  최대/최소가 1.26배다(계단 보간이면 1.07배). 정체를 만드는 건 굴곡보다 **절대 수위**이므로
+  N\* 튜닝이 본질이다. 굴곡이 더 필요하면 창을 06:00부터 잡아 상승구간(3.7%→6.8%, 1.8배)을
+  포함시키는 선택지가 있다.
 - **N\* 레벨 튜닝** — 총 통행/창을 피크가 용량 넘도록. 반복 보정(v2 §5-3, γ 배율 수렴).
 - **λ 최종값** — 0.9999 앵커, 배정 결과를 실측 지점 교통량과 비교해 미세조정(가능하면).
 - **"가장 붐비는 시점" 정의** — 시간곡선 정점 스냅샷 1장 (이미 시간프로파일 채택했으므로 명확).
@@ -386,6 +393,24 @@ Overpass가 bbox에 걸친 way의 **전 노드**를 반환하므로, 멀리 뻗�
   시간대 슬라이스를 넣는 순간 구간이 겹치고 창 밖으로 샌다.
   `write_od_o_format`은 **소수 시간을 받아 내부에서 `_hhmm()`으로 변환**하므로 호출부는
   그냥 `7.5`(=7시 30분)라고 넘기면 된다.
+- **⚠️ O-format `factor`는 정밀도를 충분히 줄 것 (2026-07-27):** 소수 2자리로 쓰면
+  15분 8구간의 factor(0.1046~0.1328)가 `0.11·0.12·0.13×6`으로 뭉개져 **의도한 1.26배 굴곡이
+  1.12배로 납작해진다.** 굴곡이 사라지면 정체가 안 생기고 배치 비교가 성립하지 않는다.
+  `write_od_o_format`은 `.8f`로 기록한다.
+- **⚠️ od2trips 셀별 반올림 편향 — 초과분이 OD 라인 수의 ~1%인 *상수* (2026-07-27 실측):**
+
+  | OD 라인 | 초과 차량 |
+  |---|---|
+  | 3,422 | +37.6 |
+  | 2,122 | +22.5 |
+  | 1,729 | +19.1 |
+
+  **총 통행량과 무관하다** — `--scale 0.1`로 줄여도 초과분은 그대로라 50대 목표에 113대
+  (+123%)가 나온다. 즉 `total_trips`가 작을수록 치명적이다.
+  → **`total_trips ≥ OD 라인 수`** 를 지키면 오차 1% 아래. `generate_demand`가 위반 시 경고한다.
+  **N\* 튜닝 때 하한선으로 쓸 것.**
+  여러 슬라이스를 함께 넘기면 이 초과가 **첫 구간에 몰려** 첫 15분이 7%쯤 부풀려진다
+  (시드를 바꿔도 계통적). 예열 구간을 창 앞에 두면 흡수된다.
 - **O-format:** 첫 줄 `$OR;D2`, 다음 `begin_h end_h`(**HH.MM**), `factor`, 이후 `origin dest count`.
 - **TAZ 파일:** `<tazs><taz id="ix_iy"><tazSource id=edge weight=len/><tazSink .../></taz></tazs>`.
 - **CRS:** 건물 parquet 4326. 면적은 `to_crs(5186).area`. 원본 shp는 5186.
@@ -420,9 +445,10 @@ backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py area-1b5adb59
 1. ~~**오케스트레이터 모듈화**~~ → ✅ **완료** (커밋 `b627ecc`). `demand/pipeline.py`의
    `generate_demand()` 하나로 net.xml → routes.xml. 함정 4개 내부 흡수.
    그 과정에서 **O-format 시각이 `HH.MM`** 이라는 걸 발견해 고쳤다(§7).
-2. **시간대 OD 슬라이스 적용** — 배관은 완성됐다(`time_profile` 인자 + `od_time_slices()`,
-   3구간 검증 완료). 남은 건 **24h 곡선(`시간대_프로파일.csv`)을 읽어 창에 맞게 잘라
-   넘기는 것**과 **창 길이 결정**(§6).
+2. ~~**시간대 OD 슬라이스**~~ → ✅ **완료** (커밋 `b603f2f`). **창 07:00~09:00, 15분 8구간**
+   확정. `time_profile.build_time_profile()` → `generate_demand(time_profile=...)`.
+   출발시각이 창 안 100%로 들어가는 것까지 스모크에서 검증.
+   그 과정에서 **factor 정밀도**와 **od2trips 반올림 편향**을 발견해 기록(§7).
 3. **동적 SUMO** — 예열 → 피크 스냅샷 → 엣지별 교통량 → 배치 수요.
    ⚠️ `sumo` 본체의 한글 경로 내성은 **아직 미검증**(§7) — 여기서 확인할 것.
    (`pipeline.ascii_temp_base()`가 이미 있으니 필요하면 그대로 재사용.)
