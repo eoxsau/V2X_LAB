@@ -13,6 +13,8 @@
     → 이 스크립트는 import 전에 POSTGIS_ENABLED=false를 강제해 parquet 경로를 탄다.
   * od2trips는 경로에 한글이 있으면 파일을 못 연다(netconvert·duarouter는 정상).
     → od2trips 단계만 ASCII 임시 디렉터리에 스테이징한다.
+  * net.xml의 origBoundary는 실제 도로 범위와 크게 다를 수 있다(경계 밖 way의 노드까지
+    포함되기 때문). → 건물 조회 bbox는 assignment.net_bbox()로 엣지 형상에서 직접 잰다.
   * 콘솔이 cp949면 출력이 깨진다. PYTHONIOENCODING=utf-8 권장.
 """
 from __future__ import annotations
@@ -81,11 +83,24 @@ def main() -> int:
         return 1
 
     txt = net.read_text(encoding="utf-8")
-    minlng, minlat, maxlng, maxlat = [
-        float(x) for x in re.search(r'origBoundary="([^"]+)"', txt).group(1).split(",")]
-    ref_lat = (minlat + maxlat) / 2
-    print(f"  bbox {minlng:.5f},{minlat:.5f} ~ {maxlng:.5f},{maxlat:.5f} (ref_lat={ref_lat:.5f})")
     print(f"  신호등(tlLogic) = {txt.count('<tlLogic')}개")
+
+    # bbox는 origBoundary가 아니라 **실제 도로 형상**에서 뽑는다 (§7 함정).
+    from app.services.demand.assignment import read_net, net_bbox
+
+    sumo_net = read_net(str(net))   # 한 번 읽어 bbox·TAZ·진단에 재사용
+    minlng, minlat, maxlng, maxlat = net_bbox(sumo_net, margin_m=CELL_M)
+    ref_lat = (minlat + maxlat) / 2
+    print(f"  도로 bbox {minlng:.5f},{minlat:.5f} ~ {maxlng:.5f},{maxlat:.5f} "
+          f"(ref_lat={ref_lat:.5f})")
+
+    m = re.search(r'origBoundary="([^"]+)"', txt)
+    if m:
+        o = [float(x) for x in m.group(1).split(",")]
+        ow = (o[2] - o[0]) / max(maxlng - minlng, 1e-9)
+        oh = (o[3] - o[1]) / max(maxlat - minlat, 1e-9)
+        note = "  ← origBoundary 오염(§7). 그대로 썼으면 수요 대부분이 증발" if max(ow, oh) > 1.5 else ""
+        print(f"  (참고) origBoundary는 도로 범위의 {ow:.1f}×{oh:.1f}배{note}")
 
     # ── 2. 건물 → 질량 ────────────────────────────────────────────
     stage("2. 건물 로드 → 질량(연면적 = 바닥면적 × 층수)")
@@ -125,22 +140,28 @@ def main() -> int:
     # ── 5. TAZ + OD (최근접 도로존 재배정 적용) ───────────────────
     stage("5. TAZ + OD 파일  (도로 없는 존 → 최근접 도로존 재배정)")
     from app.services.demand.assignment import (build_taz, write_taz_xml, write_od_o_format,
-                                                map_zones_to_taz, taz_mapping_summary)
+                                                map_zones_to_taz, taz_mapping_summary,
+                                                component_summary)
 
-    taz = build_taz(str(net), CELL_M, ref_lat)
+    print("  승용차 그래프 연결성:")
+    for k, v in component_summary(sumo_net).items():
+        print(f"    {k:24s} {v}")
+
+    taz = build_taz(sumo_net, CELL_M, ref_lat, largest_component_only=True)
     zone_taz = map_zones_to_taz(zones, taz, cell_size_m=CELL_M, max_reassign_m=MAX_REASSIGN_M)
     print(f"  TAZ(도로 있는 셀) {len(taz)}개")
     for k, v in taz_mapping_summary(zones, zone_taz, cell_size_m=CELL_M).items():
         print(f"    {k:24s} {v}")
 
-    kept = sum(f.trips for f in flows
-               if zone_taz.get(f.i) and zone_taz.get(f.j) and zone_taz[f.i] != zone_taz[f.j])
+    inter = sum(f.trips for f in flows
+                if zone_taz.get(f.i) and zone_taz.get(f.j) and zone_taz[f.i] != zone_taz[f.j])
     intra = sum(f.trips for f in flows
                 if zone_taz.get(f.i) and zone_taz.get(f.j) and zone_taz[f.i] == zone_taz[f.j])
     lost = sum(f.trips for f in flows
                if zone_taz.get(f.i) is None or zone_taz.get(f.j) is None)
+    kept = inter + intra   # 같은TAZ(o==d)도 적재 — 재배정이 합친 실재 수요 (keep_intra_zone)
     print(f"\n  통행량 {TOTAL_TRIPS:.0f} 중 → OD적재 {kept:.0f} ({kept / TOTAL_TRIPS * 100:.1f}%)"
-          f" | 같은TAZ(o==d) 탈락 {intra:.0f} | 존 버려짐 {lost:.0f}")
+          f" | 그중 같은TAZ(o==d) {intra:.0f} | 존 버려짐 {lost:.0f}")
 
     taz_f, od_f = work / "smoke.taz.xml", work / "smoke.od.txt"
     write_taz_xml(taz, str(taz_f))
@@ -157,6 +178,8 @@ def main() -> int:
     if not run("od2trips", [
         SUMO_BIN / "od2trips.exe", "--taz-files", a_taz, "--od-matrix-files", a_od,
         "-o", a_trips, "--spread.uniform",
+        # 같은 TAZ 안(o==d) 통행에서 출발=도착 엣지가 뽑히면 주행이 성립하지 않는다
+        "--different-source-sink",
     ]):
         return 1
     n_trips = a_trips.read_text(encoding="utf-8").count("<trip ")
