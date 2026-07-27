@@ -70,6 +70,9 @@ class TrafficScenario:
 
     n_vehicles: int = 0
     demand_points: list = field(default_factory=list)   # sa_placement.DemandPoint
+    # 피크 구간 엣지별 교통량 원본 — 배치 수요(demand_points)와 배경 차량 양쪽의 재료.
+    # {edge_id, lat, lng, vehicle_count, mean_speed_kph} 형태로 직렬화해 캐시한다.
+    peak_edge_loads: list = field(default_factory=list)
     stats: dict = field(default_factory=dict)
 
     @property
@@ -189,6 +192,12 @@ def build_traffic_scenario(
         peak_time_s=sim.peak_time_s,
         n_vehicles=d.n_vehicles,
         demand_points=points,
+        peak_edge_loads=[
+            {"edge_id": ld.edge_id, "lat": ld.lat, "lng": ld.lng,
+             "vehicle_count": round(ld.vehicle_count, 3),
+             "mean_speed_kph": round(ld.mean_speed_kph, 1)}
+            for ld in sim.peak_edges
+        ],
         stats={
             **sim.stats,
             "survival_rate": round(d.survival_rate, 4),
@@ -201,6 +210,42 @@ def build_traffic_scenario(
     log(f"교통 준비 완료 — 차량 {sc.n_vehicles}대, 피크 {sc.peak_running}대 "
         f"@{sc.peak_time_s / 3600:.2f}h, 배치 수요점 {len(points)}개")
     return sc
+
+
+def background_vehicles_from_scenario(sc: TrafficScenario,
+                                      max_vehicles: int = 20000) -> list[dict]:
+    """피크 스냅샷 → 배경 차량 목록 `[{id, lat, lng, speed_kmh}]`.
+
+    분석·배치 경로(`main._prepare_simulation_run`)가 기지국별 접속 차량 수를 셀 때 쓰던
+    `_generate_background_vehicles`(bbox 안 무작위 OD)를 대체한다.
+
+    왜 바꾸나: 무작위 배치는 모든 도로에 차를 고르게 뿌린다. 그런데 실측에서 교통은
+    **상위 10% 엣지에 75%** 가 몰린다. 균일하게 뿌리면 간선 옆 기지국과 골목 옆 기지국의
+    부하가 비슷하게 나와, 배치를 바꿔도 성능 차이가 드러나지 않는다.
+
+    엣지 하나가 실은 차량 수(`vehicle_count`, 그 구간 평균 동시 대수)만큼 그 엣지
+    중점에 차를 놓는다. 속도는 그 엣지의 실측 평균을 쓴다 — 막힌 엣지의 차는 느리게,
+    뚫린 엣지의 차는 빠르게 잡힌다.
+
+    max_vehicles : 안전 상한. 배율 300%처럼 극단적인 설정에서 목록이 폭주하지 않게 한다.
+    """
+    out: list[dict] = []
+    for ld in sorted(sc.peak_edge_loads or [],
+                     key=lambda x: -float(x.get("vehicle_count") or 0)):
+        n = int(round(float(ld.get("vehicle_count") or 0)))
+        if n <= 0:
+            continue
+        spd = float(ld.get("mean_speed_kph") or 0.0)
+        for k in range(n):
+            if len(out) >= max_vehicles:
+                return out
+            out.append({
+                "id": f"bg-{ld['edge_id']}-{k}",
+                "lat": float(ld["lat"]),
+                "lng": float(ld["lng"]),
+                "speed_kmh": round(spd, 1),
+            })
+    return out
 
 
 def _write_cache(path: Path, sc: TrafficScenario) -> None:

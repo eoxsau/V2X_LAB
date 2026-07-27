@@ -271,7 +271,8 @@ async def _cleanup_synthetic_nodes() -> None:
     except Exception:
         pass
 
-from app.services.demand.scenario import build_traffic_scenario, clamp_demand_scale
+from app.services.demand.scenario import (background_vehicles_from_scenario,
+                                          build_traffic_scenario, clamp_demand_scale)
 
 WORK_DIR = Path(__file__).parent / "networks"
 WORK_DIR.mkdir(exist_ok=True)
@@ -3099,12 +3100,16 @@ def overpass_download(bbox: BBox, out_file: Path):
     print(f"[OSM] Downloaded {size_kb:.1f} KB → {out_file}", flush=True)
 
 
-def current_traffic_scenario(force: bool = False):
+def current_traffic_scenario(force: bool = False, build: bool = True):
     """현재 구역의 생성 교통 한 세트를 준비한다 (없으면 만들고, 있으면 캐시 재사용).
 
     `demand/scenario.build_traffic_scenario`의 앱 측 래퍼. N* 산정·수요 생성·동적 SUMO가
     전부 그 안에서 일어나고, 여기서는 **구역·배율당 1회**만 돌도록 상태에 물려둔다
     ("교통 1회, 평가 여러 번" — 배치를 바꿔가며 같은 교통 위에서 비교해야 한다).
+
+    ⚠️ `build=True`면 **최대 10분**(N* 보정 포함)이 걸릴 수 있다. 이벤트 루프를 막으면
+    서버 전체가 멈추므로 **async 엔드포인트에서 직접 부르지 말 것** —
+    `run_in_executor`로 감싸거나, 이미 만들어진 것만 쓰려면 `build=False`로 부른다.
 
     Returns: TrafficScenario | None (net이 없거나 생성 실패 시 None — 호출부가 폴백)
     """
@@ -3122,6 +3127,8 @@ def current_traffic_scenario(force: bool = False):
             and Path(cached.net_file).resolve() == Path(net_file).resolve()
             and abs(cached.demand_scale - scale) < 1e-6):
         return cached
+    if not build:
+        return None
 
     try:
         sc = build_traffic_scenario(
@@ -4605,9 +4612,24 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
         except Exception as _k_gen_exc:
             print(f"[COST] K-path generation failed: {_k_gen_exc}", flush=True)
 
-    # ── STEP 1.5: 다중차량 실험군 — 배경 차량 생성 (vehicle_count > 1일 때만) ──
+    # ── STEP 1.5: 배경 차량 — **생성 교통의 피크 스냅샷**이 1순위 ──────────
+    # 예전엔 bbox 안에서 무작위 OD로 vehicle_count-1대를 뿌렸다. 그러면 모든 도로에
+    # 차가 고르게 깔려, 간선 옆 기지국과 골목 옆 기지국의 부하가 비슷해진다.
+    # 실측에서 교통은 상위 10% 엣지에 75%가 몰리므로, 균일 배치로는 배치를 바꿔도
+    # 성능 차이가 드러나지 않는다(v2 §8-1).
+    #
+    # 생성 교통이 있으면 vehicle_count는 무시한다 — 대수는 이제 입력이 아니라
+    # 수요 배율(demand_scale_pct)과 시간곡선이 정하는 **결과**다(진행문서 §2-9).
     _bg_vehicles: list = []
-    if req.vehicle_count and req.vehicle_count > 1 and _state.get("current_bbox"):
+    # 여기서는 **이미 만들어진 것만** 쓴다. 이 함수는 동기이고 async 엔드포인트에서
+    # 직접 호출되므로, 여기서 교통을 만들면 이벤트 루프가 수 분간 멈춘다.
+    # 생성은 호출부(start_simulation)가 executor에서 미리 해둔다.
+    _scn = current_traffic_scenario(build=False)
+    if _scn is not None and _scn.peak_edge_loads:
+        _bg_vehicles = background_vehicles_from_scenario(_scn)
+        print(f"[BG-VEHICLES] 생성 교통 피크 스냅샷 {len(_bg_vehicles)}대 "
+              f"(N* {_scn.n_star:.0f} × {_scn.demand_scale * 100:.0f}%)", flush=True)
+    elif req.vehicle_count and req.vehicle_count > 1 and _state.get("current_bbox"):
         try:
             _bg_vehicles = _generate_background_vehicles(
                 _state["mock_graph"], _state["current_bbox"], req.vehicle_count - 1, _rng,
@@ -4774,6 +4796,10 @@ async def start_simulation(req: SimStartRequest):
         _sim_thread.join(timeout=5)
     _stop_event = threading.Event()
     _pause_event = threading.Event()
+
+    # 생성 교통을 미리 준비한다 — 무거우므로(N* 보정 포함 최대 수 분) executor에서.
+    # 이후 _prepare_simulation_run과 simulation_thread는 만들어진 것을 읽기만 한다.
+    await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
 
     _prepare_simulation_run(req)
     _route_algo = req.algorithm_config.get("route", "dijkstra")
