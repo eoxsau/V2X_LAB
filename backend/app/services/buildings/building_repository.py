@@ -62,7 +62,21 @@ class BuildingRepository:
                 """,
                 {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat},
             )
-        if not self.processed_ready():
+        return self.query_by_bbox_parquet(min_lng, min_lat, max_lng, max_lat)
+
+    def query_by_bbox_parquet(
+        self, min_lng: float, min_lat: float, max_lng: float, max_lat: float
+    ) -> gpd.GeoDataFrame:
+        """PostGIS를 건너뛰고 processed parquet에서 직접 조회.
+
+        `postgis_available()`은 실제 연결이 아니라 **환경변수만** 검사하므로, 서버가 꺼져
+        있어도 True가 되어 `query_by_bbox`가 PostGIS 분기로 들어가고 빈 결과를 돌려준다
+        (2026-07-27 확인). 교통 수요 파이프라인은 parquet만 있으면 되고 DB 상태와 무관하게
+        동작해야 하므로 이 경로를 직접 부른다. `postgis_available()` 자체를 고치는 건
+        앱 전체에 영향이 커서 보류 중.
+        """
+        # processed_ready()는 postgis_available()을 먼저 타므로 여기서는 쓰지 않는다.
+        if not self.index_path.exists():
             return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         search_geom = box(min_lng, min_lat, max_lng, max_lat)
         frames: list[gpd.GeoDataFrame] = []

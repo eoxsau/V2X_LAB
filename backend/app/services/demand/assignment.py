@@ -258,6 +258,12 @@ def write_taz_xml(taz: dict[str, list[tuple[str, float]]], path: str) -> None:
         f.write('</tazs>\n')
 
 
+def _hhmm(hours: float) -> str:
+    """소수 시간 → SUMO O-format의 `HH.MM`. 7.5 → "7.30" (7시 30분)."""
+    total_min = int(round(hours * 60))
+    return f"{total_min // 60}.{total_min % 60:02d}"
+
+
 def write_od_o_format(
     flows,
     zone_taz: dict[int, Optional[str]],
@@ -271,6 +277,15 @@ def write_od_o_format(
 
     zone_taz: 존 인덱스 → TAZ id(엣지 있는 존만; 없으면 None → 스킵).
     시간(begin_h~end_h)은 시(hour) 단위. 여러 시간대 프로파일은 슬라이스별로 여러 파일.
+
+    begin_h, end_h : **소수 시간**(7.5 = 7시 30분). 내부에서 SUMO O-format의 `HH.MM`으로
+        변환해 기록한다.
+
+        ⚠️ O-format의 시각은 소수 시간이 아니라 **`HH.MM`(시.분)** 이다 (2026-07-27 실측:
+        `7.00 7.30` → 정확히 1800초 창, `7.00 7.50` → 3000초 창). 예전엔 `7.5`를
+        `"7.50"`으로 그대로 찍어 **7시 30분이 아니라 7시 50분**이 됐다. 정시(7.0/8.0)만
+        쓰던 동안엔 우연히 맞아떨어져 드러나지 않았고, 시간대 슬라이스를 넣자마자
+        구간이 서로 겹치고 창 밖으로 새어 나갔다.
 
     keep_intra_zone : o == d (같은 TAZ) 통행을 살릴지. 기본 True.
         radiation은 애초에 i == j를 만들지 않으므로, 여기서 생기는 o == d는 전부
@@ -294,7 +309,7 @@ def write_od_o_format(
     with open(path, "w", encoding="utf-8") as f:
         f.write('$OR;D2\n')
         f.write('* From-Time  To-Time\n')
-        f.write(f'{begin_h:.2f} {end_h:.2f}\n')
+        f.write(f'{_hhmm(begin_h)} {_hhmm(end_h)}\n')
         f.write('* Factor\n')
         f.write(f'{factor:.2f}\n')
         f.write('* Origin  Destination  Count\n')
