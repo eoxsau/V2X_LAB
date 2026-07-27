@@ -56,6 +56,34 @@ def compute_cbr_per_edge(vehicle_density_veh_per_m: float,
     }
 
 
+def edge_densities(state: dict, per_edge: list[dict]) -> list[float]:
+    """경로 엣지별 차량 밀도(대/m) — CBR의 ρ.
+
+    우선순위:
+      1. **실측** `state["edge_avg_density"]` — 타겟이 그 엣지를 지나는 동안 SUMO에서 잰 값.
+      2. 폴백: 총 차량수 / 전체 경로거리 (예전 방식, 균일 가정).
+
+    왜 균일 가정을 버렸나 (2026-07-27):
+        `sim_vehicle_count / total_route_distance`는 경로 전체에 차가 **고르게** 깔렸다고
+        본다. 그런데 생성 교통 실측에서 **상위 10% 엣지가 교통량의 75%** 를 점유한다.
+        균일 가정은 병목 구간(간선·교차로)의 채널 점유율을 크게 과소평가하고, 한산한
+        구간은 과대평가한다. CBR 임계값(0.65)으로 혼잡을 판정하는 지표라 이 왜곡이 그대로
+        결론에 들어간다.
+    """
+    measured = state.get("edge_avg_density") or {}
+    veh_count = int(state.get("sim_vehicle_count") or 1)
+    rc = state.get("route_cost_result") or {}
+    total_dist = float(rc.get("total_distance_m") or 1000.0)
+    fallback = veh_count / max(total_dist, 1.0)
+
+    out: list[float] = []
+    for e in per_edge:
+        eid = e.get("edge_id", "")
+        rho = measured.get(eid)
+        out.append(float(rho) if rho is not None else fallback)
+    return out
+
+
 def compute_pir_p99(prr: float, cam_period_ms: float = 100.0) -> dict:
     """
     PIR P99 geometric-distribution upper bound — 3GPP TR 37.885 + Eckermann 2019
@@ -266,13 +294,10 @@ def build_run_summary(state: dict) -> dict:
 
     # CBR avg — mean channel busy ratio across route edges (Gonzalez-Martin, IEEE TVT 2019)
     per_edge = rc.get("per_edge") or []
-    veh_count  = int(state.get("sim_vehicle_count") or 1)
-    total_dist = float(rc.get("total_distance_m") or 1000.0)
-    veh_per_m  = veh_count / max(total_dist, 1.0)
     cbr_avg = None
     if per_edge:
-        cbr_vals = [compute_cbr_per_edge(veh_per_m, coverage_radius_m=200.0)["cbr"]
-                    for _ in per_edge]
+        cbr_vals = [compute_cbr_per_edge(rho, coverage_radius_m=200.0)["cbr"]
+                    for rho in edge_densities(state, per_edge)]
         cbr_avg = round(sum(cbr_vals) / len(cbr_vals), 4)
 
     # URLLC compliance ratio — P(L ≤ 10 ms); 3GPP TS 22.261 §7.2 URLLC latency bound = 10 ms
@@ -418,6 +443,7 @@ PER_EDGE_COLUMNS = [
     "loss_db",
     "total_cost",
     # analytical channel metrics
+    "veh_density_per_m",
     "cbr",
     "cbr_congested",
     "path_loss_db",
@@ -441,10 +467,8 @@ def build_per_edge_metrics(state: dict) -> list[dict]:
     per_edge   = rc.get("per_edge") or []
     edge_names = state.get("route_edge_names") or {}
 
-    # Vehicle density for CBR: sim_vehicle_count / total route distance (m)
-    veh_count   = int(state.get("sim_vehicle_count") or 1)
-    total_dist  = float(rc.get("total_distance_m") or 1000.0)
-    veh_per_m   = veh_count / max(total_dist, 1.0)
+    # CBR의 ρ — 엣지별 실측 밀도(없으면 균일 폴백). edge_densities() 주석 참조.
+    _rho_per_edge = edge_densities(state, per_edge)
 
     # Environment tag for path loss: derive from network_mode / scenario
     policy = state.get("policy_options") or {}
@@ -471,7 +495,7 @@ def build_per_edge_metrics(state: dict) -> list[dict]:
     for i, e in enumerate(per_edge):
         eid = e.get("edge_id", "")
         dist_m = float(e.get("distance_m") or 50.0)
-        cbr_data  = compute_cbr_per_edge(veh_per_m, coverage_radius_m=200.0)
+        cbr_data  = compute_cbr_per_edge(_rho_per_edge[i], coverage_radius_m=200.0)
         pl_data   = compute_path_loss(dist_m, env=_pl_env)
         rows.append({
             "run_id":         run_id,
@@ -491,6 +515,7 @@ def build_per_edge_metrics(state: dict) -> list[dict]:
             "loss_db":        e.get("loss_db"),
             "total_cost":     e.get("total_cost"),
             # analytical channel metrics
+            "veh_density_per_m": round(_rho_per_edge[i], 6),   # CBR의 ρ (실측 또는 균일 폴백)
             "cbr":            cbr_data["cbr"],
             "cbr_congested":  cbr_data["cbr_congested"],
             "path_loss_db":   pl_data["path_loss_db"],

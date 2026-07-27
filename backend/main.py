@@ -431,6 +431,7 @@ _state = {
     "route_edge_names": {},
     "edge_telemetry": [],
     "edge_avg_speeds": {},   # {edge_id: avg_speed_kmh} measured while vehicle traversed
+    "edge_avg_density": {},  # {edge_id: veh/m} 타겟이 그 엣지를 지나는 동안의 실측 밀도 — CBR의 ρ
     "edge_history": [],      # completed edge_ids in traversal order
     "k_path_candidates": None,
     "k_path_edge_data": None,  # cached (path_ids, edge_data) tuples — reused to re-score K-path costs periodically without re-running Yen's
@@ -1363,6 +1364,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         "edge_stats": list(_state.get("edge_telemetry", [])),
         "route_edge_names": _state.get("route_edge_names", {}),
         "edge_avg_speeds": dict(_state.get("edge_avg_speeds", {})),
+        "edge_avg_density": dict(_state.get("edge_avg_density", {})),
         "edge_history": list(_state.get("edge_history", [])),
         "custom_policy_debug": dict(_state.get("custom_policy_debug") or {}),
         "routing_mode": (_state.get("route_cost_result") or {}).get("routing_mode", ""),
@@ -3704,6 +3706,8 @@ def simulation_thread(
         arrived = False
         max_steps = 100_000  # safety limit
         _spd_acc: dict[str, list] = {}   # edge_id -> [speed_kmh, ...]
+        _den_acc: dict[str, list] = {}   # edge_id -> [veh/m, ...] — CBR의 ρ 실측
+        _edge_len_m: dict[str, float] = {}
         _prev_ridx = -1
         # 타겟 차량이 한 번이라도 시뮬에 나타났는지 — "목록에 없음"을 삽입 대기와
         # 도착 중 무엇으로 볼지 가르는 기준(아래 루프 주석 참조).
@@ -3774,11 +3778,28 @@ def simulation_thread(
             if 0 <= route_idx < len(edges):
                 _cur_eid = edges[route_idx]
                 _spd_acc.setdefault(_cur_eid, []).append(_spd_kmh)
+                # 차량 밀도(대/m)도 함께 — **타겟이 그 엣지 위에 있는 동안의 실측**이다.
+                # CBR(ρ)이 예전엔 "총 차량수 / 전체 경로거리"라는 균일 가정을 썼는데,
+                # 교통이 간선·교차로에 몰리는 게 실측으로 확인된 이상(상위10% 엣지가 75%)
+                # 그 가정은 병목 구간의 채널 점유율을 크게 과소평가한다.
+                try:
+                    _n_here = traci.edge.getLastStepVehicleNumber(_cur_eid)
+                    _len_here = _edge_len_m.get(_cur_eid)
+                    if _len_here is None:
+                        _len_here = float(net.getEdge(_cur_eid).getLength())
+                        _edge_len_m[_cur_eid] = _len_here
+                    if _len_here > 0:
+                        _den_acc.setdefault(_cur_eid, []).append(_n_here / _len_here)
+                except Exception:
+                    pass
                 if route_idx != _prev_ridx and _prev_ridx >= 0 and _prev_ridx < len(edges):
                     _prev_eid = edges[_prev_ridx]
                     _samples = _spd_acc.get(_prev_eid, [])
                     if _samples:
                         _state["edge_avg_speeds"][_prev_eid] = round(sum(_samples) / len(_samples), 1)
+                    _dens = _den_acc.get(_prev_eid, [])
+                    if _dens:
+                        _state["edge_avg_density"][_prev_eid] = round(sum(_dens) / len(_dens), 6)
                     if _prev_eid not in _state["edge_history"]:
                         _state["edge_history"].append(_prev_eid)
                 _prev_ridx = route_idx
@@ -3980,6 +4001,7 @@ def reset_runtime_state() -> None:
     _state["route_edge_names"] = {}
     _state["edge_telemetry"] = []
     _state["edge_avg_speeds"] = {}
+    _state["edge_avg_density"] = {}
     _state["edge_history"] = []
     _state["k_path_candidates"] = None
     _state["k_path_edge_data"] = None
@@ -4476,6 +4498,7 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
     # 이전 런의 엣지 기록 초기화 (다음 런에서 "현재" 고정 버그 방지)
     _state["edge_history"] = []
     _state["edge_avg_speeds"] = {}
+    _state["edge_avg_density"] = {}
     _state["edge_telemetry"] = []
     _state["selected_algorithms"] = req.algorithm_config or {}
     _state["simulation_run_id"] = create_simulation_run(
