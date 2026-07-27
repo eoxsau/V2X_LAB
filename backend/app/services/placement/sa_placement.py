@@ -541,6 +541,7 @@ def optimize_placement(
     sa_iter: int = 2000,
     seed: Optional[int] = None,
     bbox: Optional[dict] = None,
+    demand: Optional[list[DemandPoint]] = None,
 ) -> PlacementResult:
     """배치 최적화 최상위 진입점.
 
@@ -548,6 +549,12 @@ def optimize_placement(
     its_links: TRAFFIC_FUSION_ENGINE.current_traffic(time_period)["links"]
     N: 설치할 기지국 수
     bbox: 주어지면 후보를 그 안으로 제한(사용자 원본 구역 밖 배치 방지).
+    demand: **생성 교통에서 뽑은 수요점**(`demand.simulation.edge_loads_to_demand`).
+        주어지면 이걸 쓰고, 없으면 기존 폴백(ITS → 균일 5.0)을 탄다.
+
+        왜 이게 중요한가: 균일 수요에서는 모든 도로가 똑같이 중요하다고 놓고 최적화하는
+        셈이라 결과가 사실상 "골고루 뿌리기"가 된다. 피크 스냅샷의 엣지별 실제 밀도를
+        넣어야 간선·교차로 집중이라는 결론이 나올 수 있다(v2 §8-1).
     """
     candidates = build_candidates_from_graph(graph, node_type=node_type, bbox=bbox)
     if not candidates:
@@ -557,7 +564,8 @@ def optimize_placement(
             uncovered_demand_pct=100.0, n_candidates=0, n_demand_points=0, n_iterations=0,
         )
 
-    demand = build_demand_from_its(its_links)
+    if not demand:
+        demand = build_demand_from_its(its_links)
     if not demand:
         demand = build_demand_from_graph(graph)
 

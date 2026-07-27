@@ -70,9 +70,16 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
      (셀렉터가 아니라 독립 기능이다 — [`tab-dashboard.jsx:1373`](frontend/tab-dashboard.jsx)
      지연·개선율·미커버율·배치일치율 비교표. 같은 시뮬의 두 시점으로 재소스하는 안도 검토했으나
      **그냥 없애기로 결정**).
-   - **"다중 차량 대수" 입력 제거** → **수요 배율 n**으로 교체. 배경 차량 대수는 이제
-     *입력이 아니라 결과*다(N\* × n과 시간곡선이 정하고 동시주행 대수는 Little's Law로 따라옴).
+   - **"다중 차량 대수" 입력 제거** → **수요 배율**로 교체. 배경 차량 대수는 이제
+     *입력이 아니라 결과*다(N\* × 배율과 시간곡선이 정하고 동시주행 대수는 Little's Law로 따라옴).
      ⚠️ **타겟 차량(veh0)은 남는다** — 라우팅 알고리즘 비교 대상이라 별개다.
+     **노브 형태 = 퍼센트 슬라이더, 10%~300%** (2026-07-27 확정, 상·하한은 잠정).
+     백엔드는 `policy_options.demand_scale_pct`(기본 100)로 받고, 범위 규칙은
+     `demand/scenario.py:clamp_demand_scale` 한 곳에만 둔다.
+     ⚠️ **낮은 배율에서는 실제 대수가 요청과 어긋난다** — od2trips 반올림 편향이
+     상수라서 배율이 낮을수록 비율이 커진다. 영등포 실측: 10% → **+16.4%**,
+     50% → −1.4%, 100% → −3.6%. `TrafficScenario.to_summary()["vehicle_count_error_pct"]`에
+     실측값이 담기니 UI에 같이 보여주는 게 정직하다.
    - 딸려오는 것 2건: **CBR의 ρ**([`tab-dashboard.jsx:358`](frontend/tab-dashboard.jsx))가
      `vehicle_count / route_distance_m`로 균일 밀도를 가정하는데, 이제 **엣지별 실측 밀도**
      (`EdgeLoad.density`)로 바꿀 수 있다(제거가 아니라 개선). 그리고 **시나리오 탭**의
@@ -95,6 +102,7 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
 | `geo/spatial_grid.py` | 순수파이썬 공간 해시 그리드 (scipy 없이 O(1) 최근접/반경) | `SpatialGrid(items, coords_fn, cell_size_m).nearest()/within()/add()` |
 | `demand/grid_mass.py` | §3·§4 격자 존 + 건물 질량 | `build_zones(buildings=[(lat,lng,mass)], cell_size_m, ref_lat, origin_shift_m) → [Zone]`; `cell_of(lat,lng,cell,ref_lat,shift)`; `zone_stats()` |
 | `demand/radiation.py` | §6 radiation OD | `radiation_od_matrix(masses, coords, total_trips, lam=0.9999) → [ODFlow(i,j,trips)]`; `od_summary()` |
+| **`demand/scenario.py`** | **§7 앱 진입점** | **`build_traffic_scenario(net_file, out_dir, demand_scale=1.0) → TrafficScenario`** — N\* 산정 → 수요 생성 → 동적 SUMO를 한 번에. `routes_file`(실시간 주행용) + `demand_points`(배치용) + `to_summary()`. `clamp_demand_scale()` (10~300% 단일 정의). **main.py는 이 함수 하나만 알면 된다.** |
 | **`demand/calibration.py`** | **§5-C N\* 자동 산정** | **`cached_nstar(net, out_dir, profile) → NStarResult`** (구역·창당 1회, net 해시 캐시); `estimate_nstar_seed()` (시뮬 0회 해석적 시드); `calibrate_nstar()` (γ 이분 보정); `network_lane_km()`; `peak_rate_per_hour()`. 상수 `K_TARGET=2.8`(시드용), `DEFAULT_SAFETY_FACTOR=0.9` |
 | **`demand/time_profile.py`** | **§5 6단계 시간곡선** | `load_hourly_profile()` (24h CSV → 비율 24개); **`build_time_profile(begin_h, end_h, step_min=15, interpolate=True)`** → `[(b,e,share)]`; `profile_summary()` (굴곡 확인용 막대) |
 | **`demand/simulation.py`** | **§5 6단계 동적 SUMO** | **`run_simulation(net, routes, out_dir, warmup_s=900, time_to_teleport_s=300) → SimResult`** — 예열 → 정체 → 시간곡선 + 피크 구간 엣지별 교통량. `SimResult.peak_edges/congestion_ratio/stats`; **`edge_loads_to_demand()`** (→ `sa_placement.DemandPoint`); `congestion_summary()` |

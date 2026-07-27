@@ -271,6 +271,8 @@ async def _cleanup_synthetic_nodes() -> None:
     except Exception:
         pass
 
+from app.services.demand.scenario import build_traffic_scenario, clamp_demand_scale
+
 WORK_DIR = Path(__file__).parent / "networks"
 WORK_DIR.mkdir(exist_ok=True)
 MAX_SETUP_AREA_KM2        = 25.0   # Overpass API 모드 상한 (대용량 다운로드 불안정)
@@ -402,6 +404,7 @@ if FRONTEND_DIR.exists():
 _state = {
     "network_ready": False,
     "net_file": None,      # path to .net.xml
+    "traffic_scenario": None,  # demand.scenario.TrafficScenario — 생성 교통 1세트(구역·배율당 1회)
     "osm_file": None,      # path to downloaded .osm
     "mock_graph": None,    # parsed OSM road graph for fallback mode
     "sim_running": False,
@@ -501,7 +504,10 @@ class SimConfigPolicyOptions(BaseModel):
     other_device_lambda:  float = 30.0  # 차량 외 기기 순간 활성 밀도 (기기/km²) — 총 밀도 ~300/km²의 활성 비율 ~10% 적용
                                          # 출처: Gonzalez-Martin et al. IEEE TVT 2019; 3GPP TR 38.901 Urban Macro 시나리오
     network_mode:         str   = "5G"  # "4G" / "5G" / "6G" — drives latency model
-    traffic_time_period:  str   = "peak"  # "peak" / "off_peak" — 어느 ITS 동기화 버킷을 시뮬레이션에 쓸지
+    traffic_time_period:  str   = "peak"  # (폐기 예정) ITS 첨두/비첨두 버킷 — 생성 교통이 대체
+    demand_scale_pct:     float = 100.0 # 기준 교통량(N*) 대비 %. 10~300. 생성 교통의 총 통행 수를 정한다.
+                                         # N*는 구역마다 자동 산정(demand/calibration.py, 진행문서 §5-C).
+                                         # 100% = 정체가 "생겼다 풀리는" 수준.
     bg_reroute_prob:      float = 0.02  # 배경 차량이 초당 무작위로 목적지를 바꿀 확률 (0~1) — 고정 경로 대신 동적 재경로
     bg_reroute_mode:      str   = "random"  # "random"(균일 확률) | "congestion"(현재 위치 BS 혼잡도에 비례해 확률 증가) — Pro 전용
 
@@ -632,6 +638,8 @@ def _apply_simulation_config(cfg: SimulationConfigModel) -> None:
         "traffic_time_period":  pol.traffic_time_period if pol.traffic_time_period in ("peak", "off_peak") else "peak",
         "bg_reroute_prob":      max(0.0, min(float(pol.bg_reroute_prob), 1.0)),
         "bg_reroute_mode":      pol.bg_reroute_mode if pol.bg_reroute_mode in ("random", "congestion") else "random",
+        # 10~300% — 범위는 demand/scenario.py에 단일 정의(clamp_demand_scale)
+        "demand_scale_pct":     round(clamp_demand_scale(float(pol.demand_scale_pct) / 100.0) * 100, 1),
     }
     _state["simulation_config"] = cfg.model_dump()
 
@@ -3089,6 +3097,47 @@ def overpass_download(bbox: BBox, out_file: Path):
     print(f"[OSM] Downloaded {size_kb:.1f} KB → {out_file}", flush=True)
 
 
+def current_traffic_scenario(force: bool = False):
+    """현재 구역의 생성 교통 한 세트를 준비한다 (없으면 만들고, 있으면 캐시 재사용).
+
+    `demand/scenario.build_traffic_scenario`의 앱 측 래퍼. N* 산정·수요 생성·동적 SUMO가
+    전부 그 안에서 일어나고, 여기서는 **구역·배율당 1회**만 돌도록 상태에 물려둔다
+    ("교통 1회, 평가 여러 번" — 배치를 바꿔가며 같은 교통 위에서 비교해야 한다).
+
+    Returns: TrafficScenario | None (net이 없거나 생성 실패 시 None — 호출부가 폴백)
+    """
+    net_file = _state.get("net_file")
+    if not net_file or not Path(net_file).exists():
+        return None
+
+    scale = clamp_demand_scale(
+        float((_state.get("policy_options") or {}).get("demand_scale_pct", 100.0)) / 100.0)
+    cached = _state.get("traffic_scenario")
+    # 경로는 반드시 resolve()로 정규화해 비교할 것 — 문자열 그대로 비교하면
+    # 'networks/wired.net.xml' vs 'networks\\wired.net.xml'처럼 구분자만 달라도
+    # 캐시가 매번 빗나간다(2026-07-27 실측).
+    if (not force and cached is not None
+            and Path(cached.net_file).resolve() == Path(net_file).resolve()
+            and abs(cached.demand_scale - scale) < 1e-6):
+        return cached
+
+    try:
+        sc = build_traffic_scenario(
+            net_file=str(net_file),
+            out_dir=str(WORK_DIR / "_demand"),
+            demand_scale=scale,
+            force=force,
+            log=lambda m: print(f"[DEMAND] {m}", flush=True),
+        )
+    except Exception as exc:
+        print(f"[DEMAND] 교통 생성 실패 — 기존 폴백을 씁니다: {exc}", flush=True)
+        _state["traffic_scenario"] = None
+        return None
+
+    _state["traffic_scenario"] = sc
+    return sc
+
+
 def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     """Convert OSM to SUMO network with netconvert.
 
@@ -3228,36 +3277,58 @@ def simulation_thread(
         except Exception:
             pass
 
-        # Start SUMO headless
-        traci.start([
+        # 생성 교통 — 있으면 경로파일을 통째로 로드해 배경 차량을 SUMO가 스케줄대로 투입한다.
+        # traci로 한 대씩 주입하던 방식(_inject_bg_vehicle, 균일 무작위 OD)을 대체한다.
+        _scn = _state.get("traffic_scenario")
+        _use_generated = bool(_scn and Path(_scn.routes_file).exists())
+
+        _sumo_args = [
             sumo_bin,
             "-n", net_file,
             "--no-warnings",
             "--no-step-log",
             "--collision.action", "none",
-            "--time-to-teleport", "-1",
+            # ⚠️ `-1`(끔)이 아니다 — 끄면 교차로 교착이 영영 안 풀려 시뮬이 무의미해진다.
+            # 영등포 4000통행 실측: -1 → 1024대 영구 교착(3878대 중 2302대만 도착) /
+            # 300 → 전원 도착, 순간이동 단 20건(0.5%). 긴 유한값이라 진짜 정체는 남는다.
+            # (진행문서 §5 — 예전 지침 "teleport off 필수"를 실측으로 뒤집은 항목)
+            "--time-to-teleport", "300",
+            "--ignore-junction-blocker", "60",
             "--step-length", "0.5",
-            "--begin", "0",
-            "--end", "86400",
-        ])
-        print("[SIM] SUMO started via TraCI", flush=True)
+        ]
+        if _use_generated:
+            # 창(07:00~)에 맞춰 시작. 경로파일의 depart가 25200초부터라 --begin을 맞춰야
+            # 차가 제때 나온다.
+            _sumo_args += ["-r", str(_scn.routes_file),
+                           "--begin", str(int(_scn.begin_s)),
+                           "--end", "86400"]
+        else:
+            _sumo_args += ["--begin", "0", "--end", "86400"]
+        traci.start(_sumo_args)
+        print(f"[SIM] SUMO started via TraCI "
+              f"({'생성 교통 ' + str(_scn.n_vehicles) + '대' if _use_generated else '배경차량 없음'})",
+              flush=True)
 
-        for item in (_state.get("traffic_sync") or {}).get("sumo_edges", []):
-            edge_id = item.get("sumo_edge_id")
-            speed_kph = item.get("speed_kph")
-            travel_time_s = item.get("travel_time_s")
-            if not edge_id:
-                continue
-            try:
-                if travel_time_s:
-                    traci.edge.adaptTraveltime(edge_id, float(travel_time_s))
-            except Exception:
-                pass
-            try:
-                if speed_kph:
-                    traci.edge.setMaxSpeed(edge_id, max(float(speed_kph) / 3.6, 0.1))
-            except Exception:
-                pass
+        # ITS 실측 속도로 엣지를 덮어쓰는 경로 — **생성 교통을 쓸 때는 건너뛴다.**
+        # 생성 교통에서는 정체가 차량 상호작용으로 저절로 생기므로, 여기에 ITS 속도까지
+        # 얹으면 같은 혼잡을 두 번 세는 셈이 된다(진행문서 §2-8).
+        if not _use_generated:
+            for item in (_state.get("traffic_sync") or {}).get("sumo_edges", []):
+                edge_id = item.get("sumo_edge_id")
+                speed_kph = item.get("speed_kph")
+                travel_time_s = item.get("travel_time_s")
+                if not edge_id:
+                    continue
+                try:
+                    if travel_time_s:
+                        traci.edge.adaptTraveltime(edge_id, float(travel_time_s))
+                except Exception:
+                    pass
+                try:
+                    if speed_kph:
+                        traci.edge.setMaxSpeed(edge_id, max(float(speed_kph) / 3.6, 0.1))
+                except Exception:
+                    pass
 
         # Try candidate edge pairs until findRoute succeeds
         result = None
@@ -3543,7 +3614,20 @@ def simulation_thread(
                     continue
             return None
 
-        if vehicle_count > 1:
+        if _use_generated:
+            # 생성 교통은 경로파일로 이미 로드돼 있다 — traci 주입이 필요 없다.
+            # 대신 **예열**: 창 시작부터 warmup_until_s까지 화면 갱신 없이 스텝만 빠르게 돌려
+            # 텅 빈 도로를 현실적인 상태로 채운다(진행문서 §5 "t=0 빈 도로는 비현실적").
+            _warm_target = float(getattr(_scn, "warmup_until_s", 0.0) or 0.0)
+            _warmed = 0
+            while traci.simulation.getTime() < _warm_target and not stop_evt.is_set():
+                traci.simulationStep()
+                _warmed += 1
+            _bg_vehicle_ids = [v for v in traci.vehicle.getIDList() if v != "veh0"]
+            _state["background_vehicle_ids"] = _bg_vehicle_ids
+            print(f"[SIM] 예열 {_warmed}스텝 → t={traci.simulation.getTime():.0f}s, "
+                  f"주행 중 {len(_bg_vehicle_ids)}대", flush=True)
+        elif vehicle_count > 1:
             _bg_drivable_edges = [e for e in net.getEdges() if e.allows("passenger")]
             if len(_bg_drivable_edges) >= 2:
                 # 면적 기준 어림 용량 — 도로 엣지 총길이는 bbox 밖 연결 엣지까지 포함돼
@@ -3865,6 +3949,7 @@ def reset_simulation_state() -> None:
     reset_runtime_state()
     _state["network_ready"] = False
     _state["net_file"] = None
+    _state["traffic_scenario"] = None
     _state["osm_file"] = None
     _state["mock_graph"] = None
     _state["current_bbox"] = None
@@ -4071,6 +4156,7 @@ async def setup_network(req: SetupRequest):
             _state["osm_file"] = str(osm_file)
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
+            _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e}
@@ -4262,6 +4348,7 @@ async def setup_network_region(req: RegionSetupRequest):
             _state["osm_file"] = str(osm_file)
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
+            _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {
@@ -5965,14 +6052,23 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
     base_anchors = [(float(n["lat"]), float(n["lng"])) for n in existing
                     if n.get("lat") is not None and n.get("lng") is not None]
 
-    # SA용 ITS(peak) — 없으면 sa_placement가 균일 수요로 폴백
+    # SA 수요: **생성 교통의 피크 스냅샷**이 1순위. 없으면 ITS, 그것도 없으면 균일 5.0.
+    # 균일 수요에서는 최적화가 사실상 "골고루 뿌리기"가 되어 간선·교차로 집중이라는
+    # 결론이 나올 수 없다(v2 §8-1).
     sa_its: list[dict] = []
+    sa_demand: list = []
     if method == "sa":
-        try:
-            _d = TRAFFIC_FUSION_ENGINE.current_traffic(time_period="peak")
-            sa_its = (_d or {}).get("links") or []
-        except Exception:
-            sa_its = []
+        _scn = await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
+        if _scn is not None and _scn.demand_points:
+            sa_demand = _scn.demand_points
+            print(f"[PLACE] 생성 교통 수요점 {len(sa_demand)}개 사용 "
+                  f"(N* {_scn.n_star:.0f} × {_scn.demand_scale * 100:.0f}%)", flush=True)
+        else:
+            try:
+                _d = TRAFFIC_FUSION_ENGINE.current_traffic(time_period="peak")
+                sa_its = (_d or {}).get("links") or []
+            except Exception:
+                sa_its = []
 
     loop = asyncio.get_event_loop()
 
@@ -5983,6 +6079,7 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
             res = await loop.run_in_executor(None, lambda: optimize_placement(
                 graph=graph, its_links=sa_its, N=n, network_mode=mode,
                 node_type=node_type, time_period="peak", seed=seed, bbox=user_bbox,
+                demand=sa_demand or None,
             ))
             return [PlacePoint(node_id=str(p["id"]), lat=float(p["lat"]), lng=float(p["lng"]))
                     for p in res.placed]
