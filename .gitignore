@@ -14,6 +14,7 @@ backend/networks/*.osm
 backend/networks/*.log
 backend/networks/*.rou.xml
 backend/networks/*.sumocfg
+backend/networks/_smoke/
 backend/tmp_building_test/
 data/processed/demo/*.dump
 
