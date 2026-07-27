@@ -3529,6 +3529,26 @@ def simulation_thread(
             _state["sim_running"] = False
             return
 
+        # ── 예열(warm-up) — **반드시 타겟 차량을 넣기 전에** ─────────────────
+        # t=0의 도로는 완전히 비어 있어 비현실적이다(진행문서 §5). 창 시작부터
+        # warmup_until_s까지 화면 갱신 없이 스텝만 빠르게 돌려 배경 교통을 채운 뒤
+        # 타겟 차량을 출발시킨다.
+        #
+        # ⚠️ 순서가 중요하다. 예열을 타겟 추가 뒤에 두면 예열 15분(1,800스텝) 동안
+        # 타겟이 경로를 다 달려 도착·소멸해버려서 사용자가 볼 게 없어진다.
+        if _use_generated:
+            _warm_target = float(getattr(_scn, "warmup_until_s", 0.0) or 0.0)
+            _warmed = 0
+            while traci.simulation.getTime() < _warm_target and not stop_evt.is_set():
+                traci.simulationStep()
+                _warmed += 1
+            print(f"[SIM] 예열 {_warmed}스텝 → t={traci.simulation.getTime():.0f}s, "
+                  f"주행 중 {len(traci.vehicle.getIDList())}대", flush=True)
+            if stop_evt.is_set():
+                traci.close()
+                _state["sim_running"] = False
+                return
+
         # Define vehicle type and add vehicle
         # Use DEFAULT_VEHTYPE (always exists in SUMO)
         traci.route.add("route0", edges)
@@ -3615,18 +3635,9 @@ def simulation_thread(
             return None
 
         if _use_generated:
-            # 생성 교통은 경로파일로 이미 로드돼 있다 — traci 주입이 필요 없다.
-            # 대신 **예열**: 창 시작부터 warmup_until_s까지 화면 갱신 없이 스텝만 빠르게 돌려
-            # 텅 빈 도로를 현실적인 상태로 채운다(진행문서 §5 "t=0 빈 도로는 비현실적").
-            _warm_target = float(getattr(_scn, "warmup_until_s", 0.0) or 0.0)
-            _warmed = 0
-            while traci.simulation.getTime() < _warm_target and not stop_evt.is_set():
-                traci.simulationStep()
-                _warmed += 1
+            # 생성 교통은 경로파일로 이미 로드돼 있고 예열도 끝났다 — traci 주입이 필요 없다.
             _bg_vehicle_ids = [v for v in traci.vehicle.getIDList() if v != "veh0"]
             _state["background_vehicle_ids"] = _bg_vehicle_ids
-            print(f"[SIM] 예열 {_warmed}스텝 → t={traci.simulation.getTime():.0f}s, "
-                  f"주행 중 {len(_bg_vehicle_ids)}대", flush=True)
         elif vehicle_count > 1:
             _bg_drivable_edges = [e for e in net.getEdges() if e.allows("passenger")]
             if len(_bg_drivable_edges) >= 2:
@@ -3694,6 +3705,11 @@ def simulation_thread(
         max_steps = 100_000  # safety limit
         _spd_acc: dict[str, list] = {}   # edge_id -> [speed_kmh, ...]
         _prev_ridx = -1
+        # 타겟 차량이 한 번이라도 시뮬에 나타났는지 — "목록에 없음"을 삽입 대기와
+        # 도착 중 무엇으로 볼지 가르는 기준(아래 루프 주석 참조).
+        _veh0_seen = False
+        _insert_wait = 0
+        _max_insert_wait = 2400   # 0.5s 스텝 기준 20분. 이 안에 못 들어가면 포기하고 안내
 
         while not stop_evt.is_set() and not arrived and step < max_steps:
             # 일시정지 대기 (TraCI 연결 유지)
@@ -3706,15 +3722,36 @@ def simulation_thread(
 
             ids = traci.vehicle.getIDList()
             if "veh0" not in ids:
-                # Vehicle arrived — keep last known position, just mark arrived
-                if step > 10:
-                    print(f"[SIM] veh0 not in sim at step {step} — arrived", flush=True)
-                    arrived = True
-                    if _state["vehicle_pos"] and _state["vehicle_pos"].get("lat"):
-                        _state["vehicle_pos"] = {**_state["vehicle_pos"], "arrived": True}
-                    else:
-                        _state["vehicle_pos"] = {"arrived": True}
+                # ⚠️ "목록에 없음"은 두 가지 뜻이다. 구분하지 않으면 안 된다.
+                #   (a) 아직 **삽입되지 않음** — 출발 엣지가 막혀 SUMO가 대기시키는 중
+                #   (b) 목적지에 **도착해 소멸**
+                # 예전엔 step>10이면 무조건 (b)로 봤다. 배경 교통이 거의 없을 땐 맞았지만,
+                # 생성 교통을 넣고 피크 직전(배경 1,000대)에 출발시키자 삽입 대기 중인
+                # 차를 도착으로 오판해 시뮬이 step 11에서 끝나버렸다(2026-07-27 실측).
+                # → **한 번이라도 보인 적이 있어야** 도착으로 친다.
+                if not _veh0_seen:
+                    _insert_wait += 1
+                    if _insert_wait == 20 or _insert_wait % 600 == 0:
+                        print(f"[SIM] veh0 삽입 대기 {_insert_wait}스텝 — 출발 지점이 혼잡합니다",
+                              flush=True)
+                        _state["warning"] = ("출발 지점이 혼잡해 타겟 차량이 대기 중입니다. "
+                                             "교통량을 낮추거나 출발지를 옮겨보세요.")
+                    if _insert_wait > _max_insert_wait:
+                        print(f"[SIM] veh0가 {_max_insert_wait}스텝 동안 삽입되지 못했습니다 — 중단",
+                              flush=True)
+                        _state["warning"] = ("출발 지점이 계속 막혀 타겟 차량을 투입하지 못했습니다. "
+                                             "교통량(수요 배율)을 낮추거나 출발지를 바꿔주세요.")
+                        break
+                    continue
+                # 한 번 보였다가 사라졌다 = 도착
+                print(f"[SIM] veh0 not in sim at step {step} — arrived", flush=True)
+                arrived = True
+                if _state["vehicle_pos"] and _state["vehicle_pos"].get("lat"):
+                    _state["vehicle_pos"] = {**_state["vehicle_pos"], "arrived": True}
+                else:
+                    _state["vehicle_pos"] = {"arrived": True}
                 continue
+            _veh0_seen = True
 
             x, y = traci.vehicle.getPosition("veh0")
             lon, lat = traci.simulation.convertGeo(x, y)
@@ -3772,7 +3809,24 @@ def simulation_thread(
             # 도착 감지(아이디 집합 비교)는 매 틱 수행하지만, 무거운 getPosition() 호출은
             # WS background_positions 브로드캐스트와 같은 주기(4틱)로만 수행해 대수가 많을 때
             # 틱당 TraCI 비용을 1/4로 줄인다.
-            if _bg_vehicle_ids:
+            if _use_generated:
+                # 생성 교통은 SUMO가 경로파일 스케줄대로 넣고 뺀다 — 우리가 채워 넣을 게 없다.
+                # 고정 풀을 유지하며 재주입하던 로직(아래 elif)은 여기선 오히려 해롭다:
+                # 도착한 차를 무작위 OD로 되살리면 애써 만든 수요 구조가 무너지고,
+                # `_bg_drivable_edges`도 비어 있어 IndexError가 난다(2026-07-27 실측).
+                if step % 4 == 0:
+                    _bg_vehicle_ids = [v for v in traci.vehicle.getIDList() if v != "veh0"]
+                    _snap = []
+                    for _bg_id in _bg_vehicle_ids:
+                        try:
+                            _bx, _by = traci.vehicle.getPosition(_bg_id)
+                            _blon, _blat = traci.simulation.convertGeo(_bx, _by)
+                            _snap.append({"id": _bg_id, "lat": _blat, "lng": _blon,
+                                          "speed": round(traci.vehicle.getSpeed(_bg_id) * 3.6, 1)})
+                        except Exception:
+                            continue
+                    _state["background_vehicles"] = _snap
+            elif _bg_vehicle_ids:
                 _live_ids = set(traci.vehicle.getIDList())
                 _new_bg_vehicle_ids = []
                 _fetch_bg_positions = (step % 4 == 0)

@@ -22,7 +22,8 @@ from typing import Callable, Optional
 
 from .calibration import cached_nstar
 from .pipeline import DemandResult, generate_demand
-from .simulation import SimResult, edge_loads_to_demand, run_simulation
+from .simulation import (SimResult, edge_loads_to_demand, pick_target_depart_time,
+                         run_simulation)
 from .time_profile import build_time_profile
 
 # UI 노브 범위 — 2026-07-27 사용자 확정 (상·하한은 잠정, 실사용 보고 조정)
@@ -32,6 +33,11 @@ MAX_DEMAND_SCALE = 3.0     # 300%
 # 시뮬레이션 창 — §6 확정: 07:00~09:00 아침 첨두, 15분 8구간
 DEFAULT_WINDOW = (7.0, 9.0)
 DEFAULT_STEP_MIN = 15.0
+
+# 타겟 차량 출발 시점을 고르는 상한 — 정지 비율이 이 값 이하인 가장 늦은 시각을 쓴다.
+# 0.6은 실측에서 "진짜 막히는데 그래도 굴러가는" 구간(영등포 07:45, 221대 주행·정지 57%).
+# 이보다 높이면 출발 엣지가 막혀 타겟이 삽입조차 안 된다(simulation.pick_target_depart_time).
+TARGET_MAX_HALTING = 0.6
 
 
 def _log_noop(_: str) -> None:
@@ -59,7 +65,7 @@ class TrafficScenario:
     begin_s: float                     # 시뮬 시작 시각(초) — 창 시작
     depart_begin_s: float              # 첫 차 출발
     depart_end_s: float                # 마지막 차 출발
-    warmup_until_s: float              # 이 시각까지는 예열(측정·재생 제외)
+    warmup_until_s: float              # 이 시각까지 예열(화면 갱신 없이 스텝만) 후 타겟 출발
     peak_time_s: float                 # 가장 붐빈 시각 = 배치 스냅샷 시점
 
     n_vehicles: int = 0
@@ -174,7 +180,12 @@ def build_traffic_scenario(
         n_star=float(n_star), demand_scale=scale, total_trips=total_trips,
         begin_s=sim.begin_s, depart_begin_s=sim.begin_s,
         depart_end_s=window[1] * 3600.0,
-        warmup_until_s=sim.begin_s + sim.warmup_s,
+        # 예열 목표 = 타겟이 출발할 시각. 곡선에서 고른다(§2-6 "예열 → 출발 → 정체 뚫고 주행").
+        #
+        # 최소 예열(15분)만 하면 타겟이 07:15에 출발해 한산한 도로를 달려 정체를 못 만나고,
+        # 반대로 피크에 맞추면 정지 88%라 **출발 엣지에 삽입조차 안 된다**(실측: 20분 대기 후 중단).
+        # 그래서 "정지 비율이 TARGET_MAX_HALTING 이하인 가장 늦은 시각"을 쓴다.
+        warmup_until_s=pick_target_depart_time(sim, max_halting=TARGET_MAX_HALTING),
         peak_time_s=sim.peak_time_s,
         n_vehicles=d.n_vehicles,
         demand_points=points,

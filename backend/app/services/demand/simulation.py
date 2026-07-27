@@ -355,6 +355,44 @@ def edge_loads_to_demand(loads: list[EdgeLoad], min_vehicles: float = 0.0):
     ]
 
 
+def pick_target_depart_time(
+    res: SimResult,
+    max_halting: float = 0.6,
+    min_running_frac: float = 0.15,
+) -> float:
+    """타겟 차량을 언제 출발시킬지 — **정체는 있되 움직일 수는 있는** 시각.
+
+    왜 피크에 출발시키면 안 되나 (2026-07-27 실측):
+        피크에는 정지 비율이 88%까지 올라가 도로가 사실상 멈춘다. 그 상태에서는
+        타겟 차량이 **출발 엣지에 삽입조차 되지 않는다** — 2,400스텝(20분)을 기다려도
+        자리가 안 나서 시뮬이 중단됐다. "정체를 뚫고 주행"이 아니라 "출발을 못 함"이다.
+
+        같은 실행의 곡선을 보면 07:45에 이미 221대가 굴러가고 정지 57%다.
+        이 정도면 타겟이 진짜 막힘을 겪으면서도 도로에 올라탈 수 있다.
+
+    규칙: 피크 이전 구간에서 **정지 비율이 `max_halting` 이하인 가장 늦은 시각**.
+        (늦을수록 혼잡하므로 "가장 늦은"이 곧 "가장 빡빡하되 주행 가능한" 지점이다.)
+        조건에 맞는 표본이 없으면 예열 종료 시각으로 되돌아간다.
+
+    min_running_frac : 피크 대비 이 비율보다 주행 대수가 적으면 "아직 한산"으로 보고 제외.
+        너무 이른 시각(도로가 텅 빈 때)이 뽑히는 것을 막는다.
+    """
+    fallback = res.begin_s + res.warmup_s
+    if not res.times_s or not res.peak_running:
+        return fallback
+
+    floor = res.peak_running * min_running_frac
+    best = None
+    for t, run, halt in zip(res.times_s, res.running, res.halting):
+        if t > res.peak_time_s or t < fallback or run <= 0:
+            continue
+        if run < floor:
+            continue
+        if halt / run <= max_halting:
+            best = t
+    return best if best is not None else fallback
+
+
 def congestion_summary(res: SimResult, top_n: int = 10) -> str:
     """정체가 생겼다 풀리는지 + 어디에 몰리는지 한눈에."""
     lines = [
