@@ -31,28 +31,53 @@ from typing import Any
 # Analytical metric helpers (peer-reviewed models with citations)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# C-V2X Mode 4 무선 자원 구조 (Gonzalez-Martin et al. 2019 §II-A)
+_SUBFRAMES_PER_S = 1000.0          # 서브프레임 1개 = 1 ms
+_DEFAULT_SUBCHANNELS = 2           # 서브프레임당 서브채널 수 (논문 검증 조건: QPSK 0.5)
+_SENSING_RADIUS_M = 230.0          # 편측 감지 반경 — 논문의 (0.1 veh/m → CBR 0.23)에서 역산
+
+
 def compute_cbr_per_edge(vehicle_density_veh_per_m: float,
-                          coverage_radius_m: float = 200.0,
                           f_cam_hz: float = 10.0,
-                          t_rri_s: float = 0.1) -> dict:
-    """
-    CBR analytical model — Gonzalez-Martin et al., IEEE TVT 2019 §IV.A
+                          n_subchannels: int = _DEFAULT_SUBCHANNELS,
+                          sensing_radius_m: float = _SENSING_RADIUS_M,
+                          coverage_radius_m: float | None = None) -> dict:
+    """CBR (Channel Busy Ratio) — 무선 자원 중 사용 중인 비율.
 
-    CBR = 1 − exp(−ρ · R_tx · f_CAM · T_RRI)
+    Gonzalez-Martin et al., IEEE TVT 68(2) 2019, **식 (34)**: `CBR = N_E / N`
+    (N_E = 지난 Selection Window에서 점유된 자원 수, N = 전체 자원 수).
+    논문 본문의 정의 그대로 "busy로 감지된 자원의 평균 비율"이다.
 
-    ρ        vehicle density (vehicles/m)
-    R_tx     transmission radius (m); ETSI ITS default 200 m
-    f_CAM    CAM frequency (Hz); ETSI EN 302 637-2 §6.1.2.3 max 10 Hz
-    T_RRI    Resource Reservation Interval (s); 3GPP TS 36.331 §5.14.1.1 default 0.1 s
-    CBR > 0.65 → congested (ETSI TS 102 687 §5.2.2)
+    ⚠️ 2026-07-27 정정 — 이전 구현은 논문에 없는 공식을 쓰고 있었다:
+        `CBR = 1 − exp(−ρ · R_tx · f_CAM · T_RRI)`  ← 논문에 **0회** 등장
+        게다가 `f_CAM × T_RRI = 10Hz × 0.1s = 1`인데, 이 둘은 같은 사실을 두 번
+        표현한 것이라(초당 10회 = 0.1초마다 1회) 곱하면 항상 1이 된다. 그 결과 지수가
+        사실상 "이웃 차량 수"가 되어 이웃 5대만 있어도 CBR 0.99로 포화됐다.
+        논문의 검증값과 대조하면 명백하다 — ρ=0.1 veh/m에서 논문 0.23 vs 구현 1.000.
+
+    현재 구현 — 자원 점유율을 직접 센다:
+
+        이웃 차량 수 = ρ × 2 × 감지반경
+        초당 자원 수 = 1000 서브프레임 × 서브채널 수
+        CBR = 이웃 차량 수 × f_CAM / 초당 자원 수      (1.0에서 클램프)
+
+    논문 검증값 대조 (λ=10 Hz, 서브채널 2, 식 (34) 기준):
+        ρ = 0.1 veh/m → 논문 0.23 / 본 구현 0.23  ✅
+        ρ = 0.3 veh/m → 논문 0.62 / 본 구현 0.69  (자원 포화 효과로 논문이 조금 낮음)
+
+    감지반경 230 m는 첫 번째 검증값에서 역산한 값이다(논문이 직접 명시하지 않음).
+    실제 감지 범위는 송신 전력에 따라 달라지므로, 전력 설정을 바꾸면 재보정이 필요하다.
+
+    coverage_radius_m : 옛 시그니처 호환용. 무시된다(감지 반경과 다른 개념).
+    CBR > 0.65 → 혼잡 (ETSI TS 102 687 §5.2.2)
     """
-    exponent = vehicle_density_veh_per_m * coverage_radius_m * f_cam_hz * t_rri_s
-    cbr = 1.0 - math.exp(-exponent)
-    cbr = min(cbr, 1.0)
+    resources_per_s = _SUBFRAMES_PER_S * max(int(n_subchannels), 1)
+    neighbours = max(vehicle_density_veh_per_m, 0.0) * 2.0 * sensing_radius_m
+    cbr = min(neighbours * f_cam_hz / resources_per_s, 1.0)
     return {
         "cbr": round(cbr, 4),
         "cbr_congested": cbr > 0.65,
-        "cbr_ref": "Gonzalez-Martin et al., IEEE TVT 68(2) 2019; ETSI TS 102 687 §5.2.2",
+        "cbr_ref": "Gonzalez-Martin et al., IEEE TVT 68(2) 2019 eq.(34); ETSI TS 102 687 §5.2.2",
     }
 
 
@@ -296,7 +321,7 @@ def build_run_summary(state: dict) -> dict:
     per_edge = rc.get("per_edge") or []
     cbr_avg = None
     if per_edge:
-        cbr_vals = [compute_cbr_per_edge(rho, coverage_radius_m=200.0)["cbr"]
+        cbr_vals = [compute_cbr_per_edge(rho)["cbr"]
                     for rho in edge_densities(state, per_edge)]
         cbr_avg = round(sum(cbr_vals) / len(cbr_vals), 4)
 
@@ -495,7 +520,7 @@ def build_per_edge_metrics(state: dict) -> list[dict]:
     for i, e in enumerate(per_edge):
         eid = e.get("edge_id", "")
         dist_m = float(e.get("distance_m") or 50.0)
-        cbr_data  = compute_cbr_per_edge(_rho_per_edge[i], coverage_radius_m=200.0)
+        cbr_data  = compute_cbr_per_edge(_rho_per_edge[i])
         pl_data   = compute_path_loss(dist_m, env=_pl_env)
         rows.append({
             "run_id":         run_id,
