@@ -3097,6 +3097,15 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     훨씬 벗어나는 edge가 net.xml에 들어갈 수 있다. bbox가 주어지면
     --keep-edges.in-geo-boundary로 해당 영역(다운로드 시 사용한 확장 bbox와 동일)
     밖으로 뻗어나가는 edge를 잘라내, 경로가 구역 밖으로 크게 우회하는 것을 막는다.
+
+    신호등: OSM은 교차로 신호를 노드 태그(highway=traffic_signals)로만 띄엄띄엄 담고 있어
+    (실측: 영등포 구역 8개, 안양·의왕 구역 19개) --tls.guess-signals 만으로는 net에 신호가
+    거의 생기지 않는다. 신호가 없으면 교차로 대기가 없어 정체가 "생겼다 풀리는" 현상 자체가
+    안 나오므로 --tls.guess로 주요 교차로에 신호를 추정 생성한다(영등포 구역 2개 → 11개).
+    다만 --tls.guess는 --tls.guess.threshold(교차로 진입차로 속도 합, 기본 250)를 넘는
+    교차로에만 붙으므로 효과가 구역마다 크게 다르다 — 안양·의왕 구역은 기본 임계값에서 8개
+    그대로였고 임계값을 50까지 낮춰야 33개가 됐다. 정체가 안 생기면 이 임계값을 먼저 의심할 것.
+    과생성은 뒤따르는 --tls.discard-simple이 단순 교차로에서 걸러낸다.
     """
     netconvert_bin = resolve_binary("netconvert")
     if not netconvert_bin:
@@ -3112,6 +3121,7 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
         "--roundabouts.guess",
         "--ramps.guess",
         "--junctions.join",
+        "--tls.guess",
         "--tls.guess-signals",
         "--tls.discard-loaded",
         "--tls.discard-simple",
