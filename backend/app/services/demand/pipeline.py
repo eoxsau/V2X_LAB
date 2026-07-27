@@ -273,18 +273,27 @@ def generate_demand(
 
     slices = od_time_slices(total_trips, time_profile, begin_h, end_h)
     od_files: list[Path] = []
+    n_od_lines = 0
     for k, (b_h, e_h, slice_trips) in enumerate(slices):
         # 슬라이스는 factor로 총량을 나눈다 — OD 분포(어디↔어디)는 시간대와 무관하게
         # 같고 총량만 곡선을 탄다는 v2 §5의 "총량과 분포를 분리" 원칙 그대로.
         od_file = out / (f"{prefix}.od.txt" if len(slices) == 1 else f"{prefix}.od.{k:02d}.txt")
-        write_od_o_format(
+        n_od_lines = write_od_o_format(
             flows, zone_taz, str(od_file),
             begin_h=b_h, end_h=e_h,
             factor=slice_trips / total_trips if total_trips else 1.0,
             keep_intra_zone=True,
         )
         od_files.append(od_file)
-    log(f"OD 파일 {len(od_files)}개 (슬라이스 {len(slices)}구간)")
+    log(f"OD 파일 {len(od_files)}개 (슬라이스 {len(slices)}구간, OD 라인 {n_od_lines}개)")
+
+    # od2trips 셀별 반올림 편향 — 초과 차량 ≈ OD 라인 수의 1%로, **총 통행량과 무관한 상수**다
+    # (2026-07-27 실측: 3422라인 +37.6대 / 1729라인 +19.1대. scale 0.1로 줄여도 초과는 그대로).
+    # 통행량이 라인 수보다 적으면 이 상수가 결과를 지배한다 — N* 튜닝 때 특히 조심(§7).
+    if total_trips < n_od_lines:
+        log(f"⚠️ total_trips({total_trips:.0f})가 OD 라인 수({n_od_lines})보다 적습니다. "
+            f"od2trips 반올림 편향(+{n_od_lines * 0.01:.0f}대 내외)이 "
+            f"{n_od_lines * 0.01 / max(total_trips, 1) * 100:.0f}% 수준으로 커집니다.")
 
     # 수요 손실 내역 — 어디서 새는지 매 실행 확인용(§5-A)
     loaded = sum(f.trips for f in flows if zone_taz.get(f.i) and zone_taz.get(f.j))
@@ -327,6 +336,7 @@ def generate_demand(
             "trips_intra_taz": round(intra, 1),
             "trips_dropped": round(dropped, 1),
             "n_slices": len(slices),
+            "n_od_lines": n_od_lines,
         },
     )
     if result.routing_rate < 0.9:

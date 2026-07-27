@@ -311,7 +311,11 @@ def write_od_o_format(
         f.write('* From-Time  To-Time\n')
         f.write(f'{_hhmm(begin_h)} {_hhmm(end_h)}\n')
         f.write('* Factor\n')
-        f.write(f'{factor:.2f}\n')
+        # ⚠️ 소수 2자리로 쓰면 시간대 슬라이스가 뭉개진다 (2026-07-27 실측):
+        # 07~09시 15분 8구간의 factor 0.1046·0.1129·0.1257·0.1284·0.1305·0.1328·0.1313·0.1261이
+        # 전부 0.11·0.12·0.13×6 으로 반올림되어, 의도한 1.26배 굴곡이 1.12배로 납작해졌다.
+        # 굴곡이 사라지면 정체가 안 생기고, 그러면 배치 비교 자체가 성립하지 않는다(§5-1).
+        f.write(f'{factor:.8f}\n')
         f.write('* Origin  Destination  Count\n')
         for o, d, t in lines:
             f.write(f'{o} {d} {t:.4f}\n')

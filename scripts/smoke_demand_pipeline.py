@@ -25,6 +25,7 @@ netconvert(main.py와 동일 플래그)만 직접 돌리고, 그 뒤는 오케�
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,6 +45,8 @@ AREA = sys.argv[1] if len(sys.argv) > 1 else "area-0baecbba"
 OSM_SRC = BACKEND / "networks" / f"{AREA}.osm"
 
 TOTAL_TRIPS = 5000.0   # 임시값 — N* 튜닝은 정체 관측 수단이 생긴 뒤(6단계)
+WINDOW = (7.0, 9.0)    # 시뮬레이션 창 07:00~09:00 (아침 첨두)
+STEP_MIN = 15.0        # 슬라이스 간격
 
 
 def stage(msg: str) -> None:
@@ -73,8 +76,15 @@ def main() -> int:
     n_tls = net.read_text(encoding="utf-8").count("<tlLogic")
     print(f"  OK  netconvert | 신호등(tlLogic) {n_tls}개")
 
-    # ── 2. 수요 생성 (오케스트레이터) ─────────────────────────────────
-    stage("2. generate_demand — 건물 → 존 → OD → TAZ/OD → od2trips → duarouter")
+    # ── 2. 시간대 프로파일 (24h 곡선 → 창 슬라이스) ───────────────────
+    stage(f"2. 시간 프로파일 — {WINDOW[0]:.0f}:00~{WINDOW[1]:.0f}:00, {STEP_MIN:.0f}분 간격")
+    from app.services.demand.time_profile import build_time_profile, profile_summary
+
+    profile = build_time_profile(WINDOW[0], WINDOW[1], STEP_MIN)
+    print(profile_summary(profile, TOTAL_TRIPS))
+
+    # ── 3. 수요 생성 (오케스트레이터) ─────────────────────────────────
+    stage("3. generate_demand — 건물 → 존 → OD → TAZ/OD → od2trips → duarouter")
     from app.services.demand.pipeline import generate_demand
 
     t0 = time.time()
@@ -82,13 +92,14 @@ def main() -> int:
         net_file=str(net),
         out_dir=str(work),
         total_trips=TOTAL_TRIPS,
+        time_profile=profile,
         prefix="smoke",
         log=lambda m: print(f"  {m}", flush=True),
     )
     print(f"\n  ({time.time() - t0:.1f}s)")
 
-    # ── 3. 결과 판정 ──────────────────────────────────────────────────
-    stage("3. 결과")
+    # ── 4. 결과 판정 ──────────────────────────────────────────────────
+    stage("4. 결과")
     m = res.stats["taz_mapping"]
     print(f"  존 {m['n_zones']}개 (자기셀 {m['zones_own_cell']} / 재배정 {m['zones_reassigned']}"
           f" / 버림 {m['zones_dropped']})")
@@ -96,10 +107,25 @@ def main() -> int:
           f" (그중 같은TAZ {res.stats['trips_intra_taz']:.0f})"
           f" | 존 버려짐 {res.stats['trips_dropped']:.0f}")
     print(f"  trip {res.n_trips} → 차량 {res.n_vehicles}")
+
+    # 출발시각이 실제로 프로파일대로 깔렸는지 — O-format 시각은 HH.MM이라 여기서 틀리기 쉽다(§7)
+    deps = [float(x) / 3600.0
+            for x in re.findall(r'depart="([\d.]+)"', Path(res.routes_file).read_text(encoding="utf-8"))]
+    in_window = sum(1 for d in deps if WINDOW[0] - 0.02 <= d <= WINDOW[1] + 0.02)
+    print(f"\n  출발시각 {min(deps):.2f}h ~ {max(deps):.2f}h "
+          f"(창 안 {in_window}/{len(deps)} = {in_window / max(len(deps), 1) * 100:.1f}%)")
+    for b, e, share in profile:
+        got = sum(1 for d in deps if b <= d < e)
+        exp = share * res.n_vehicles
+        print(f"    {int(b):02d}:{int(round((b % 1) * 60)):02d}~"
+              f"{int(e):02d}:{int(round((e % 1) * 60)):02d}  {got:5d}대 (기대 {exp:5.0f})"
+              f"  {'#' * int(round(got / 20))}")
+
     print(f"\n  ★ 라우팅률 {res.routing_rate * 100:.1f}%  |  "
           f"최종 생존율 {res.survival_rate * 100:.1f}%")
 
-    ok = res.routing_rate >= 0.9 and res.survival_rate >= 0.9
+    ok = (res.routing_rate >= 0.9 and res.survival_rate >= 0.9
+          and in_window == len(deps))   # 창 밖으로 새면 시각 변환이 틀린 것
     print(f"  → {'PASS' if ok else 'FAIL — 진행문서 §5-A 확인'}")
     print(f"\n  산출물: {res.routes_file}")
     return 0 if ok else 1
