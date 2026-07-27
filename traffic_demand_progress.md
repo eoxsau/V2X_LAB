@@ -25,15 +25,18 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
 2. 데이터 분석 (등급표 + 24h 곡선) ... ✅ 완료
 3. 격자 + 건물 질량 ................. ✅ 완료 (모듈+검증)
 4. radiation OD 생성 ............... ✅ 완료 (모듈+검증)
-5. 배정 (OD→도로별 교통량) .......... ✅ 완료. 수요 손실 3건 전부 해결(§5-A)
-6. SUMO 운영설정 + 시간프로파일 주입 . ⬜ 다음
-7. 파이프라인 통합 ................. ⬜ 다음
+5. 배정 (OD→도로별 교통량) .......... ✅ 완료. 수요 손실 4건 전부 해결(§5-A)
+6. SUMO 운영설정 + 시간프로파일 주입 . ✅ 완료. 시간슬라이스+동적SUMO, N* 스윕(§5-B)
+7. 파이프라인 통합 ................. 🔶 모듈은 완성, **앱 배선만 남음**
    (RL은 7단계 이후 최종 층으로. 지금은 손대지 않음 — 친구가 재설계 중)
 ```
 
-**지금 위치: 5단계 완료, 최종 생존율 96.2%(영등포)·100.6%(안양·의왕).** 45.4%에서 새던
-수요 손실 3건을 전부 잡았다(커밋 `5458136`, §5-A). **다음은 6단계 — 시간대 OD 슬라이스와
-동적 SUMO.** N\* 튜닝의 선결조건이던 "생존율 안정"이 확보됐으므로 이제 튜닝도 가능하다.
+**지금 위치: 6단계 완료.** 수요 생성(생존율 96%+) → 시간대 슬라이스(07:00~09:00 15분 8구간)
+→ 동적 SUMO까지 관통했고, 영등포에서 **정체가 9.00h 503대까지 쌓였다가 9.83h에 완전히 풀린다**
+(§5-B). 피크 상위 10% 엣지가 교통량 75%를 점유해 "병목=간선·교차로" 서사가 실측으로 확인됐다.
+
+**다음은 7단계 — 앱 배선.** 모듈(`demand/` 5개)은 완성됐고 스모크로 검증되지만
+**아직 `main.py`가 쓰지 않는다.** 균일 랜덤 배경차량과 균일 5.0 배치수요를 교체하는 일이 남았다.
 
 > ⚠️ **프론트엔드(`frontend/*.jsx`)는 임의로 수정하지 말 것.** 사용자와 의논 후 함께 진행하기로
 > 합의됨(2026-07-27). 7단계 UI 정리 항목에 도달하면 멈추고 상의할 것.
@@ -79,6 +82,7 @@ ITS 실시간 데이터가 거의 없으므로, **건물(질량) → radiation O
 | `demand/grid_mass.py` | §3·§4 격자 존 + 건물 질량 | `build_zones(buildings=[(lat,lng,mass)], cell_size_m, ref_lat, origin_shift_m) → [Zone]`; `cell_of(lat,lng,cell,ref_lat,shift)`; `zone_stats()` |
 | `demand/radiation.py` | §6 radiation OD | `radiation_od_matrix(masses, coords, total_trips, lam=0.9999) → [ODFlow(i,j,trips)]`; `od_summary()` |
 | **`demand/time_profile.py`** | **§5 6단계 시간곡선** | `load_hourly_profile()` (24h CSV → 비율 24개); **`build_time_profile(begin_h, end_h, step_min=15, interpolate=True)`** → `[(b,e,share)]`; `profile_summary()` (굴곡 확인용 막대) |
+| **`demand/simulation.py`** | **§5 6단계 동적 SUMO** | **`run_simulation(net, routes, out_dir, warmup_s=900, time_to_teleport_s=300) → SimResult`** — 예열 → 정체 → 시간곡선 + 피크 구간 엣지별 교통량. `SimResult.peak_edges/congestion_ratio/stats`; **`edge_loads_to_demand()`** (→ `sa_placement.DemandPoint`); `congestion_summary()` |
 | **`demand/pipeline.py`** | **§7 오케스트레이터** | **`generate_demand(net_file, out_dir, total_trips, ..., time_profile=None) → DemandResult`** — net.xml 하나로 routes.xml까지. 함정 4개(net_bbox·parquet 직접·ASCII 스테이징·최대 SCC) 전부 내부 흡수. `DemandResult.survival_rate/routing_rate/stats`; `od_time_slices()`; `ascii_temp_base()`; `sumo_binary()` |
 | `demand/assignment.py` | §7·§8 배정 준비 | `read_net(path)`(한 번 읽어 재사용); **`net_bbox(net, margin_m=300)`** (실제 도로 범위 — 건물 조회 bbox는 반드시 이걸로); **`build_taz(net, cell, ref_lat, largest_component_only=True)`** (최대 승용차 SCC만 담음); **`component_summary(net)`** (고립 섬 진단); `write_taz_xml()`; **`write_od_o_format(..., keep_intra_zone=True)`** (o==d 살림); **`map_zones_to_taz(zones, taz, cell_size_m, max_reassign_m=900)`** (도로 없는 존 → 최근접 도로존 재배정); **`taz_mapping_summary()`** (자기셀/재배정/버림 진단) |
 
@@ -178,7 +182,21 @@ bbox 필터, RL환경·SA 공간인덱스 등도 포함.)
   적정값은 정체 관측 수단(동적 SUMO)이 생긴 뒤 튜닝하기로 보류.
   ※ 기존에 적혀 있던 "52→**234개**"는 서울 도심 종로·중구 **별도 net 기준**이며, 위 두 구역에서는
   재현되지 않았다. 일반적으로 기대할 수 있는 수치가 아니므로 근거로 삼지 말 것.
-- **teleport off:** `--time-to-teleport -1` (프로젝트 sumo 실행에 이미 있음). 정체 연구 필수.
+- **⚠️ teleport off는 틀린 지침이었다 (2026-07-27 실측으로 정정).** 이전 문서엔
+  "`--time-to-teleport -1`, 정체 연구 필수"라고 적혀 있었으나, **완전히 끄면 교차로 교착이
+  영영 안 풀려 시뮬 자체가 무의미해진다.** 영등포 4000통행 비교:
+
+  | 설정 | 결과 |
+  |---|---|
+  | `--time-to-teleport -1` | **1024대 영구 교착.** 3878대 중 2302대만 도착. teleport 0건 |
+  | `--time-to-teleport 300` | 피크 112대(정지 49%), **전원 도착**. teleport 단 **20건(0.5%)** |
+
+  차량 0.5%가 1024대를 잡고 있었던 것이다. 교착은 용량 포화와 달리 **이산 사건**이라
+  수요량에 **비단조**로 반응한다(4250통행은 멀쩡한데 4000·4500은 잠김) — 끈 상태로는
+  **N\* 튜닝이 원리적으로 불가능**하다. 무엇을 튜닝하는지 알 수 없기 때문.
+  → `simulation.py`는 기본 **300초**를 쓰고, `stats["teleports"]`가 도착 차량의 3%를 넘으면
+  경고한다. `--ignore-junction-blocker 60`도 함께 주지만 그것만으로는 안 풀린다(실측).
+  ⚠️ `main.py`의 실시간 시뮬은 아직 `-1`이다 — 앱 배선 때 함께 볼 것.
 - **예열(warm-up):** t=0 빈 도로 → 비현실적. 15~30분 예열 후 측정. **예열은 화면갱신 없이
   배속(스텝만 빠르게)**, 타겟 출발부터 실시간 재생.
 - **피크 스냅샷:** 가장 붐비는 스텝에서 전 차량 위치(`libsumo getPosition`) → 엣지별/구역별
@@ -318,6 +336,33 @@ Overpass가 bbox에 걸친 way의 **전 노드**를 반환하므로, 멀리 뻗�
 
 ---
 
+## 5-B. N\* 레벨 스윕 (2026-07-27, 영등포 `area-0baecbba`)
+
+정체가 **"생겼다 풀리는"** 지점을 찾는 것이 목표(v2 §5-1). 창 07:00~09:00, 15분 8구간,
+`--time-to-teleport 300` 기준.
+
+| total_trips | 피크 동시주행 | 정지 비율 | 종료시 잔류 | 해소 | 피크 평균속도 | 순간이동 |
+|---|---|---|---|---|---|---|
+| 2,000 | 41대 | 4.9% | 0 | ✅ | 53.6 km/h | 0 |
+| 4,000 | 112대 | 39.3% | 0 | ✅ | 31.1 km/h | 20 |
+| 4,500 | 101대 | 20.8% | 0 | ✅ | 40.9 km/h | 4 |
+| **5,000** | **503대** | **79.5%** | **0** | **✅** | **4.5 km/h** | **132 (2.7%)** |
+| 5,500 | 1,026대 | 90.9% | 767 | ❌ | 0.8 km/h | 524 (9.9%) |
+| 6,000+ | 1,223대↑ | 90% | 955↑ | ❌ | 0.9 km/h | 779↑ |
+
+**→ 영등포는 5,000 채택.** "생겼다 풀리는" 구간의 상한이다. 5,500부터는 안 풀린다.
+
+⚠️ **주의 3가지**
+1. **구역마다 다시 잡아야 한다.** 같은 5,000에서 안양·의왕은 피크 68대·정지 11.8%로 훨씬 헐겁다.
+2. **run-to-run 변동이 있다.** 4,000(39.3%)이 4,500(20.8%)보다 더 막히는 역전이 보인다 —
+   교착 발생이 확률적이라서다. 경계 근처 값은 한 번 돌려 판단하지 말 것.
+3. **`total_trips ≥ OD 라인 수`** 를 지킬 것(§7 od2trips 반올림 편향). 영등포는 3,422라인.
+
+피크 구간 상위 10% 엣지가 교통량 **75%** 를 점유 — 격자 질량이 아니라 **엣지별 교통량**으로
+배치해야 한다는 결정(§2-5)의 실측 근거다.
+
+---
+
 ## 6. 미결정 사항 (다음 채팅에서 정할 것)
 
 - ~~**시뮬레이션 창 길이**~~ → ✅ **결정**: **07:00~09:00, 15분 8구간** (2026-07-27).
@@ -355,7 +400,12 @@ Overpass가 bbox에 걸친 way의 **전 노드**를 반환하므로, 멀리 뻗�
 - **SUMO 위치:** `C:\Program Files (x86)\Eclipse\Sumo`. 도구 od2trips/duarouter/duaIterate.py/
   sumo/netconvert 전부 있음(SUMO 1.27).
 - **od2trips 옵션 함정:** `-n` = `--taz-files` (net 아님!). od2trips는 **net 불필요**, TAZ+OD만.
-  명령: `od2trips --taz-files T.xml --od-matrix-files OD.txt -o trips.xml --spread.uniform`.
+  명령: `od2trips --taz-files T.xml --od-matrix-files OD.txt -o trips.xml --different-source-sink`.
+- **⚠️ `--spread.uniform`을 쓰지 말 것 (2026-07-27 실측):** 이름과 달리 시간축이 아니라
+  **OD 셀별로** 균등 배치하는 옵션이다. 통행 1대짜리 셀은 구간 **정중앙**에 찍히는데,
+  radiation OD는 그런 작은 셀이 대부분이라 **15분 슬라이스 552대 중 331대가 한 분에 몰렸다**
+  (옵션 없으면 분당 28~46대로 평탄). 그 인위적 플래툰이 교착을 크게 키운다.
+  옵션을 빼면 od2trips가 구간 안에 무작위 균등 배치한다 — 그게 우리가 원하는 것.
 - **⚠️ 현행 netconvert 플래그가 OSM 신호를 오히려 버림 (2026-07-27 발견):**
   `--tls.discard-loaded`·`--tls.discard-simple` 탓에 **아무 옵션 없이 변환할 때보다 신호가 적다.**
   (실측: 옵션 없음 → 영등포 **4개**·안양 **9개** / 현행 설정 → **2개**·**8개**.) 정체 생성이 목표라면
@@ -449,14 +499,18 @@ backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py area-1b5adb59
    확정. `time_profile.build_time_profile()` → `generate_demand(time_profile=...)`.
    출발시각이 창 안 100%로 들어가는 것까지 스모크에서 검증.
    그 과정에서 **factor 정밀도**와 **od2trips 반올림 편향**을 발견해 기록(§7).
-3. **동적 SUMO** — 예열 → 피크 스냅샷 → 엣지별 교통량 → 배치 수요.
-   ⚠️ `sumo` 본체의 한글 경로 내성은 **아직 미검증**(§7) — 여기서 확인할 것.
-   (`pipeline.ascii_temp_base()`가 이미 있으니 필요하면 그대로 재사용.)
-4. **N\* 레벨 튜닝** — 이제 가능하다. 생존율이 안정됐으므로 `total_trips`를 올려가며
-   피크가 도로 용량을 넘는 지점을 찾는다(v2 §5-1·§5-3).
-5. **앱 배선** — `generate_demand`를 `main.py`에 연결(구역·시나리오당 1회 + 캐시).
-   `_inject_bg_vehicle`(균일 랜덤) → 생성 교통, `build_demand_from_graph`(균일 5.0) →
-   피크 스냅샷 밀도.
+3. ~~**동적 SUMO**~~ → ✅ **완료** (커밋 `4d111a1`). `simulation.run_simulation()`.
+   영등포 5000통행에서 **정체가 9.00h 503대까지 쌓였다가 9.83h에 완전히 풀린다.**
+   피크 상위 10% 엣지가 교통량 **75%** 점유 — §8-1 "병목=간선·교차로" 서사와 일치.
+   `sumo` 본체 한글 경로는 **정상**으로 확인(§7). 그 과정에서 `--spread.uniform`과
+   teleport off 두 함정을 잡았다(§7 — **문서 지침이 틀렸던 건**).
+4. **N\* 레벨 튜닝 마무리** — 스윕은 이미 돌렸다(아래 §5-B). 영등포는 5000 채택.
+   **구역마다 다시 잡아야 한다** — 안양·의왕은 같은 5000에서 피크 68대·정지 11.8%로
+   훨씬 헐겁다. 구역별 N\*를 잡는 절차를 모듈로 만들지 결정할 것.
+5. **앱 배선** — `generate_demand` + `run_simulation`을 `main.py`에 연결
+   (구역·시나리오당 1회 + 캐시). `_inject_bg_vehicle`(균일 랜덤) → 생성 교통,
+   `build_demand_from_graph`(균일 5.0) → `edge_loads_to_demand()`.
+   ⚠️ `main.py`의 실시간 시뮬은 아직 `--time-to-teleport -1`이다 — 함께 고칠 것(§5).
 6. **UI 정리** — ITS·첨두/비첨두 제거, 수요 배율 n 노브. **프론트는 반드시 상의 후 함께.**
 
 > 참고 명령/데이터는 §4·§5·§7에 다 있음. 모듈은 `backend/app/services/demand/`에 준비됨.
