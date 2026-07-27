@@ -379,7 +379,11 @@ def _od2trips_and_duarouter(
             "--taz-files", s_taz,
             "--od-matrix-files", ",".join(str(p) for p in s_ods),
             "-o", s_trips,
-            "--spread.uniform",
+            # ⚠️ `--spread.uniform`은 쓰지 않는다 (2026-07-27 실측):
+            # 이름과 달리 시간축이 아니라 **OD 셀별로** 균등 배치하는 옵션이라, 통행 1대짜리
+            # 셀은 전부 구간 **정중앙**에 찍힌다. radiation OD는 작은 셀이 대부분이라
+            # 15분 슬라이스 552대 중 331대가 한 분에 몰렸다(옵션 없으면 분당 28~46대로 평탄).
+            # 그 인위적 플래툰이 교착의 큰 원인이었다.
             # 같은 TAZ 안(o==d) 통행에서 출발=도착 엣지가 뽑히면 주행이 성립하지 않는다.
             # o==d는 재배정이 두 존을 합쳐 생긴 실재 수요라 살려 쓴다(§5-A).
             "--different-source-sink",

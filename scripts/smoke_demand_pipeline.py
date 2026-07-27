@@ -8,6 +8,7 @@ netconvert(main.py와 동일 플래그)만 직접 돌리고, 그 뒤는 오케�
 사용법 (반드시 backend/.venv 로):
     backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py
     backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py area-1b5adb59
+    backend/.venv/Scripts/python.exe scripts/smoke_demand_pipeline.py --sim   # 동적 SUMO까지
 
 **두 구역 다 돌릴 것.** 한 구역만 보면 놓친다 — origBoundary 버그가 영등포에서는
 배율이 1에 가까워 보이지 않다가 안양·의왕에서 생존율 2.0%로 드러났다(진행문서 §5-A).
@@ -41,7 +42,9 @@ os.environ.setdefault("SUMO_HOME", str(SUMO_HOME))
 
 sys.path.insert(0, str(BACKEND))
 
-AREA = sys.argv[1] if len(sys.argv) > 1 else "area-0baecbba"
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+RUN_SIM = "--sim" in sys.argv[1:]    # 동적 SUMO까지 (느리므로 기본 꺼둠)
+AREA = ARGS[0] if ARGS else "area-0baecbba"
 OSM_SRC = BACKEND / "networks" / f"{AREA}.osm"
 
 TOTAL_TRIPS = 5000.0   # 임시값 — N* 튜닝은 정체 관측 수단이 생긴 뒤(6단계)
@@ -128,6 +131,33 @@ def main() -> int:
           and in_window == len(deps))   # 창 밖으로 새면 시각 변환이 틀린 것
     print(f"  → {'PASS' if ok else 'FAIL — 진행문서 §5-A 확인'}")
     print(f"\n  산출물: {res.routes_file}")
+
+    # ── 5. (선택) 동적 SUMO ───────────────────────────────────────────
+    if RUN_SIM:
+        stage("5. 동적 SUMO — 예열 → 정체 → 피크 스냅샷")
+        from app.services.demand.simulation import (run_simulation, congestion_summary,
+                                                    edge_loads_to_demand)
+
+        sim = run_simulation(net_file=str(net), routes_file=res.routes_file,
+                             out_dir=str(work), prefix="smoke",
+                             log=lambda m: print(f"  {m}", flush=True))
+        print(congestion_summary(sim, top_n=6))
+
+        dp = edge_loads_to_demand(sim.peak_edges)
+        total = sum(d.vehicle_count for d in dp) or 1.0
+        top10 = sum(sorted((d.vehicle_count for d in dp), reverse=True)[:max(1, len(dp) // 10)])
+        print(f"\n  배치 수요점 {len(dp)}개 | 총 {total:.0f}대 "
+              f"| 상위10% 엣지가 {top10 / total * 100:.0f}% 점유")
+
+        # 정체가 "생겼다 풀려야" 배치 비교가 성립한다(§5-1)
+        built = sim.congestion_ratio >= 0.05
+        cleared = sim.stats["still_running_at_end"] <= max(sim.stats["arrived"] * 0.05, 10)
+        print(f"  → 정체 생김 {'O' if built else 'X'} / 풀림 {'O' if cleared else 'X'}"
+              f" | 순간이동 {sim.stats['teleports']}건"
+              f" ({sim.stats['teleports'] / max(sim.stats['arrived'], 1) * 100:.1f}%)")
+        print(f"  → {'PASS' if built and cleared else 'FAIL — total_trips 조정 필요(N* 튜닝)'}")
+        ok = ok and built and cleared
+
     return 0 if ok else 1
 
 
