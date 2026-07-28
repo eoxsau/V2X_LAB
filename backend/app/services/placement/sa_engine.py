@@ -55,14 +55,27 @@ def _to_stations(cands: Sequence, idx: Sequence[int]) -> list[Station]:
 
 
 class _Evaluator:
-    """채점 호출 횟수를 세는 얇은 래퍼 — 실행 비용을 결과에 남기기 위해."""
+    """채점 호출 횟수를 세는 얇은 래퍼 — 실행 비용을 결과에 남기기 위해.
+
+    가능하면 `fast_scoring.FastScorer`(numpy 벡터화)를 쓰고, 준비에 실패하면 원본
+    `score_placement`로 조용히 되돌아간다. 둘은 같은 답을 낸다(동치 검증 최대 차이 7e-12 ms).
+    greedy가 만 회 단위로 부르는 자리라 여기 속도가 전체를 좌우한다 — 실측 41.4 → 0.78 ms.
+    """
 
     def __init__(self, cands, demand, tech, a_seg):
         self.c, self.d, self.tech, self.a = cands, demand, tech, a_seg
         self.n = 0
+        self._fast = None
+        try:
+            from .fast_scoring import FastScorer
+            self._fast = FastScorer(cands, demand, tech, a_seg)
+        except Exception as exc:      # numpy 부재·메모리 부족 등 — 정확성엔 영향 없다
+            print(f"[PLACE] 벡터화 채점 준비 실패, 원본 경로로 진행합니다: {exc}", flush=True)
 
     def __call__(self, idx: Sequence[int]) -> ScoreResult:
         self.n += 1
+        if self._fast is not None:
+            return self._fast.score(idx)
         return score_placement(_to_stations(self.c, idx), self.d, self.tech, self.a)
 
 
@@ -161,13 +174,25 @@ def optimize(
     a_seg: ASegLookup = _no_a_seg,
     n_greedy: int = 1,
     n_random: int = 2,
-    sa_iter: int = 1500,
+    sa_iter: int = 0,
     seed: Optional[int] = None,
 ) -> PlacementResult:
-    """multi-start SA 진입점 (§6-1).
+    """multi-start 진입점 (§6-1).
 
-    warm-start(greedy) 궤적 + random 궤적을 각각 SA로 굴리고 최선을 채택한다.
-    **warm-start만으로 채우지 않는다** — greedy는 근시안이라 단독으로는 국소해에 갇힌다(v1 규칙).
+    sa_iter : SA 궤적 길이. **0이면 SA를 건너뛰고 greedy 해를 그대로 쓴다(기본값).**
+
+        ⚠️ 기본을 0으로 둔 근거 (2026-07-28 실측, 안양 구역 BS8·RSU8):
+            greedy 해의 **1-swap 이웃 8,128개를 전수 탐색했더니 개선이 하나도 없었다.**
+            즉 greedy가 이미 1-swap 국소최적이고, `sa_run`의 이동 집합은 단일 swap뿐이라
+            **원리적으로 이길 수 없다.** 실제로 SA 12,384회(389초)가 개선 0.00%였다.
+            온도나 반복수 문제가 아니다 — 이웃 전체에 갈 곳이 없다.
+
+        지우지 않고 남겨둔 이유: 다른 구역·다른 N에서도 항상 0이라는 보장은 없고,
+        나중에 2-swap 같은 **넓은 이동 집합**을 넣을 때 이 자리가 필요하다.
+        그때는 `sa_run`의 이동을 바꾸고 이 기본값을 되살리면 된다.
+
+    n_random : 무작위 배치 표본 수. `sa_iter=0`이면 **기준선(random_baseline_ms) 산출에만**
+        쓰인다 — 채점 1회씩이면 충분하고, 궤적으로는 쓰지 않는다.
     """
     cands = list(bs_candidates) + list(rsu_candidates)
     bs_pool = list(range(len(bs_candidates)))
@@ -186,18 +211,24 @@ def optimize(
     for _ in range(max(n_greedy, 0)):
         init = greedy_forward_init(ev, bs_pool, rsu_pool, n_bs, n_rsu)
         init_cost = ev(init).cost_ms
-        idx, cost = sa_run(ev, init, type_of, pool_by_type, n_iter=sa_iter,
-                           rng=_rng_module.Random(rng.randint(0, 10 ** 9)))
+        if sa_iter > 0:
+            idx, cost = sa_run(ev, init, type_of, pool_by_type, n_iter=sa_iter,
+                               rng=_rng_module.Random(rng.randint(0, 10 ** 9)))
+        else:
+            idx, cost = init, init_cost
         results.append((idx, cost, init_cost))
 
     for _ in range(max(n_random, 0)):
         init = (rng.sample(bs_pool, n_bs) if n_bs else []) + \
                (rng.sample(rsu_pool, n_rsu) if n_rsu else [])
         init_cost = ev(init).cost_ms
-        random_inits.append(init_cost)     # 최적화 이득의 기준선
-        idx, cost = sa_run(ev, init, type_of, pool_by_type, n_iter=sa_iter,
-                           rng=_rng_module.Random(rng.randint(0, 10 ** 9)))
-        results.append((idx, cost, init_cost))
+        random_inits.append(init_cost)     # 최적화 이득의 기준선 — 이 한 번이면 나온다
+        if sa_iter > 0:
+            idx, cost = sa_run(ev, init, type_of, pool_by_type, n_iter=sa_iter,
+                               rng=_rng_module.Random(rng.randint(0, 10 ** 9)))
+            results.append((idx, cost, init_cost))
+        # sa_iter=0이면 궤적으로 쓰지 않는다 — 무작위 배치를 최종 결과로 채택할 이유가 없다.
+        # (기준선 수치는 위 init_cost 한 번으로 이미 확보했다)
 
     if not results:
         return PlacementResult(tech=tech, n_bs=n_bs, n_rsu=n_rsu)

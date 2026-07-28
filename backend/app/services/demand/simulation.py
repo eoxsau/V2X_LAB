@@ -27,11 +27,28 @@ teleport (⚠️ 여기서 문서의 기존 지침을 뒤집었다 — 2026-07-2
     → **긴 유한값(기본 300초)** 을 쓴다. 이 네트워크에서 정상적인 줄서기는 5분을 넘지 않으므로
       진짜 정체는 그대로 남고 교착만 풀린다. `teleports` 건수를 결과에 담아두었으니
       **이 값이 커지면(수 % 이상) 튜닝 결과를 의심할 것.**
+
+조기 종료 (2026-07-28 추가 — N* 보정이 사실상 끝나지 않던 문제):
+    실측(안양 5.5km², 211 lane-km, 20,321통행): 판정에 필요한 정보는 **2분**이면 다 나오는데
+    실행은 **55분**이 걸렸다. 곡선이 이랬다 —
+
+        t=7.58h  주행 3,923  정지 85%  도착 2,878  순간이동 321  (tele/arr = 0.11)  ← 탈락 확정
+        t=9.17h  주행10,441  정지 87%  도착 6,505  순간이동 7,405 (tele/arr = 1.14)
+
+    `MAX_TELEPORT_RATIO=0.10`을 t=7.58h에 이미 넘었다. 나머지 53분은 **아는 답을 다시
+    확인하려고** 태운 시간이다. 게다가 이런 실행이 6회 반복되니 클릭 한 번에 3~5시간이었다.
+
+    → `abort_check` 콜백으로 summary를 돌아가는 중에 훔쳐보고, 판정이 확정되면 끊는다.
+      반대쪽 낭비(차가 다 빠진 뒤의 빈 꼬리 구간, 여기선 4시간)는 `stop_when_drained`가 자른다.
+      **어느 쪽도 결과를 바꾸지 않는다** — 확정된 판정을 앞당길 뿐이고, 빈 스텝은 어차피
+      아무 일도 일어나지 않는다.
 """
 from __future__ import annotations
 
 import math
+import re
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +62,18 @@ DEFAULT_INTERVAL_S = 300.0   # 5분 집계. 피크를 이 해상도로 찾는다
 DEFAULT_STEP_LENGTH = 0.5    # main.py의 실시간 시뮬과 동일
 DEFAULT_IGNORE_JUNCTION_BLOCKER_S = 60.0   # 교차로를 막고 선 차를 무시하기까지의 시간
 DEFAULT_TIME_TO_TELEPORT_S = 300.0   # -1(끔)이면 교착이 영구화된다 — 모듈 상단 설명 참조
+DEFAULT_POLL_S = 2.0         # 조기 종료 판단 주기. summary는 이보다 훨씬 드물게 갱신된다
+
+# summary 기록 주기 — **엣지 집계 주기(`interval_s`)와 분리한다** (2026-07-28).
+#
+# sumo는 출력을 ~4KB 버퍼 단위로 흘린다(1.27에 unbuffered 옵션이 없다). summary 한 줄이
+# ~340B이므로 period=300이면 **한 번 흘릴 때마다 시뮬 1시간치**가 뭉쳐 나온다 — 조기 종료가
+# 그만큼 늦어진다(실측: tele/arr이 0.087까지 오른 걸 보고도 다음 갱신까지 12분을 더 기다림).
+# 60초로 줄이면 같은 4KB가 시뮬 12분치가 되어 판정이 5배 빨라진다.
+#
+# 엣지 집계는 그대로 `interval_s`를 쓴다 — 그쪽은 구간당 표본이 충분해야 하므로 잘게 쪼개면 안 된다.
+# summary는 시간 곡선·피크 '시각' 탐색용이라 잘게 쓰는 편이 오히려 정확하다.
+SUMMARY_PERIOD_S = 60.0
 
 
 def _log_noop(_: str) -> None:
@@ -89,7 +118,18 @@ class SimResult:
     peak_running: int = 0
     peak_edges: list[EdgeLoad] = field(default_factory=list)   # 피크 구간의 엣지별 교통량
 
+    # 조기 종료 — end_s까지 안 가고 중간에 끊었다는 뜻. `abort_reason`으로 무엇인지 구분한다:
+    #   "gridlock: ..."  판정이 이미 확정돼 끊음 → 호출부가 실패로 처리할 것 (수치 신뢰 불가)
+    #   "drained: ..."   차가 다 빠져 남은 구간이 빈 스텝뿐이라 끊음 → **정상 완주와 동등**
+    aborted: bool = False
+    abort_reason: str = ""
+
     stats: dict = field(default_factory=dict)
+
+    @property
+    def gridlocked(self) -> bool:
+        """교착이 확정돼 중단된 실행인가. True면 이 결과의 수치는 쓸 수 없다."""
+        return self.aborted and self.abort_reason.startswith("gridlock")
 
     @property
     def congestion_ratio(self) -> float:
@@ -111,6 +151,9 @@ def run_simulation(
     step_length: float = DEFAULT_STEP_LENGTH,
     ignore_junction_blocker_s: float = DEFAULT_IGNORE_JUNCTION_BLOCKER_S,
     time_to_teleport_s: float = DEFAULT_TIME_TO_TELEPORT_S,
+    abort_check: Optional[Callable[[dict], Optional[str]]] = None,
+    stop_when_drained: bool = True,
+    poll_s: float = DEFAULT_POLL_S,
     prefix: str = "sim",
     log: Optional[Callable[[str], None]] = None,
 ) -> SimResult:
@@ -125,10 +168,16 @@ def run_simulation(
     time_to_teleport_s : 이 시간을 넘게 막힌 차를 순간이동. -1이면 끔.
         **끄지 말 것** — 교착이 영구화된다(모듈 상단 실측 근거). 결과의
         `stats["teleports"]`가 차량 수의 수 %를 넘으면 정체 수치를 신뢰하지 말 것.
+    abort_check : `poll_s`마다 summary의 **최신 스텝**을 받아 중단 사유를 돌려주는 콜백.
+        None을 주면 계속 진행. N* 보정처럼 "판정만 필요한" 실행에서 쓴다 — 자세한
+        근거는 모듈 상단 §조기 종료.
+    stop_when_drained : 마지막 차가 출발한 뒤 도로가 비면 남은 구간을 굴리지 않고 끊는다.
+        남은 건 빈 스텝뿐이므로 결과가 달라지지 않는다(`still_running_at_end`도 0으로 동일).
 
     Returns
     -------
     SimResult — `peak_edges`가 곧 배치 수요의 재료다(`edge_loads_to_demand`로 변환).
+        `aborted`면 조기 종료된 것이고, `gridlocked`면 수치를 쓰면 안 된다.
     """
     log = log or _log_noop
     out = Path(out_dir)
@@ -154,18 +203,29 @@ def run_simulation(
 
     summary_f = out / f"{prefix}.summary.xml"
     edgedata_f = out / f"{prefix}.edgedata.xml"
-    _run_sumo(net_file, routes_file, summary_f, edgedata_f,
-              begin_s, end_s, interval_s, step_length, ignore_junction_blocker_s,
-              time_to_teleport_s, log)
+    # 이전 실행의 잔재를 남겨두면 조기 종료 판정이 옛 곡선을 읽는다 — 반드시 지우고 시작한다.
+    for stale in (summary_f, edgedata_f):
+        stale.unlink(missing_ok=True)
+
+    t_wall = time.perf_counter()
+    aborted, abort_reason = _run_sumo(
+        net_file, routes_file, summary_f, edgedata_f,
+        begin_s, end_s, interval_s, step_length, ignore_junction_blocker_s,
+        time_to_teleport_s, abort_check,
+        depart_max if stop_when_drained else None, poll_s, log)
 
     res = SimResult(
         net_file=str(net_file), routes_file=str(routes_file),
         summary_file=str(summary_f), edgedata_file=str(edgedata_f),
         begin_s=begin_s, end_s=end_s, warmup_s=warmup_s, interval_s=interval_s,
+        aborted=aborted, abort_reason=abort_reason,
     )
     _parse_summary(summary_f, res)
     if not res.times_s:
         raise RuntimeError(f"summary 출력이 비었습니다: {summary_f}")
+    if aborted:
+        log(f"조기 종료 ({abort_reason}) — {time.perf_counter() - t_wall:.0f}s, "
+            f"t={res.times_s[-1] / 3600:.2f}h / 예정 {end_s / 3600:.2f}h")
 
     # 피크 = 예열 이후에서 동시 주행 대수 최대 시각
     measure_from = begin_s + warmup_s
@@ -175,8 +235,12 @@ def run_simulation(
         log("⚠️ 예열 구간이 시뮬 전체보다 깁니다 — 전체에서 피크를 찾습니다.")
     res.peak_time_s, res.peak_running, peak_halting = max(cand, key=lambda x: x[1])
 
-    net = read_net(str(net_file))
-    res.peak_edges = _parse_edgedata(edgedata_f, net, res.peak_time_s)
+    # 교착으로 끊은 실행은 수치를 어차피 버리므로 엣지 집계(수십 MB 파싱)를 건너뛴다.
+    if res.gridlocked:
+        res.peak_edges = []
+    else:
+        net = read_net(str(net_file))
+        res.peak_edges = _parse_edgedata(edgedata_f, net, res.peak_time_s)
 
     res.stats = {
         "n_intervals": int(math.ceil((end_s - begin_s) / interval_s)),
@@ -212,13 +276,21 @@ def _run_sumo(
     net_file: str, routes_file: str, summary_f: Path, edgedata_f: Path,
     begin_s: float, end_s: float, interval_s: float, step_length: float,
     ignore_junction_blocker_s: float, time_to_teleport_s: float,
+    abort_check: Optional[Callable[[dict], Optional[str]]],
+    drain_after_s: Optional[float], poll_s: float,
     log: Callable[[str], None],
-) -> None:
-    """sumo 실행.
+) -> tuple[bool, str]:
+    """sumo 실행 + `poll_s`마다 summary를 훔쳐보며 조기 종료 판단.
 
     **`sumo` 본체는 한글 경로에서 정상**이다(2026-07-27 실측: `C:\\Users\\최동혁\\...`에서 rc=0).
     한글 경로에서 죽는 건 od2trips뿐이므로, 여기서는 ASCII 스테이징 없이 제자리에서 돌린다
     (출력이 그대로 남아 디버깅도 쉽다).
+
+    stdout/stderr을 파이프가 아니라 **파일로** 받는 이유: 실행 중에 파이프를 안 읽으면
+    버퍼가 차서 자식이 멈춘다. 예전 `subprocess.run(capture_output=True)`은 끝날 때까지
+    기다렸으니 문제가 없었지만, 지금은 돌아가는 중에 폴링하므로 파일이어야 안전하다.
+
+    Returns: (aborted, reason) — reason은 "gridlock: ..." | "drained: ..." | "".
     """
     add_f = summary_f.parent / f"{summary_f.name.split('.')[0]}.add.xml"
     # 엣지 집계는 additional 파일로만 period 지정이 가능하다(--edgedata-output엔 period 옵션이 없음)
@@ -229,13 +301,14 @@ def _run_sumo(
         '</additional>\n', encoding="utf-8")
 
     # cwd를 출력 폴더로 옮기므로 입력은 전부 절대경로여야 한다
-    p = subprocess.run([
+    cmd = [
         sumo_binary("sumo"),
         "-n", str(Path(net_file).resolve()),
         "-r", str(Path(routes_file).resolve()),
         "-a", str(add_f.resolve()),
         "--summary-output", str(summary_f.resolve()),
-        "--summary-output.period", f"{interval_s:.0f}",
+        # ⚠️ interval_s가 아니다 — 위 SUMMARY_PERIOD_S 주석 참조(버퍼 때문에 분리했다)
+        "--summary-output.period", f"{min(interval_s, SUMMARY_PERIOD_S):.0f}",
         "--begin", f"{begin_s:.0f}",
         "--end", f"{end_s:.0f}",
         "--step-length", f"{step_length}",
@@ -245,14 +318,59 @@ def _run_sumo(
         "--ignore-junction-blocker", f"{ignore_junction_blocker_s:.0f}",
         "--collision.action", "none",
         "--no-step-log", "--no-warnings",
-    ], capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(summary_f.parent))   # edgeData의 file=은 상대경로 → cwd를 출력 폴더로
-    if p.returncode != 0:
-        raise RuntimeError(f"sumo 실패 (rc={p.returncode}):\n{(p.stderr or p.stdout or '')[-2000:]}")
-    log("sumo OK")
+    ]
+    stdout_f = summary_f.parent / f"{summary_f.name.split('.')[0]}.sumo.log"
+    aborted, reason = False, ""
+
+    with open(stdout_f, "w", encoding="utf-8", errors="replace") as fh:
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+                                cwd=str(summary_f.parent))
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=poll_s)
+                    break                      # 정상 종료
+                except subprocess.TimeoutExpired:
+                    pass
+                snap = _peek_summary(summary_f)
+                if not snap:
+                    continue
+                r = abort_check(snap) if abort_check else None
+                if r is None and drain_after_s is not None:
+                    # 마지막 차가 출발했고 · 도로가 비었고 · 삽입 대기줄도 없다
+                    # = 남은 건 빈 스텝뿐. `waiting`을 꼭 봐야 한다 — 출발 엣지가 막혀
+                    # 대기 중인 차가 있으면 running이 0이어도 아직 끝난 게 아니다.
+                    if (snap.get("time", 0.0) >= drain_after_s
+                            and snap.get("running", 1) == 0
+                            and snap.get("waiting", 1) == 0
+                            and snap.get("arrived", 0) > 0):
+                        r = f"drained: t={snap['time'] / 3600:.2f}h에 전원 도착"
+                if r:
+                    aborted, reason = True, r
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    break
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    if not aborted and proc.returncode != 0:
+        tail = ""
+        try:
+            tail = stdout_f.read_text(encoding="utf-8", errors="replace")[-2000:]
+        except OSError:
+            pass
+        raise RuntimeError(f"sumo 실패 (rc={proc.returncode}):\n{tail}")
+    if not aborted:
+        log("sumo OK")
 
     if not edgedata_f.exists():
         edgedata_f.write_text('<meandata/>\n', encoding="utf-8")
+    return aborted, reason
 
 
 # ── 파싱 ──────────────────────────────────────────────────────────────────────
@@ -274,18 +392,79 @@ def _depart_range(routes_file: str) -> tuple[float, float]:
     return min(deps), max(deps)
 
 
+_STEP_RE = re.compile(r"<step\s([^<>]*?)/>")
+_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+# summary에서 실제로 읽는 필드만 숫자로 변환한다(나머지는 문자열로 남겨도 무해).
+_NUM_KEYS = ("time", "running", "halting", "teleports", "ended", "arrived",
+             "loaded", "inserted", "waiting", "meanSpeed")
+
+
+def _read_steps(path: Path) -> list[dict]:
+    """summary의 `<step .../>`를 정규식으로 읽는다 — **잘린 파일도 읽히는 게 요점**이다.
+
+    조기 종료는 sumo를 TerminateProcess로 끊으므로 닫는 태그가 없다. `ET.iterparse`는
+    그때 ParseError로 통째로 실패한다. `<step>`은 자기완결 태그라 정규식으로 뽑으면
+    마지막 한 줄이 깨져 있어도 그 앞까지 온전히 얻는다.
+    """
+    try:
+        txt = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[dict] = []
+    for m in _STEP_RE.finditer(txt):
+        d: dict = {}
+        for k, v in _ATTR_RE.findall(m.group(1)):
+            if k in _NUM_KEYS:
+                try:
+                    d[k] = float(v) if k in ("time", "meanSpeed") else int(float(v))
+                except ValueError:
+                    continue
+            else:
+                d[k] = v
+        if "time" in d:
+            out.append(d)
+    return out
+
+
+def _peek_summary(path: Path) -> Optional[dict]:
+    """돌아가는 중인 sumo의 summary에서 **최신 스텝** 하나. 못 읽으면 None(다음 폴링에 재시도)."""
+    steps = _read_steps(path)
+    return steps[-1] if steps else None
+
+
 def _parse_summary(path: Path, res: SimResult) -> None:
-    for _, el in ET.iterparse(path, events=("end",)):
-        if el.tag != "step":
-            continue
-        res.times_s.append(float(el.get("time", 0)))
-        res.running.append(int(el.get("running", 0)))
-        res.halting.append(int(el.get("halting", 0)))
-        ms = float(el.get("meanSpeed", -1) or -1)
-        res.mean_speed_kph.append(max(ms, 0.0) * 3.6)
-        res.teleports.append(int(el.get("teleports", 0) or 0))
-        res.ended.append(int(el.get("ended", 0) or 0))
-        el.clear()
+    for d in _read_steps(path):
+        res.times_s.append(d.get("time", 0.0))
+        res.running.append(d.get("running", 0))
+        res.halting.append(d.get("halting", 0))
+        res.mean_speed_kph.append(max(d.get("meanSpeed", -1.0), 0.0) * 3.6)
+        res.teleports.append(d.get("teleports", 0))
+        res.ended.append(d.get("ended", 0))
+
+
+def _load_xml_tolerant(path: Path, root_tag: str) -> Optional[ET.Element]:
+    """XML을 읽되, 조기 종료로 **잘려 있으면 마지막 완결 `</interval>`까지만** 살려서 판다.
+
+    바이트로 읽는 게 중요하다 — sumo 출력에는 `<?xml ... encoding="UTF-8"?>` 선언이 있어
+    str로 넘기면 ElementTree가 ValueError를 낸다.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError:
+        pass
+    cut = raw.rfind(b"</interval>")
+    if cut == -1:
+        return None
+    repaired = raw[:cut + len(b"</interval>")] + f"\n</{root_tag}>\n".encode()
+    try:
+        return ET.fromstring(repaired)
+    except ET.ParseError:
+        return None
 
 
 def _parse_edgedata(path: Path, net, peak_time_s: float) -> list[EdgeLoad]:
@@ -295,15 +474,17 @@ def _parse_edgedata(path: Path, net, peak_time_s: float) -> list[EdgeLoad]:
     동시 주행 대수**가 된다. 배치 수요는 "그 자리에 몇 대가 있나"이므로 이 값이 맞다
     (`entered`는 통과량이라 짧은 엣지에서 과대평가된다).
     """
-    tree = ET.parse(path)
+    root = _load_xml_tolerant(path, "meandata")
+    if root is None:
+        return []
     best: Optional[ET.Element] = None
-    for iv in tree.getroot().findall("interval"):
+    for iv in root.findall("interval"):
         b, e = float(iv.get("begin", 0)), float(iv.get("end", 0))
         if b <= peak_time_s < e:
             best = iv
             break
     if best is None:
-        intervals = tree.getroot().findall("interval")
+        intervals = root.findall("interval")
         if not intervals:
             return []
         best = min(intervals, key=lambda iv: abs(float(iv.get("begin", 0)) - peak_time_s))

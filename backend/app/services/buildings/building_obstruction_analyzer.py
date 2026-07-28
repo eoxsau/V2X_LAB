@@ -271,6 +271,21 @@ def _cache_obstruction(key: tuple, result: BuildingObstructionResult) -> None:
     _OBSTRUCTION_CACHE[key] = result
 
 
+def _planar_dist_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """평면 근사 지상거리(m). 수 km 범위에서 haversine과 차이가 무시할 만하다."""
+    from math import cos, hypot, radians
+    dlat = (lat2 - lat1) * 111_320.0
+    dlng = (lng2 - lng1) * 111_320.0 * cos(radians((lat1 + lat2) * 0.5))
+    return hypot(dlat, dlng)
+
+
+# 커버리지 사전 필터의 안전 여유. `analyze_vehicle_to_node`가 재는 `distance_m`은
+# **EPSG:3857(웹 메르카토르) 길이**라 위도 37도에서 지상거리보다 약 1/cos(lat)=1.26배 크다.
+# 즉 정확한 판정은 `지상거리 <= R × cos(lat)`에 해당한다. 사전 필터가 실수로 후보를
+# 떨어뜨리면 안 되므로 여기에 여유를 더 준다(값이 커질수록 안전하고 덜 걸러진다).
+_COVERAGE_PREFILTER_MARGIN = 1.15
+
+
 def analyze_candidates(
     *,
     vehicle_id: str,
@@ -289,6 +304,18 @@ def analyze_candidates(
         # (2026-07-16 결정) — 4G/5G/6G 전환이 기존 노드에도 즉시 반영된다.
         # BS = d_edge(α 앵커, 셀 안에서는 무차폐 시 SINR ≥ SINR_MIN 보장), RSU = PC5 반경.
         node_coverage_radius = formula_v31.resolve_coverage_radius(network_mode, node_type)
+
+        # ⚠️ 커버리지 밖 노드는 **차폐 분석 전에** 버린다 (2026-07-28).
+        # 아래 `analyze_vehicle_to_node`는 거리 하나를 얻으려고 호출마다 GeoDataFrame을
+        # 만들고 `to_crs`로 좌표계를 바꾼다 — 호출당 ~20ms다. 예전엔 그걸 **전부 돌린 뒤**
+        # 거리로 걸러내서, 노드 54개면 틱당 1.2~2.0초가 들었고 시뮬 루프의 80~90%를 먹었다.
+        # 대부분의 노드는 애초에 커버리지 밖이라 값이 쓰이지도 않는다.
+        from math import cos, radians
+        _cos_lat = max(cos(radians(vehicle_lat)), 1e-6)
+        if (_planar_dist_m(vehicle_lat, vehicle_lng,
+                           float(node.get("lat") or 0.0), float(node.get("lng") or 0.0))
+                > node_coverage_radius * _cos_lat * _COVERAGE_PREFILTER_MARGIN):
+            continue
 
         obs = analyze_vehicle_to_node(
             vehicle_id=vehicle_id,

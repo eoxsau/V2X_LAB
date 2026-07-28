@@ -232,6 +232,7 @@ if SUMO_HOME_PATH and SUMO_TOOLS.exists() and str(SUMO_TOOLS) not in sys.path:
 
 try:
     import traci
+    import traci.constants as tc      # 일괄 구독(subscribeContext)용 변수 상수
     import sumolib
     TRACI_AVAILABLE = True
 except ImportError:
@@ -277,6 +278,9 @@ from app.services.demand.scenario import (background_vehicles_from_scenario,
 WORK_DIR = Path(__file__).parent / "networks"
 WORK_DIR.mkdir(exist_ok=True)
 MAX_SETUP_AREA_KM2        = 25.0   # Overpass API 모드 상한 (대용량 다운로드 불안정)
+# 하한 — 이보다 작으면 도로가 몇 개 안 걸려 교통·배치가 성립하지 않는다.
+# 0.05km² = 약 224m×224m. BS 커버 반경(~500m)보다도 작으니 실험 의미가 없는 크기다.
+MIN_SETUP_AREA_KM2        = 0.05
 MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 단위 커버)
 # RSU 안테나 높이 — C-V2X 표준 도로변 폴 높이 고정값. RSU는 교차로 폴 설치라 건물 높이를
 # 쓰지 않고 항상 이 값을 쓴다(옥상 스냅 대상 아님). 수동/자동 배치 모두 이 상수를 참조.
@@ -427,7 +431,8 @@ async def _no_cache_html(request, call_next):
 _state = {
     "network_ready": False,
     "net_file": None,      # path to .net.xml
-    "traffic_preparing": False,  # 백그라운드 교통 준비 중 여부
+    "traffic_preparing": False,  # 백그라운드 N* 시드 산정 중 여부
+    "nstar_seed": None,          # 해석적 N* 시드(보정 전 잠정값) — 배율 UI 표시용
     "traffic_scenario": None,  # demand.scenario.TrafficScenario — 생성 교통 1세트(구역·배율당 1회)
     "osm_file": None,      # path to downloaded .osm
     "mock_graph": None,    # parsed OSM road graph for fallback mode
@@ -479,6 +484,30 @@ _ws_clients: list[WebSocket] = []
 _sim_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _pause_event = threading.Event()  # set=일시정지, clear=실행
+
+# 실시간 시뮬 배속 — 1.0이 종전 동작(틱당 SUMO 1스텝 + 0.1s 대기 = 실시간의 약 3배).
+# 시뮬 스레드가 매 틱 읽으므로 **실행 중에 바꿔도 즉시 반영**된다.
+_SIM_TICK_S = 0.1
+SIM_SPEED_MIN, SIM_SPEED_MAX = 0.25, 16.0
+_sim_speed_value = 1.0
+
+# 네트워크 텔레메트리 재계산 최소 간격(초, **벽시계**).
+#
+# `update_network_telemetry`는 노드마다 건물 차폐를 ray casting으로 다시 재는데,
+# 2026-07-28 계측에서 **틱당 1.2~2.0초 · 시뮬 루프의 80~90%** 를 먹고 있었다
+# (노드 54개 기준). 그 탓에 시뮬이 초당 0.6스텝으로 기어가고 배경 차량 회색 점이
+# 5.5초에 한 번씩 뚝뚝 끊겨 갱신됐다.
+#
+# 이 값은 **사람이 보는 대시보드의 갱신 주기**이므로 배속이 아니라 벽시계로 잰다.
+# 배속을 올렸다고 텔레메트리를 더 자주 계산할 이유는 없다(오히려 반대다).
+# 근본 해결은 차폐 결과 캐싱이고, 이건 그때까지의 상한선이다.
+SIM_TELEMETRY_MIN_INTERVAL_S = 0.5
+
+
+def _sim_speed() -> float:
+    return _sim_speed_value
+
+
 _runtime_probe_cache: dict[str, dict] = {}
 _network_lock = threading.Lock()
 # Phase 2: 시나리오 배치 러너 상태. _state를 공유하는 단일 순차 실행이므로 동시에 하나만
@@ -3126,6 +3155,22 @@ def overpass_download(bbox: BBox, out_file: Path):
     print(f"[OSM] Downloaded {size_kb:.1f} KB → {out_file}", flush=True)
 
 
+def _demand_bbox() -> Optional[tuple[float, float, float, float]]:
+    """수요를 깔 범위 = **사용자가 그린 구역** → (minlng, minlat, maxlng, maxlat).
+
+    net(=`--keep-edges.in-geo-boundary`로 경계에 걸친 도로를 통째로 살린 결과)은 그린 구역보다
+    훨씬 넓다. 그 전체에 수요를 깔면 존 수가 제곱으로 늘어 비용이 몇 배가 되고, 무엇보다
+    "이 구역의 통신 수요"가 아닌 것까지 섞인다(안양 실측 5.45km² → 19.16km², OD 상한 6.1배).
+    """
+    b = _state.get("current_bbox")
+    if not b:
+        return None
+    try:
+        return (float(b["w"]), float(b["s"]), float(b["e"]), float(b["n"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def current_traffic_scenario(force: bool = False, build: bool = True):
     """현재 구역의 생성 교통 한 세트를 준비한다 (없으면 만들고, 있으면 캐시 재사용).
 
@@ -3149,28 +3194,39 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
     # 경로는 반드시 resolve()로 정규화해 비교할 것 — 문자열 그대로 비교하면
     # 'networks/wired.net.xml' vs 'networks\\wired.net.xml'처럼 구분자만 달라도
     # 캐시가 매번 빗나간다(2026-07-27 실측).
-    if (not force and cached is not None
-            and Path(cached.net_file).resolve() == Path(net_file).resolve()
-            and abs(cached.demand_scale - scale) < 1e-6):
+    def _hit(c) -> bool:
+        return (not force and c is not None
+                and Path(c.net_file).resolve() == Path(net_file).resolve()
+                and abs(c.demand_scale - scale) < 1e-6)
+
+    if _hit(cached):
         return cached
     if not build:
         return None
 
-    try:
-        sc = build_traffic_scenario(
-            net_file=str(net_file),
-            out_dir=str(WORK_DIR / "_demand"),
-            demand_scale=scale,
-            force=force,
-            log=lambda m: print(f"[DEMAND] {m}", flush=True),
-        )
-    except Exception as exc:
-        print(f"[DEMAND] 교통 생성 실패 — 기존 폴백을 씁니다: {exc}", flush=True)
-        _state["traffic_scenario"] = None
-        return None
+    # ⚠️ 반드시 직렬화할 것. 구역 확정 직후 백그라운드가 이미 만들고 있는데 사용자가
+    # 최적화/재생을 누르면, 락이 없으면 **같은 보정을 두 번** 돌린다(SUMO 8개가 서로
+    # CPU를 뺏어 둘 다 느려진다). 락을 기다렸다 다시 확인하면 앞선 작업 결과를 그대로 쓴다.
+    with _traffic_build_lock:
+        cached = _state.get("traffic_scenario")
+        if _hit(cached):
+            return cached
+        try:
+            sc = build_traffic_scenario(
+                net_file=str(net_file),
+                out_dir=str(WORK_DIR / "_demand"),
+                demand_scale=scale,
+                area_bbox=_demand_bbox(),
+                force=force,
+                log=lambda m: print(f"[DEMAND] {m}", flush=True),
+            )
+        except Exception as exc:
+            print(f"[DEMAND] 교통 생성 실패 — 기존 폴백을 씁니다: {exc}", flush=True)
+            _state["traffic_scenario"] = None
+            return None
 
-    _state["traffic_scenario"] = sc
-    return sc
+        _state["traffic_scenario"] = sc
+        return sc
 
 
 def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] = None):
@@ -3197,12 +3253,20 @@ def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] 
         return None
 
     from app.services.demand.assignment import read_net, net_bbox, routable_edges
+    from app.services.demand.calibration import _edge_touches_bbox
     from app.services.placement.optimizer import (demand_from_edge_loads,
                                                   optimize_placement_for_area)
 
     net = read_net(str(net_file))
-    bbox = net_bbox(net, margin_m=0)
-    buildings = BUILDING_REPOSITORY.query_by_bbox_parquet(*bbox)
+    # 후보는 **사용자가 그린 구역 안**에서만 고른다. net은 그 구역보다 훨씬 넓어서
+    # (경계에 걸친 도로가 통째로 살아남음) 그대로 두면 사용자가 요청하지도 않은 바깥
+    # 지역에 BS·RSU를 세운다. 랜덤 배치 경로는 이미 current_bbox로 거르고 있었는데
+    # v2 경로만 빠져 있었다(2026-07-28).
+    bbox = _demand_bbox() or net_bbox(net, margin_m=0)
+    buildings = BUILDING_REPOSITORY.query_by_bbox_parquet(*bbox)          # BS 후보 = 건물 옥상
+    _routable = routable_edges(net)
+    _in_area = {eid for eid in _routable
+                if _edge_touches_bbox(net, net.getEdge(eid), bbox)}       # RSU 후보 = 교차로
     demand = demand_from_edge_loads(scn.peak_edge_loads, net)
     if not demand:
         return None
@@ -3210,30 +3274,83 @@ def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] 
     return optimize_placement_for_area(
         net, buildings, demand, n_bs, n_rsu, tech=tech,
         cache_dir=str(WORK_DIR / "_aseg"),
-        routable_edge_ids=routable_edges(net),
+        routable_edge_ids=_in_area or _routable,
         seed=seed,
         log=lambda m: print(f"[PLACE-V2] {m}", flush=True),
     )
 
 
-def _prepare_traffic_async() -> None:
-    """구역 설정 직후 백그라운드로 교통(N* 포함)을 미리 만들어 둔다.
+_nstar_seed_lock = threading.Lock()
+# 교통 생성 직렬화 — 백그라운드 준비와 클릭 경로가 같은 것을 두 번 만들지 않게 한다.
+# `current_traffic_scenario` 안에서만 쓴다(설명은 그쪽 주석).
+_traffic_build_lock = threading.Lock()
 
-    N* 보정은 시뮬을 5~6회 돌리므로 처음 한 번은 수 분이 걸린다. 이걸 첫 시뮬레이션
-    시작이나 첫 배치 때까지 미루면 사용자가 버튼을 누른 뒤 몇 분을 기다리게 되고,
-    무엇보다 **수요 배율 UI가 "총 몇 대"인지 표시할 수 없다**(N*를 모르므로).
-    구역을 정하는 순간부터 백그라운드로 돌려두면 사용자가 출발지·도착지를 찍는 동안
-    끝나 있을 가능성이 높다.
+
+def _prepare_traffic_async() -> None:
+    """구역 설정 직후 시드 → **전체 교통까지** 백그라운드로 만들어 둔다.
+
+    ⚠️ 2026-07-27 — 처음엔 여기서 전체 보정을 돌렸다가 뺐다. 이유는 타당했다:
+       구역을 드래그할 때마다 수 분짜리 SUMO 반복이 CPU를 점유해서, 구역을 몇 번
+       바꿔보는 흔한 사용에서 스레드가 쌓여 앱 전체가 먹통처럼 느껴졌다.
+
+    ✅ 2026-07-28 — **다시 넣었다.** 그때 뺀 근거가 사라졌기 때문이다:
+       * 보정이 3~5시간 → 9분으로 줄었다(조기 종료·병렬·수요 앞단 공유).
+       * 아래 `_run`이 락으로 직렬화하고, 차례가 왔을 때 구역이 바뀌었으면 버린다.
+         즉 드래그를 여러 번 해도 **동시에 도는 건 항상 하나**고, 마지막 것만 살아남는다.
+       빼 둔 대가는 컸다 — 사용자가 최적화/재생을 누르는 순간에야 보정이 시작돼서
+       클릭 후 아무 반응 없이 수 분을 기다려야 했다(그게 이 세션의 최초 증상이었다).
+
+    시드(수요 생성 1회, ~10초)를 먼저 채워 배율 UI가 바로 "약 몇 대"를 보여주게 하고,
+    이어서 전체 교통을 만든다. 사용자가 노드를 배치하고 출발지·도착지를 찍는 동안 끝난다.
     """
-    def _run():
-        try:
+    net_file = _state.get("net_file")
+    if not net_file:
+        return
+
+    def _run(target_net: str):
+        # 동시에 여러 개가 돌지 않게 직렬화한다. 건너뛰지 않고 **줄을 서는** 이유:
+        # 건너뛰면 그 구역은 시드를 영영 못 받아 배율 UI가 계속 "대기 중"에 머문다.
+        # 대신 차례가 왔을 때 이미 구역이 바뀌었으면 그 계산은 버린다.
+        with _nstar_seed_lock:
+            if _state.get("net_file") != target_net:
+                return
             _state["traffic_preparing"] = True
-            current_traffic_scenario()
+            _seed_worker(target_net)
+            # 시드가 끝났고 아직 같은 구역이면 이어서 전체 교통까지 만든다.
+            # 클릭 경로(`/api/simulation/start`·auto-place)가 쓰는 것과 **같은** 캐시라,
+            # 여기서 끝나 있으면 그쪽은 즉시 반환된다.
+            if _state.get("net_file") != target_net:
+                return
+            try:
+                _state["traffic_preparing"] = True
+                _state["traffic_stage"] = "calibrating"
+                current_traffic_scenario()
+            except Exception as exc:
+                print(f"[DEMAND] 백그라운드 교통 생성 실패: {exc}", flush=True)
+            finally:
+                _state["traffic_preparing"] = False
+                _state["traffic_stage"] = None
+
+    def _seed_worker(target_net: str):
+        try:
+            from app.services.demand.calibration import estimate_nstar_seed
+            from app.services.demand.scenario import DEFAULT_STEP_MIN, DEFAULT_WINDOW
+            from app.services.demand.time_profile import build_time_profile
+
+            profile = build_time_profile(DEFAULT_WINDOW[0], DEFAULT_WINDOW[1], DEFAULT_STEP_MIN)
+            seed, info = estimate_nstar_seed(
+                target_net, str(WORK_DIR / "_demand"), profile, bbox=_demand_bbox(),
+                log=lambda m: print(f"[DEMAND] {m}", flush=True))
+            # 계산하는 사이에 구역이 바뀌었으면 버린다 — 옛 결과로 새 상태를 덮지 않는다
+            if _state.get("net_file") == target_net:
+                _state["nstar_seed"] = {"n_star": round(seed), **info}
         except Exception as exc:
-            print(f"[DEMAND] 백그라운드 교통 준비 실패: {exc}", flush=True)
+            print(f"[DEMAND] N* 시드 산정 실패: {exc}", flush=True)
         finally:
+            # 락 해제는 호출부의 `with`이 한다 — 여기서 또 풀면 이중 해제가 된다
             _state["traffic_preparing"] = False
-    threading.Thread(target=_run, daemon=True).start()
+
+    threading.Thread(target=_run, args=(str(net_file),), daemon=True).start()
 
 
 @app.get("/api/demand/status")
@@ -3246,18 +3363,30 @@ async def demand_status():
     pol = _state.get("policy_options") or {}
     pct = float(pol.get("demand_scale_pct", 100.0))
     sc = current_traffic_scenario(build=False)
-    if sc is None:
+    if sc is not None:
+        # 실제로 교통을 만든 뒤 — 보정된 N*와 실측 대수까지 전부 있다
+        return {"ready": True, "calibrated": True, "preparing": False,
+                "demand_scale_pct": pct, **sc.to_summary()}
+
+    seed = _state.get("nstar_seed")
+    if seed:
+        # 아직 교통은 안 만들었지만 시드로 "약 몇 대"는 보여줄 수 있다(오차 ±20%).
+        # `preparing`을 False로 굳혀 두면 안 된다 — 구역 확정 직후 백그라운드 보정이
+        # 도는 동안 화면이 "준비 완료"라고 거짓말을 하게 된다(2026-07-28).
         return {
-            "ready": False,
+            "ready": True, "calibrated": False,
             "preparing": bool(_state.get("traffic_preparing")),
+            "stage": _state.get("traffic_stage"),
             "demand_scale_pct": pct,
-            "network_ready": bool(_state.get("network_ready")),
+            "n_star": seed["n_star"],
+            "total_trips": round(seed["n_star"] * pct / 100.0),
+            "lane_km": seed.get("lane_km"),
         }
     return {
-        "ready": True,
-        "preparing": False,
+        "ready": False, "calibrated": False,
+        "preparing": bool(_state.get("traffic_preparing")),
         "demand_scale_pct": pct,
-        **sc.to_summary(),
+        "network_ready": bool(_state.get("network_ready")),
     }
 
 
@@ -3836,14 +3965,61 @@ def simulation_thread(
         _insert_wait = 0
         _max_insert_wait = 2400   # 0.5s 스텝 기준 20분. 이 안에 못 들어가면 포기하고 안내
 
+        # 주기 작업은 **`step % N`으로 게이트하면 안 된다** (2026-07-28 실측 버그).
+        # 배속이 붙으면서 한 틱에 step이 여러 칸 뛰므로, 배수를 건너뛰면 그 조건은
+        # **영구히 죽는다.** 실제로 배속 2×로 바꾼 순간 step이 홀수로 굳어
+        # `step % 4 == 0`이 다시는 참이 되지 않았고, 배경 차량 회색 점이 통째로 멈췄다.
+        # → "마지막 실행 이후 몇 스텝 지났나"로 판단한다. 스텝 폭이 얼마든 정확히 동작한다.
+        _last_run_at: dict[str, int] = {}
+        _last_telemetry_at = 0.0    # 벽시계 기준 — 아래 SIM_TELEMETRY_MIN_INTERVAL_S 참조
+
+        def _due(tag: str, every: int) -> bool:
+            if step - _last_run_at.get(tag, -10 ** 9) < every:
+                return False
+            _last_run_at[tag] = step
+            return True
+
+        # ── 배경 차량 위치를 왕복 1회로 받기 (문맥 구독) ─────────────────────
+        # 아무 정션이나 하나를 기준으로 반경을 네트워크보다 크게 잡으면 "모든 차량"이
+        # 걸린다. SUMO가 서버 쪽에서 한 번에 묶어 보내므로 대수가 늘어도 왕복은 1회다.
+        _ctx_jid: Optional[str] = None
+
+        def _bg_ctx() -> dict:
+            """{veh_id: {VAR_POSITION: (x, y), VAR_SPEED: m/s}} — 실패하면 빈 dict."""
+            nonlocal _ctx_jid
+            try:
+                if _ctx_jid is None:
+                    _jids = traci.junction.getIDList()
+                    if not _jids:
+                        return {}
+                    _ctx_jid = _jids[0]
+                    traci.junction.subscribeContext(
+                        _ctx_jid, tc.CMD_GET_VEHICLE_VARIABLE, 1_000_000.0,
+                        [tc.VAR_POSITION, tc.VAR_SPEED])
+                return traci.junction.getContextSubscriptionResults(_ctx_jid) or {}
+            except Exception as _ctx_exc:
+                print(f"[SIM] 배경 차량 일괄 구독 실패, 이번 틱 건너뜁니다: {_ctx_exc}", flush=True)
+                return {}
+
         while not stop_evt.is_set() and not arrived and step < max_steps:
             # 일시정지 대기 (TraCI 연결 유지)
             while _pause_event.is_set() and not stop_evt.is_set():
                 time.sleep(0.1)
             if stop_evt.is_set():
                 break
-            traci.simulationStep()
-            step += 1
+            # 배속 — 틱마다 다시 읽는다(실행 중에 바꿀 수 있어야 하므로).
+            # 한 틱에 SUMO 스텝을 `_substeps`번 굴리고 화면 갱신은 그 뒤 한 번만 한다.
+            # 상한은 SUMO 스텝 비용이다: 배경 1만 대에서 스텝당 ~75ms라 배속을 아무리
+            # 올려도 그 이상 빨라지지 않는다(sleep을 0으로 만드는 데까지가 실질 이득).
+            _speed = _sim_speed()
+            _substeps = max(1, int(round(_speed)))
+            for _ in range(_substeps):
+                traci.simulationStep()
+                step += 1
+                if stop_evt.is_set():
+                    break
+            if stop_evt.is_set():
+                break
 
             ids = traci.vehicle.getIDList()
             if "veh0" not in ids:
@@ -3855,8 +4031,9 @@ def simulation_thread(
                 # 차를 도착으로 오판해 시뮬이 step 11에서 끝나버렸다(2026-07-27 실측).
                 # → **한 번이라도 보인 적이 있어야** 도착으로 친다.
                 if not _veh0_seen:
-                    _insert_wait += 1
-                    if _insert_wait == 20 or _insert_wait % 600 == 0:
+                    # 스텝 단위로 세야 한다 — 배속에서 한 틱이 여러 스텝이므로 +1은 틀린다
+                    _insert_wait += _substeps
+                    if _insert_wait == 20 or _insert_wait // 600 != (_insert_wait - _substeps) // 600:
                         print(f"[SIM] veh0 삽입 대기 {_insert_wait}스텝 — 출발 지점이 혼잡합니다",
                               flush=True)
                         _state["warning"] = ("출발 지점이 혼잡해 타겟 차량이 대기 중입니다. "
@@ -3956,22 +4133,29 @@ def simulation_thread(
                 # 고정 풀을 유지하며 재주입하던 로직(아래 elif)은 여기선 오히려 해롭다:
                 # 도착한 차를 무작위 OD로 되살리면 애써 만든 수요 구조가 무너지고,
                 # `_bg_drivable_edges`도 비어 있어 IndexError가 난다(2026-07-27 실측).
-                if step % 4 == 0:
-                    _bg_vehicle_ids = [v for v in traci.vehicle.getIDList() if v != "veh0"]
+                if _due("bg_positions", 4):
+                    # ⚠️ 차량별로 getPosition/convertGeo/getSpeed를 부르면 안 된다.
+                    # TraCI는 소켓 프로토콜이라 호출 하나가 왕복 한 번이다. 배경 452대면
+                    # 스냅샷 한 번에 1,356회 왕복이고, 실측에서 **시뮬 전체가 초당 0.3스텝**
+                    # 으로 기어갔다(정상 13.6스텝/초의 1/45). 2026-07-28.
+                    #   → 위치·속도는 **문맥 구독으로 한 번에** 받고(왕복 1회),
+                    #     좌표 변환은 이미 메모리에 있는 sumolib net으로 **로컬 계산**한다.
                     _snap = []
-                    for _bg_id in _bg_vehicle_ids:
+                    for _bg_id, _vars in (_bg_ctx() or {}).items():
+                        if _bg_id == "veh0":
+                            continue
                         try:
-                            _bx, _by = traci.vehicle.getPosition(_bg_id)
-                            _blon, _blat = traci.simulation.convertGeo(_bx, _by)
+                            _bx, _by = _vars[tc.VAR_POSITION]
+                            _blon, _blat = net.convertXY2LonLat(_bx, _by)
                             _snap.append({"id": _bg_id, "lat": _blat, "lng": _blon,
-                                          "speed": round(traci.vehicle.getSpeed(_bg_id) * 3.6, 1)})
+                                          "speed": round(_vars[tc.VAR_SPEED] * 3.6, 1)})
                         except Exception:
                             continue
                     _state["background_vehicles"] = _snap
             elif _bg_vehicle_ids:
                 _live_ids = set(traci.vehicle.getIDList())
                 _new_bg_vehicle_ids = []
-                _fetch_bg_positions = (step % 4 == 0)
+                _fetch_bg_positions = _due("bg_positions", 4)
                 _bg_snapshot = [] if _fetch_bg_positions else None
                 for _bg_id in _bg_vehicle_ids:
                     if _bg_id in _live_ids:
@@ -4014,7 +4198,7 @@ def simulation_thread(
                 # baseline(혼잡도 0일 때의 확률)으로 그대로 쓰이고, 혼잡도 1.0에서 최대 4배까지 증폭.
                 _reroute_prob = (_state.get("policy_options") or {}).get("bg_reroute_prob", 0.0)
                 _reroute_mode = (_state.get("policy_options") or {}).get("bg_reroute_mode", "random")
-                if _reroute_prob > 0 and step % 10 == 0 and _bg_drivable_edges:
+                if _reroute_prob > 0 and _bg_drivable_edges and _due("bg_reroute", 10):
                     _bs_nodes_for_reroute = _state.get("network_nodes") or [] if _reroute_mode == "congestion" else []
                     for _bg_id in _bg_vehicle_ids:
                         if _bg_id not in _live_ids:
@@ -4043,7 +4227,8 @@ def simulation_thread(
             # 핸드오버/배경 차량 이동 후에도 그대로 굳어있어 대시보드 "자원 할당" 패널이
             # 갱신되지 않던 문제를 해결한다. K-path 재탐색 없이(빈 리스트) ego의 현재
             # 위치와 최신 배경 차량 스냅샷만으로 가볍게 재계산한다.
-            if RESOURCE_DEMAND_AVAILABLE and step % 20 == 0 and _state.get("network_nodes"):
+            if (RESOURCE_DEMAND_AVAILABLE and _state.get("network_nodes")
+                    and _due("resource_alloc", 20)):
                 _live_origin = _state.get("vehicle_pos") or origin
                 if _live_origin and _live_origin.get("lat") is not None:
                     _periodic_alloc_algo = _state.get("allocation_algorithm") or "traffic_aware_allocation"
@@ -4061,8 +4246,14 @@ def simulation_thread(
                             daemon=True,
                         ).start()
 
-            update_network_telemetry(_state["vehicle_pos"])
-            time.sleep(0.1)  # ~10 fps
+            # 텔레메트리는 **벽시계 기준으로 제한**한다 — 매 틱 돌리면 이 한 줄이 루프의
+            # 80~90%를 먹는다(SIM_TELEMETRY_MIN_INTERVAL_S 주석의 실측).
+            _now_wall = time.perf_counter()
+            if _now_wall - _last_telemetry_at >= SIM_TELEMETRY_MIN_INTERVAL_S:
+                _last_telemetry_at = _now_wall
+                update_network_telemetry(_state["vehicle_pos"])
+            # 배속 1.0에서 10fps(종전 고정값). 올리면 틱 간격이 그만큼 짧아진다.
+            time.sleep(_SIM_TICK_S / _speed)
 
         print(f"[SIM] Simulation ended at step {step}", flush=True)
         traci.close()
@@ -4284,6 +4475,22 @@ async def setup_network(req: SetupRequest):
         (bbox.e - bbox.w) * 111 * abs((bbox.n + bbox.s) / 2 * 3.14159 / 180)
     )
 
+    # 하한도 막는다 — 지도에서 드래그 대신 **클릭**이 되면 사실상 점 하나가 구역으로 잡힌다.
+    # 2026-07-28 실측: 7m×7m 구역이 들어와 도로가 하나도 안 걸렸고, N*가 0으로 나온 뒤
+    # od2trips가 "No vehicles loaded"로 죽었다. 원인이 화면에 전혀 드러나지 않는 실패라,
+    # 여기서 이유를 말해주고 막는 편이 낫다.
+    if area_km2 < MIN_SETUP_AREA_KM2:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"선택 구역이 너무 작습니다 ({area_km2 * 1e6:.0f} m²). "
+                f"최소 {MIN_SETUP_AREA_KM2 * 1e6:.0f} m²(약 "
+                f"{(MIN_SETUP_AREA_KM2 * 1e6) ** 0.5:.0f}m × "
+                f"{(MIN_SETUP_AREA_KM2 * 1e6) ** 0.5:.0f}m) 이상으로 드래그해주세요. "
+                "지도를 클릭만 하면 구역이 점으로 잡힙니다."
+            ),
+        )
+
     area_limit = MAX_SETUP_AREA_KM2_LOCAL if use_local_pbf else MAX_SETUP_AREA_KM2
     if area_km2 > area_limit:
         raise HTTPException(
@@ -4354,10 +4561,13 @@ async def setup_network(req: SetupRequest):
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
             _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
-            _prepare_traffic_async()            # N* 포함 교통을 미리 만들어 둔다(백그라운드)
+            _state["nstar_seed"] = None
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e}
+            # ⚠️ current_bbox **다음에** 부를 것 — 시드 스레드가 `_demand_bbox()`로 그린 구역을
+            # 읽는다. 먼저 부르면 아직 None이라 net 전체에 수요를 깔아 몇 배로 느려진다.
+            _prepare_traffic_async()            # N* 시드를 미리 구해 둔다(백그라운드)
             _state["synthetic_network_nodes"] = generate_network_nodes_for_bbox(
                 _state["current_bbox"],
                 traffic_lambda=(_state.get("policy_options") or {}).get("traffic_lambda", 5.0),
@@ -4547,12 +4757,14 @@ async def setup_network_region(req: RegionSetupRequest):
             _state["mock_graph"] = mock_graph
             _state["net_file"] = str(net_file)
             _state["traffic_scenario"] = None   # 구역이 바뀌면 교통을 새로 만든다
-            _prepare_traffic_async()            # N* 포함 교통을 미리 만들어 둔다(백그라운드)
+            _state["nstar_seed"] = None
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {
                 "s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e
             }
+            # ⚠️ current_bbox **다음에** 부를 것 — 위 bbox 경로와 같은 이유(_demand_bbox 참조)
+            _prepare_traffic_async()            # N* 시드를 미리 구해 둔다(백그라운드)
             _state["current_region"] = {
                 "osm_id": req.osm_id,
                 "name_ko": region["name_ko"],
@@ -5261,6 +5473,28 @@ async def resume_simulation():
         _state["sim_running"] = True
         return {"ok": True}
     raise HTTPException(status_code=400, detail="일시정지 중인 시뮬레이션이 없습니다.")
+
+
+class SimSpeedRequest(BaseModel):
+    speed: float = 1.0
+
+
+@app.post("/api/simulation/speed")
+async def set_simulation_speed(req: SimSpeedRequest):
+    """실시간 시뮬 배속을 바꾼다. 실행 중에 불러도 다음 틱부터 바로 반영된다.
+
+    1.0 = 종전 동작. 올리면 틱당 SUMO 스텝 수가 늘고 틱 간격이 줄어든다.
+    **무한정 빨라지지는 않는다** — 배경 차량이 많으면 SUMO 스텝 자체가 수십 ms라
+    그게 상한이다(배경 1만 대에서 실측 ~75ms/스텝 → 체감 상한 배속 4~6).
+    """
+    global _sim_speed_value
+    _sim_speed_value = max(SIM_SPEED_MIN, min(SIM_SPEED_MAX, float(req.speed)))
+    return {"ok": True, "speed": _sim_speed_value}
+
+
+@app.get("/api/simulation/speed")
+async def get_simulation_speed():
+    return {"speed": _sim_speed_value, "min": SIM_SPEED_MIN, "max": SIM_SPEED_MAX}
 
 
 @app.post("/api/simulation/reset")

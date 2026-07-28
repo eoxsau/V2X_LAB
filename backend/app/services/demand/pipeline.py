@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import platform
 import re
@@ -40,16 +41,189 @@ from .assignment import (
     write_taz_xml,
 )
 from .grid_mass import Zone, build_zones, zone_stats
-from .radiation import od_summary, radiation_od_matrix
+from .radiation import ODFlow, od_summary, radiation_od_matrix
 
 # 기본값 — 근거는 traffic_demand_design_v2.md
 DEFAULT_CELL_M = 300.0        # §3-2. BS 커버엔 충분, RSU는 엣지별 교통량을 쓰므로 무관
+
+# 적응형 셀 크기 — **OD 셀이 통행보다 훨씬 많으면 수요가 망가진다** (2026-07-28 실측).
+#
+# od2trips는 OD 셀별 소수 통행을 정수로 올린다. 셀당 값이 1보다 한참 작으면 그 올림이
+# 총량을 지배하고, 무엇보다 radiation이 만든 **분포가 균일에 가깝게 납작해진다** —
+# 설계문서 §8-1이 "그러면 간선·교차로 집중이라는 결론이 나올 수 없다"고 경고한 그 상태다.
+#
+# 안양 net(그린 구역), 3,694통행 요청 실측:
+#     셀300m · 8슬라이스 → OD셀 110,448 (통행당 29.9) → 차량 7,507대  **203%**
+#     셀300m · 2슬라이스 → OD셀  27,612 (통행당  7.5) → 차량 4,601대   125%
+#     셀500m · 8슬라이스 → OD셀  31,248 (통행당  8.5) → 차량 4,111대   111%
+# 반면 잘 돌던 영등포 앵커는 OD셀 27,376 / 6,244통행 = 통행당 4.4 → 초과 +0.6%.
+#
+# 즉 "OD 라인 수의 1%"라는 예전 규칙은 **통행당 셀 4~5 구간에서 잰 값**이고, 통행당 30
+# 구간으로 외삽하면 안 된다. 아래 비율을 넘지 않도록 셀을 키운다.
+MAX_OD_CELLS_PER_TRIP = 5.0
+MAX_CELL_M = 1000.0           # 이 이상 키우면 배치 최적화가 보는 공간 해상도가 무의미해진다
 DEFAULT_LAMBDA = 0.9999       # §6-5. λ=0은 고밀도 도심에서 통행거리가 셀크기로 붕괴
 DEFAULT_MAX_REASSIGN_M = 900.0  # 셀 3칸. "걸어서 큰길까지" 정도가 타당한 상한
 
 
 def _log_noop(_: str) -> None:
     pass
+
+
+@dataclass
+class DemandContext:
+    """통행량과 **무관한** 준비 결과. 레벨을 여러 개 돌릴 때 한 번만 만들어 공유한다.
+
+    N* 보정은 통행량만 바꿔가며 같은 구역을 반복해서 돈다. 그런데 아래 것들은 통행량이
+    바뀌어도 **결과가 완전히 같다** — net 읽기, 건물 질량, 격자 존, TAZ, 그리고 radiation
+    OD의 *분포*까지. `radiation_od_matrix`의 docstring이 명시하듯 total_trips는 O_i 스케일에만
+    영향을 주고, 코드도 `o_i = total_trips × (mass_i / total_mass)` 한 줄에서만 쓴다.
+
+    그래서 흐름을 **합이 1인 단위 스케일**로 한 번 계산해두고, 레벨마다 곱하기만 한다.
+    안양 실측: 레벨 하나당 준비가 ~13초였고 4개 병렬이면 GIL 경합으로 2분 15초까지 늘었다
+    (스레드를 늘려도 이 구간은 안 빨라진다 — 오히려 나빠진다).
+
+    ⚠️ 만든 뒤에는 **읽기 전용으로만** 쓸 것. 여러 스레드가 동시에 참조한다.
+    """
+    net_file: str
+    net: object
+    bbox: tuple[float, float, float, float]
+    ref_lat: float
+    cell_size_m: float
+    zones: list[Zone] = field(default_factory=list)
+    n_buildings: int = 0
+    flows_unit: list = field(default_factory=list)   # Σ trips == 1.0
+    taz: dict = field(default_factory=dict)
+    zone_taz: dict = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
+
+
+def build_demand_context(
+    net_file: str,
+    *,
+    cell_size_m: Optional[float] = None,
+    design_trips: Optional[float] = None,
+    n_slices: int = 1,
+    lam: float = DEFAULT_LAMBDA,
+    max_reassign_m: float = DEFAULT_MAX_REASSIGN_M,
+    bbox_margin_m: Optional[float] = None,
+    bbox: Optional[tuple[float, float, float, float]] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> DemandContext:
+    """`generate_demand`의 통행량-무관 앞단을 한 번만 수행한다 (DemandContext 참조).
+
+    cell_size_m : 격자 셀 한 변(m). None이고 `design_trips`를 주면 `fit_cell_size`로
+        자동 결정한다(둘 다 없으면 DEFAULT_CELL_M).
+    design_trips : 셀 크기를 맞출 기준 통행량. N* 보정이면 **가장 낮은 레벨**을 줄 것.
+
+    건물 로딩 margin은 셀 크기와 무관하게 `DEFAULT_CELL_M`으로 고정한다. margin의 목적은
+    "경계에 걸친 건물이 잘려 가장자리 셀 질량이 과소평가되는 것"을 막는 것뿐이라 셀 크기를
+    따라갈 이유가 없다. 오히려 따라가게 두면 **셀을 정할 때와 쓸 때 건물 집합이 달라져**
+    맞춰놓은 셀 크기가 빗나간다(2026-07-28: 48개로 맞췄는데 실제로는 존 66개가 됐다).
+    """
+    log = log or _log_noop
+    net_path = str(net_file)
+    net = read_net(net_path)
+    margin = DEFAULT_CELL_M if bbox_margin_m is None else bbox_margin_m
+    area = net_bbox(net, margin_m=margin) if bbox is None else _expand_bbox_m(bbox, margin)
+    ref_lat = (area[1] + area[3]) / 2
+    comp = component_summary(net)
+    log(f"수요 bbox {area[0]:.5f},{area[1]:.5f} ~ {area[2]:.5f},{area[3]:.5f} (ref_lat={ref_lat:.5f})")
+    log(f"승용차 그래프: 엣지 {comp['vclass_edges']} / 최대성분 {comp['largest_component']} "
+        f"({comp['largest_pct']}%) / 고립 {comp['isolated_edges']}")
+
+    buildings, n_buildings = load_building_mass(area)
+    if not buildings:
+        raise RuntimeError(
+            "bbox 안에서 건물을 찾지 못했습니다. data/processed/buildings 전처리 여부와 "
+            "해당 시도 parquet 존재를 확인하세요."
+        )
+    log(f"건물 {n_buildings}동 / 연면적 {sum(b[2] for b in buildings) / 1e6:.2f} km²")
+
+    if cell_size_m is None:
+        cell_size_m = (fit_cell_size(buildings, ref_lat, design_trips, n_slices, log=log)[0]
+                       if design_trips else DEFAULT_CELL_M)
+
+    zones = build_zones(buildings, cell_size_m=cell_size_m, ref_lat=ref_lat)
+    zstats = zone_stats(zones)
+    log(f"존 {zstats['n_zones']}개 / 질량 max·중앙 {zstats['max_over_median']:.1f}배")
+
+    masses = [z.mass for z in zones]
+    coords = [(z.center_lat, z.center_lng) for z in zones]
+    flows = radiation_od_matrix(masses, coords, 1.0, lam=lam)      # 단위 스케일
+    ostats = od_summary(flows, masses, coords)
+    log(f"OD 흐름 {ostats['n_flows']}개 / 통행거리 중앙 {ostats['trip_len_median_m']}m")
+
+    taz = build_taz(net, cell_size_m, ref_lat, largest_component_only=True)
+    zone_taz = map_zones_to_taz(zones, taz, cell_size_m=cell_size_m, max_reassign_m=max_reassign_m)
+    mstats = taz_mapping_summary(zones, zone_taz, cell_size_m=cell_size_m)
+    log(f"TAZ {len(taz)}개 / 자기셀 {mstats['zones_own_cell']} · 재배정 "
+        f"{mstats['zones_reassigned']} · 버림 {mstats['zones_dropped']}"
+        f"(질량 {mstats['mass_dropped_pct']}%)")
+
+    return DemandContext(
+        net_file=net_path, net=net, bbox=area, ref_lat=ref_lat, cell_size_m=cell_size_m,
+        zones=zones, n_buildings=n_buildings, flows_unit=flows, taz=taz, zone_taz=zone_taz,
+        stats={"component": comp, "zone": zstats, "od": ostats, "taz_mapping": mstats},
+    )
+
+
+def fit_cell_size(
+    buildings,
+    ref_lat: float,
+    design_trips: float,
+    n_slices: int,
+    *,
+    start_cell_m: float = DEFAULT_CELL_M,
+    max_cell_m: float = MAX_CELL_M,
+    max_cells_per_trip: float = MAX_OD_CELLS_PER_TRIP,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[float, int]:
+    """OD 셀이 통행 대비 너무 잘게 쪼개지지 않는 셀 크기를 고른다 (근거는 위 상수 주석).
+
+    design_trips : **어떤 통행량 기준으로 맞출지.** N* 보정처럼 여러 레벨을 돌린다면
+        가장 낮은 레벨을 넣어야 한다 — 왜곡은 통행이 적을수록 심하기 때문이다.
+
+        ⚠️ 보정 중에 레벨마다 셀 크기를 바꾸면 **안 된다.** 크기가 바뀌면 수요 분포가
+        바뀌어 레벨 간 비교가 성립하지 않는다(같은 교통 위에서 비교한다는 전제가 깨진다).
+        한 번 정해서 보정 전체와 이후 시나리오 생성까지 같은 값을 쓸 것.
+
+    Returns: (cell_size_m, n_zones)
+    """
+    log = log or _log_noop
+    blist = list(buildings)
+    cell = float(start_cell_m)
+    n_zones = 0
+    for _ in range(8):
+        zones = build_zones(blist, cell_size_m=cell, ref_lat=ref_lat)
+        n_zones = len(zones)
+        if n_zones < 2:
+            break
+        n_cells = n_zones * (n_zones - 1) * max(n_slices, 1)
+        budget = max_cells_per_trip * max(design_trips, 1.0)
+        if n_cells <= budget or cell >= max_cell_m:
+            break
+        # 셀 수는 존 수의 제곱 → 존을 sqrt(초과분)만큼 줄이면 되고,
+        # 존 수는 셀 면적에 반비례하므로 셀 한 변은 그 제곱근만큼 키운다.
+        cell = min(max_cell_m, cell * (n_cells / budget) ** 0.25 * 1.02)
+    if abs(cell - start_cell_m) > 1.0:
+        log(f"셀 크기 {start_cell_m:.0f}m → {cell:.0f}m (존 {n_zones}개, "
+            f"기준 통행 {design_trips:.0f} · 슬라이스 {n_slices})")
+    return cell, n_zones
+
+
+def _expand_bbox_m(
+    bbox: tuple[float, float, float, float], margin_m: float,
+) -> tuple[float, float, float, float]:
+    """(minlng, minlat, maxlng, maxlat)를 사방으로 margin_m만큼 넓힌다.
+
+    경계에 걸친 건물이 잘려 나가면 가장자리 셀의 질량이 과소평가된다 — `net_bbox`가
+    margin을 두는 것과 같은 이유다.
+    """
+    minlng, minlat, maxlng, maxlat = bbox
+    dlat = margin_m / 111_320.0
+    dlng = margin_m / (111_320.0 * max(math.cos(math.radians((minlat + maxlat) / 2)), 0.1))
+    return (minlng - dlng, minlat - dlat, maxlng + dlng, maxlat + dlat)
 
 
 # ── SUMO 바이너리 / ASCII 경로 ────────────────────────────────────────────────
@@ -200,9 +374,11 @@ def generate_demand(
     lam: float = DEFAULT_LAMBDA,
     max_reassign_m: float = DEFAULT_MAX_REASSIGN_M,
     bbox_margin_m: Optional[float] = None,
+    bbox: Optional[tuple[float, float, float, float]] = None,
     begin_h: float = 7.0,
     end_h: float = 8.0,
     time_profile: Optional[Sequence[tuple[float, float, float]]] = None,
+    context: Optional["DemandContext"] = None,
     prefix: str = "demand",
     log: Optional[Callable[[str], None]] = None,
 ) -> DemandResult:
@@ -216,10 +392,27 @@ def generate_demand(
         (od2trips 단계만 내부적으로 ASCII로 스테이징한다).
     total_trips : **시뮬레이션 창 전체의 총 통행 수**(통행/창). 동시 주행 대수가 아니다 —
         그건 결과다(Little's Law). 이 값이 N* × 사용자 배율 n에 해당한다(v2 §5-2).
-    bbox_margin_m : 도로 범위 밖으로 건물을 얼마나 더 담을지. 기본 = 셀 한 칸.
+    bbox_margin_m : 수요 범위 밖으로 건물을 얼마나 더 담을지. 기본 = 셀 한 칸.
+    bbox : **수요를 만들 범위** (minlng, minlat, maxlng, maxlat). None이면 net 전체 범위.
+
+        ⚠️ 이걸 안 주면 **사용자가 그린 구역이 아니라 net 전체**에 수요를 깐다 (2026-07-28).
+        netconvert의 `--keep-edges.in-geo-boundary`는 경계에 걸친 도로를 통째로 살리므로
+        net은 그린 구역보다 훨씬 넓어진다. 안양 실측 — 그린 구역 5.45km² → net 19.16km²:
+
+            존 119개 (OD 상한 14,042)  →  존 293개 (OD 상한 85,556)   **6.1배**
+
+        radiation OD가 존 수의 **제곱**이라 넓이 3.5배가 비용 6배가 된다. 정확성 문제이기도
+        하다 — 구역 밖에서 나고 드는 통행은 "이 구역의 통신 수요"가 아니다.
+
+        net을 자르지 않고 수요만 좁히는 이유: 도로를 경계에서 자르면 인위적인 막다른 길이
+        생겨 그리로 배정된 차가 갇힌다. 주변 도로는 남겨두는 편이 현실적이다(실제 교통도
+        구역 밖에서 들어와 빠져나간다).
     time_profile : [(begin_h, end_h, share)] 시간대 슬라이스. None이면 begin_h~end_h 단일 구간.
         24h 곡선(`data/processed/traffic_survey/시간대_프로파일.csv`)에서 창에 해당하는
         구간만 떼어 넘기면 된다.
+    context : `build_demand_context()`로 미리 만든 통행량-무관 앞단. 통행량만 바꿔 여러 번
+        부를 때(N* 보정) 넘기면 net 읽기·건물·존·radiation·TAZ를 통째로 건너뛴다.
+        주면 `cell_size_m`·`lam`·`bbox` 등 앞단 인자는 **context 쪽이 이긴다.**
 
     Returns
     -------
@@ -229,45 +422,30 @@ def generate_demand(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # 1. net 로드 + **실제 도로 범위** bbox
-    net_path = str(net_file)
-    net = read_net(net_path)   # 한 번 읽어 bbox·연결성·TAZ에 재사용
-    margin = cell_size_m if bbox_margin_m is None else bbox_margin_m
-    bbox = net_bbox(net, margin_m=margin)
-    ref_lat = (bbox[1] + bbox[3]) / 2
-    comp = component_summary(net)
-    log(f"도로 bbox {bbox[0]:.5f},{bbox[1]:.5f} ~ {bbox[2]:.5f},{bbox[3]:.5f} (ref_lat={ref_lat:.5f})")
-    log(f"승용차 그래프: 엣지 {comp['vclass_edges']} / 최대성분 {comp['largest_component']} "
-        f"({comp['largest_pct']}%) / 고립 {comp['isolated_edges']}")
+    # 1~5. 통행량과 무관한 앞단 — context를 주면 통째로 재사용한다(DemandContext 주석 참조)
+    if context is None:
+        if bbox is None:
+            log("⚠️ 수요 범위를 net 전체로 잡습니다 — 그린 구역을 넘겨주면 훨씬 싸집니다(docstring 참조)")
+        context = build_demand_context(
+            net_file, cell_size_m=cell_size_m, lam=lam, max_reassign_m=max_reassign_m,
+            bbox_margin_m=bbox_margin_m, bbox=bbox, log=log)
 
-    # 2. 건물 → 질량
-    buildings, n_buildings = load_building_mass(bbox)
-    if not buildings:
-        raise RuntimeError(
-            "bbox 안에서 건물을 찾지 못했습니다. data/processed/buildings 전처리 여부와 "
-            "해당 시도 parquet 존재를 확인하세요."
-        )
-    log(f"건물 {n_buildings}동 / 연면적 {sum(b[2] for b in buildings) / 1e6:.2f} km²")
+    net_path = context.net_file
+    net = context.net
+    bbox = context.bbox
+    ref_lat = context.ref_lat
+    cell_size_m = context.cell_size_m
+    zones, n_buildings = context.zones, context.n_buildings
+    taz, zone_taz = context.taz, context.zone_taz
+    comp = context.stats["component"]
+    zstats, mstats = context.stats["zone"], context.stats["taz_mapping"]
+    # od 진단은 대부분 스케일 무관(비율·거리·개수)이지만 total_trips만 단위 스케일(1.0)이라
+    # 이번 통행량으로 되돌려 놓는다. 원본을 건드리면 안 된다 — 스레드 간 공유 객체다.
+    ostats = {**context.stats["od"], "total_trips": total_trips}
 
-    # 3. 격자 존
-    zones = build_zones(buildings, cell_size_m=cell_size_m, ref_lat=ref_lat)
-    zstats = zone_stats(zones)
-    log(f"존 {zstats['n_zones']}개 / 질량 max·중앙 {zstats['max_over_median']:.1f}배")
-
-    # 4. radiation OD
-    masses = [z.mass for z in zones]
-    coords = [(z.center_lat, z.center_lng) for z in zones]
-    flows = radiation_od_matrix(masses, coords, total_trips, lam=lam)
-    ostats = od_summary(flows, masses, coords)
-    log(f"OD 흐름 {ostats['n_flows']}개 / 통행거리 중앙 {ostats['trip_len_median_m']}m")
-
-    # 5. TAZ (최대 SCC만) + 존 재배정 + OD 파일(시간대별)
-    taz = build_taz(net, cell_size_m, ref_lat, largest_component_only=True)
-    zone_taz = map_zones_to_taz(zones, taz, cell_size_m=cell_size_m, max_reassign_m=max_reassign_m)
-    mstats = taz_mapping_summary(zones, zone_taz, cell_size_m=cell_size_m)
-    log(f"TAZ {len(taz)}개 / 자기셀 {mstats['zones_own_cell']} · 재배정 "
-        f"{mstats['zones_reassigned']} · 버림 {mstats['zones_dropped']}"
-        f"(질량 {mstats['mass_dropped_pct']}%)")
+    # 흐름은 **합이 1인 단위 스케일**로 저장돼 있다 — 이번 통행량으로 곱하기만 하면 된다.
+    # (radiation은 total_trips에 정확히 선형이다. radiation.py의 o_i 계산 참조.)
+    flows = [ODFlow(i=f.i, j=f.j, trips=f.trips * total_trips) for f in context.flows_unit]
 
     taz_file = out / f"{prefix}.taz.xml"
     write_taz_xml(taz, str(taz_file))

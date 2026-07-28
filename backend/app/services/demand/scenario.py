@@ -98,10 +98,14 @@ class TrafficScenario:
 
 
 def _cache_path(out_dir: Path, net_file: str, demand_scale: float,
-                window: tuple[float, float], step_min: float) -> Path:
+                window: tuple[float, float], step_min: float,
+                area_bbox: Optional[tuple[float, float, float, float]] = None) -> Path:
     from .calibration import _cache_key
+    # area_bbox가 키에 **반드시** 들어가야 한다 — 같은 net이라도 수요 범위가 다르면
+    # 완전히 다른 교통이다. 빠뜨리면 구역을 좁힌 뒤에도 예전(net 전체) 캐시가 적중한다.
     key = _cache_key(net_file, None, 0.0, {"scale": round(demand_scale, 4),
-                                           "window": list(window), "step": step_min})
+                                           "window": list(window), "step": step_min,
+                                           "bbox": [round(v, 6) for v in area_bbox] if area_bbox else None})
     return out_dir / f"scenario_{key}.json"
 
 
@@ -113,6 +117,7 @@ def build_traffic_scenario(
     window: tuple[float, float] = DEFAULT_WINDOW,
     step_min: float = DEFAULT_STEP_MIN,
     n_star: Optional[float] = None,
+    area_bbox: Optional[tuple[float, float, float, float]] = None,
     force: bool = False,
     log: Optional[Callable[[str], None]] = None,
 ) -> TrafficScenario:
@@ -122,6 +127,9 @@ def build_traffic_scenario(
     ----------
     demand_scale : 기준 교통량 대비 배율. UI의 % 노브 ÷ 100. 0.1~3.0으로 잘린다.
     n_star : 이미 아는 값이 있으면 넘긴다. None이면 `cached_nstar`로 산정(구역당 1회).
+    area_bbox : **사용자가 그린 구역** (minlng, minlat, maxlng, maxlat). 수요를 여기에만
+        깐다. None이면 net 전체 — net은 그린 구역보다 훨씬 넓으므로 비용이 몇 배로 뛴다
+        (근거는 `pipeline.generate_demand`의 bbox docstring).
 
     Returns
     -------
@@ -133,7 +141,7 @@ def build_traffic_scenario(
     scale = clamp_demand_scale(demand_scale)
     profile = build_time_profile(window[0], window[1], step_min)
 
-    cache_f = _cache_path(out, net_file, scale, window, step_min)
+    cache_f = _cache_path(out, net_file, scale, window, step_min, area_bbox)
     if cache_f.exists() and not force:
         try:
             data = json.loads(cache_f.read_text(encoding="utf-8"))
@@ -149,19 +157,28 @@ def build_traffic_scenario(
         except Exception as exc:
             log(f"교통 캐시 무시 (읽기 실패: {exc})")
 
-    # 1. N* — 구역당 1회, net 해시로 캐시
+    # 1. N* — 구역당 1회, net 해시 + 수요 범위로 캐시
+    cell_m = None
     if n_star is None:
-        ns = cached_nstar(net_file, str(out), profile, log=log)
+        ns = cached_nstar(net_file, str(out), profile, log=log,
+                          bbox=area_bbox, cache_extra={"bbox": [round(v, 6) for v in area_bbox]
+                                                       if area_bbox else None})
         n_star = ns.n_star
+        # ⚠️ 보정이 쓴 격자 셀 크기를 **그대로** 이어받는다. 다른 크기로 수요를 만들면
+        # 분포가 달라져 N*이 가리키던 운영점이 아니게 된다(calibration에서 실어 보낸다).
+        cell_m = (ns.stats or {}).get("cell_size_m")
         if not ns.converged:
             log("⚠️ N* 보정이 수렴하지 않았습니다 — 잠정값을 씁니다(§5-C).")
     total_trips = n_star * scale
-    log(f"N* {n_star:.0f} × {scale * 100:.0f}% = {total_trips:.0f}통행")
+    log(f"N* {n_star:.0f} × {scale * 100:.0f}% = {total_trips:.0f}통행"
+        + (f" (셀 {cell_m:.0f}m)" if cell_m else ""))
 
     # 2. 수요 생성
+    _gen_kw = {"cell_size_m": cell_m} if cell_m else {}
     d: DemandResult = generate_demand(
         net_file=net_file, out_dir=str(out), total_trips=total_trips,
-        time_profile=profile, prefix=f"scn{round(scale * 100)}", log=log)
+        time_profile=profile, prefix=f"scn{round(scale * 100)}", bbox=area_bbox,
+        log=log, **_gen_kw)
 
     # 3. 동적 SUMO — 정체 만들고 피크 스냅샷
     sim: SimResult = run_simulation(

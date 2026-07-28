@@ -1606,7 +1606,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     let alive = true;
     const tick = async () => {
       try {
-        const res = await fetch(`${api}/demand/status`);
+        const res = await fetch(`${api}/api/demand/status`);
         if (!res.ok) return;
         const body = await res.json();
         if (alive) setDemandStatus(body);
@@ -1654,6 +1654,20 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setAutoN({ bs: n, rsu: n });
     setSaN({ bs: n, rsu: n });
   }, [area, networkGen]);
+
+  // 재생 배속 — 백엔드 시뮬 스레드가 매 틱 읽으므로 실행 중에 바꿔도 즉시 반영된다.
+  // 상한은 SUMO 스텝 비용이라 8×를 눌러도 체감은 4~6× 근처에서 포화한다.
+  const [simSpeed, setSimSpeed] = useState(1);
+  async function changeSpeed(v) {
+    setSimSpeed(v);
+    try {
+      await fetch(`${api}/api/simulation/speed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speed: v }),
+      });
+    } catch (_) { /* 배속은 부가 기능 — 실패해도 시뮬 진행을 막지 않는다 */ }
+  }
 
   // SA 비교군
   const [saCompareRunning, setSaCompareRunning] = useState(false);
@@ -2321,7 +2335,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                   </span>
                   <span className="muted"> / 창(07:00~09:00)</span>
                 </div>
-                {demandScalePct === demandStatus.demand_scale_pct && (
+                {!demandStatus.calibrated && (
+                  <div className="muted" style={{ marginTop: 2 }}>
+                    기준값은 아직 <b>추정치</b>입니다 (오차 ±20%). 시뮬레이션을 처음 시작할 때 보정됩니다.
+                  </div>
+                )}
+                {demandStatus.calibrated && demandScalePct === demandStatus.demand_scale_pct && (
                   <div className="muted" style={{ marginTop: 2 }}>
                     실제 생성 {demandStatus.n_vehicles?.toLocaleString()}대
                     {demandStatus.vehicle_count_error_pct != null &&
@@ -2335,7 +2354,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                     <span className="num">{demandStatus.peak_running?.toLocaleString()}</span>대
                   </div>
                 )}
-                {demandScalePct !== demandStatus.demand_scale_pct && (
+                {demandStatus.calibrated && demandScalePct !== demandStatus.demand_scale_pct && (
                   <div className="muted" style={{ marginTop: 2 }}>
                     시뮬레이션을 시작하면 이 배율로 교통을 다시 만듭니다.
                   </div>
@@ -2749,6 +2768,13 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                     <Icon.pause size={15} /> 정지
                   </button>}
               <button className="btn icon" onClick={clearAll} title="시나리오 초기화"><Icon.reset size={15} /></button>
+            </div>
+            {/* 재생 배속 — 실행 중에도 바꿀 수 있어야 하므로 설정 잠금(isConfigLocked) 밖에 둔다 */}
+            <div className="row between" style={{ alignItems: 'center' }}>
+              <span className="muted" style={{ fontSize: 10.5 }}>배속</span>
+              <Seg value={simSpeed} onChange={changeSpeed}
+                options={[{ v: 1, label: '1×' }, { v: 2, label: '2×' },
+                          { v: 4, label: '4×' }, { v: 8, label: '8×' }]} />
             </div>
             {stationsErr && (
               <div style={{ padding: '8px 11px', background: 'var(--warn-tint)', border: '1px solid var(--warn-line)', borderRadius: 9, color: 'var(--warn)', fontSize: 11 }}>

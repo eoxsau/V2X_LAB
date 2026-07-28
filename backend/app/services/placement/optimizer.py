@@ -104,9 +104,12 @@ def optimize_placement_for_area(
 ) -> PlacementResult:
     """구역 하나에 대해 BS N_BS개 + RSU N_RSU개를 **함께** 최적화한다.
 
-    sa_iter : None이면 후보 수에 비례해 자동 결정한다.
-        ⚠️ 고정값을 쓰면 후보가 많을 때 탐색이 덜 되어 "후보를 늘렸는데 결과가 나빠지는"
-        비단조 현상이 나온다(K 실측에서 확인 — candidates.py 주석 참조).
+    sa_iter : None이면 **0**(= SA 건너뜀, greedy 해를 그대로 채택)이 기본이다.
+
+        예전엔 `max(800, 4×후보수)`로 자동 결정했는데, 2026-07-28 실측에서 그 SA가
+        개선 0.00%에 389초를 쓰는 것으로 확인됐다. greedy 해가 1-swap 국소최적이라
+        단일 swap 이동으로는 이길 수 없기 때문이다(sa_engine.optimize docstring 참조).
+        양수를 명시하면 예전처럼 SA가 돈다.
     """
     log = log or _log_noop
     bs = build_bs_candidates(buildings_gdf, tech, k) if n_bs > 0 else []
@@ -120,7 +123,8 @@ def optimize_placement_for_area(
     a_seg = build_a_seg_table(demand, list(bs) + list(rsu), buildings_gdf, tech,
                               cache_dir=cache_dir, log=log)
 
-    n_iter = sa_iter if sa_iter is not None else max(800, 4 * (len(bs) + len(rsu)))
+    # 기본 0 = SA 건너뜀. 근거는 sa_engine.optimize의 sa_iter docstring(1-swap 전수 탐색 실측).
+    n_iter = sa_iter if sa_iter is not None else 0
     res = optimize(bs, rsu, demand, n_bs, n_rsu, tech=tech, a_seg=a_seg,
                    n_greedy=n_greedy, n_random=n_random, sa_iter=n_iter, seed=seed)
     log(f"배치 완료 — 비용 {res.cost_initial_ms:.2f} → {res.cost_final_ms:.2f} ms "
