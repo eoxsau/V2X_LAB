@@ -855,6 +855,11 @@ def run_cmd(args: list, cwd=None, extra_env: dict | None = None) -> tuple[int, s
 #    걸려 있어야 한다(`OUT_OF_AREA_TRAVELTIME_S` 참조).
 DOWNLOAD_MARGIN_M = 1000.0
 
+# 통과 교통 기본 비율(%) — 구역 밖에서 들어와 밖으로 나가는 통행의 **대수 기준** 비중.
+# 0이면 종전과 완전히 같다(구역 내부 통행만). 30%는 "간선·고속도로가 지나는 도시 구역에서
+# 통과 교통이 3할쯤"이라는 보수적 출발점이고, policy_options.through_traffic_pct로 바꾼다.
+DEFAULT_THROUGH_PCT = 30.0
+
 
 def expand_bbox(bbox: BBox, margin_m: float = DOWNLOAD_MARGIN_M) -> BBox:
     """그린 구역을 사방으로 `margin_m` 만큼 넓힌다.
@@ -3231,8 +3236,11 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
     if not net_file or not Path(net_file).exists():
         return None
 
-    scale = clamp_demand_scale(
-        float((_state.get("policy_options") or {}).get("demand_scale_pct", 100.0)) / 100.0)
+    _pol = _state.get("policy_options") or {}
+    scale = clamp_demand_scale(float(_pol.get("demand_scale_pct", 100.0)) / 100.0)
+    # 통과 교통 비율 p — 구역 밖에서 들어와 밖으로 나가는 통행의 **대수 기준** 비중.
+    # 0이면 종전과 동일(구역 내부 통행만).
+    through = max(0.0, min(0.9, float(_pol.get("through_traffic_pct", DEFAULT_THROUGH_PCT)) / 100.0))
     cached = _state.get("traffic_scenario")
     # 경로는 반드시 resolve()로 정규화해 비교할 것 — 문자열 그대로 비교하면
     # 'networks/wired.net.xml' vs 'networks\\wired.net.xml'처럼 구분자만 달라도
@@ -3240,7 +3248,8 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
     def _hit(c) -> bool:
         return (not force and c is not None
                 and Path(c.net_file).resolve() == Path(net_file).resolve()
-                and abs(c.demand_scale - scale) < 1e-6)
+                and abs(c.demand_scale - scale) < 1e-6
+                and abs(getattr(c, "through_ratio", 0.0) - through) < 1e-6)
 
     if _hit(cached):
         return cached
@@ -3260,6 +3269,7 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
                 out_dir=str(WORK_DIR / "_demand"),
                 demand_scale=scale,
                 area_bbox=_demand_bbox(),
+                through_ratio=through,
                 force=force,
                 log=_traffic_log,
             )

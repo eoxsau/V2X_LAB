@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
@@ -31,10 +32,12 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from .assignment import (
+    boundary_taz,
     build_taz,
     component_summary,
     excluded_major_roads,
     map_zones_to_taz,
+    routable_edges,
     net_bbox,
     read_net,
     taz_mapping_summary,
@@ -260,6 +263,102 @@ def _is_ascii(p: Path) -> bool:
     return str(p).isascii()
 
 
+def _mean_ff_time_s(net, pairs: Sequence[tuple[str, str]], vclass: str = "passenger") -> float:
+    """엣지 쌍 표본의 **자유류 통행시간 평균(초)**. sumolib 최단경로라 외부 프로세스가 없다.
+
+    통과 통행의 체류시간 T_통과를 통행을 만들기 **전에** 알아야 대수 기준 분할이 성립한다
+    (닭-달걀을 피하려고 duarouter를 두 번 돌리는 대신 여기서 해석적으로 잰다).
+
+    ⚠️ `getShortestPath`가 돌려주는 cost는 **초가 아니라 미터**다(실측: 2.4km 경로에 3072).
+       그걸 시간으로 쓰면 고속도로처럼 빠른 길이 든 통과 경로의 체류시간을 과대평가해
+       통과 통행 수가 적게 잡힌다. 그래서 경로 엣지에서 길이/제한속도로 직접 잰다.
+    """
+    costs: list[float] = []
+    for a, b in pairs:
+        if a == b:
+            continue
+        try:
+            path, _dist = net.getShortestPath(net.getEdge(a), net.getEdge(b), vClass=vclass)
+        except Exception:
+            continue
+        if not path:
+            continue
+        t = 0.0
+        for e in path:
+            try:
+                t += e.getLength() / max(e.getSpeed(), 0.1)
+            except Exception:
+                pass
+        if 0.0 < t < 1e5:
+            costs.append(t)
+    return sum(costs) / len(costs) if costs else 0.0
+
+
+def _sample_internal_pairs(taz: dict, zone_taz: dict, flows, n: int,
+                           seed: int = 11) -> list[tuple[str, str]]:
+    """T_내부 표본 — **실제 OD 흐름을 통행수 가중**으로 뽑는다.
+
+    TAZ를 균일하게 뽑으면 안 된다. radiation OD는 가까운 존끼리의 통행이 압도적으로 많아
+    실제 평균 통행시간이 훨씬 짧다 — 균일 추출은 이를 과대평가하고, 그러면 T_내부/T_통과
+    비가 커져 통과 통행이 과다 생성된다(실측: 균일 167.5s vs 실제 145.0s, +15%).
+    od2trips가 하는 것과 같은 방식(존쌍은 통행수 가중, 존 안 엣지는 무작위)으로 맞춘다.
+    """
+    rng = random.Random(seed)
+    cand = []
+    for f in flows:
+        o, d = zone_taz.get(f.i), zone_taz.get(f.j)
+        if o and d and o != d and taz.get(o) and taz.get(d) and f.trips > 0:
+            cand.append((f.trips, o, d))
+    if not cand:
+        return []
+    picks = rng.choices(range(len(cand)), weights=[c[0] for c in cand], k=n)
+    return [(rng.choice(taz[cand[k][1]])[0], rng.choice(taz[cand[k][2]])[0]) for k in picks]
+
+
+def _sample_through_pairs(entry_taz: dict, exit_taz: dict, n: int, seed: int = 12
+                          ) -> list[tuple[str, str]]:
+    """진입 → 진출 쌍. **서로 다른 방위**만 — 같은 쪽이면 구역을 가로지르지 않는다."""
+    rng = random.Random(seed)
+    pairs = [(i, o) for i in entry_taz for o in exit_taz if i[-1] != o[-1]]
+    if not pairs:
+        return []
+    out = []
+    for _ in range(n):
+        i, o = rng.choice(pairs)
+        out.append((rng.choice(entry_taz[i])[0], rng.choice(exit_taz[o])[0]))
+    return out
+
+
+def _append_through_flows(flows: list, zone_taz: dict, entry_taz: dict, exit_taz: dict,
+                          trips_through: float) -> tuple[int, dict]:
+    """통과 통행을 방위쌍마다 용량 가중으로 깔아 `flows`·`zone_taz`에 덧붙인다.
+
+    존 인덱스는 실제 격자 존과 겹치지 않도록 **음수**를 쓴다.
+    Returns: (추가한 OD 라인 수, 갱신된 zone_taz)
+    """
+    pairs = [(i, o) for i in entry_taz for o in exit_taz if i[-1] != o[-1]]
+    if not pairs or trips_through <= 0:
+        return 0, zone_taz
+    cap = {t: sum(w for _, w in edges) for t, edges in {**entry_taz, **exit_taz}.items()}
+    weights = [cap.get(i, 0.0) * cap.get(o, 0.0) for i, o in pairs]
+    tot_w = sum(weights) or 1.0
+
+    zone_taz = dict(zone_taz)
+    zid: dict[str, int] = {}
+    nxt = -1
+    for t in list(entry_taz) + list(exit_taz):
+        zid[t] = nxt
+        zone_taz[nxt] = t
+        nxt -= 1
+
+    for (i, o), w in zip(pairs, weights):
+        share = w / tot_w
+        if share <= 0:
+            continue
+        flows.append(ODFlow(i=zid[i], j=zid[o], trips=trips_through * share))
+    return len(pairs), zone_taz
+
+
 def ascii_temp_base() -> Path:
     """ASCII 전용 임시 디렉터리 루트.
 
@@ -391,6 +490,7 @@ def generate_demand(
     time_profile: Optional[Sequence[tuple[float, float, float]]] = None,
     context: Optional["DemandContext"] = None,
     prefix: str = "demand",
+    through_ratio: float = 0.0,
     log: Optional[Callable[[str], None]] = None,
 ) -> DemandResult:
     """net.xml 하나로 SUMO에 바로 넣을 수 있는 경로파일까지 만든다.
@@ -457,6 +557,58 @@ def generate_demand(
     # 흐름은 **합이 1인 단위 스케일**로 저장돼 있다 — 이번 통행량으로 곱하기만 하면 된다.
     # (radiation은 total_trips에 정확히 선형이다. radiation.py의 o_i 계산 참조.)
     flows = [ODFlow(i=f.i, j=f.j, trips=f.trips * total_trips) for f in context.flows_unit]
+
+    # ── 통과 교통 — 구역 밖에서 들어와 구역 밖으로 나가는 통행 ──────────────
+    # 없으면 구역을 스쳐 지나가는 차가 0이 되고, 고속도로처럼 통과가 대부분인 축은
+    # 교통량이 0으로 나온다(2026-07-29: 그래서 기지국 배치까지 그 지역이 비었다).
+    #
+    # **구역 안 대수를 유지**하도록 나눈다. 통행 수를 1:1로 바꾸면 안 된다 —
+    # Little의 법칙(대수 = 통행률 × 체류시간)에서 통과 통행은 구역을 가로지르므로
+    # 체류시간이 길고, 같은 통행 수라도 구역 안 대수가 늘어난다.
+    #
+    #     N_target       = n_star × r_peak × T_내부        (기존 N* 정의를 뒤집은 것)
+    #     trips_내부     = (1-p) × total_trips
+    #     trips_통과     = p × total_trips × (T_내부 / T_통과)
+    #
+    # 유입=유출은 통과 통행 하나가 진입 1 · 진출 1을 가지므로 **구조적으로 성립**한다.
+    through_stats: dict = {}
+    if through_ratio > 0.0 and bbox is not None:
+        entry_taz, exit_taz = boundary_taz(net, bbox, usable=routable_edges(net))
+        n_in = sum(len(v) for v in entry_taz.values())
+        n_out = sum(len(v) for v in exit_taz.values())
+        if n_in and n_out:
+            taz_edge_pool = taz                      # 경계 존을 섞기 전의 내부 TAZ
+            taz = {**taz, **entry_taz, **exit_taz}
+            t_int = _mean_ff_time_s(
+                net, _sample_internal_pairs(taz_edge_pool, zone_taz, flows, 60))
+            t_thr = _mean_ff_time_s(net, _sample_through_pairs(entry_taz, exit_taz, 60))
+            if t_int > 0 and t_thr > 0:
+                trips_internal = (1.0 - through_ratio) * total_trips
+                trips_through = through_ratio * total_trips * (t_int / t_thr)
+                # 내부 흐름을 (1-p)로 줄이고, 통과 흐름을 방위쌍마다 용량 가중으로 깐다.
+                flows = [ODFlow(i=f.i, j=f.j, trips=f.trips * (1.0 - through_ratio))
+                         for f in flows]
+                extra, zone_taz = _append_through_flows(
+                    flows, zone_taz, entry_taz, exit_taz, trips_through)
+                through_stats = {
+                    "through_ratio": through_ratio,
+                    "t_internal_s": round(t_int, 1),
+                    "t_through_s": round(t_thr, 1),
+                    "trips_internal": round(trips_internal, 1),
+                    "trips_through": round(trips_through, 1),
+                    "n_entry_edges": n_in, "n_exit_edges": n_out,
+                    "n_through_od_lines": extra,
+                }
+                total_trips = trips_internal + trips_through
+                log(f"통과 교통: 진입 {n_in}엣지 / 진출 {n_out}엣지, "
+                    f"T_내부 {t_int:.0f}s vs T_통과 {t_thr:.0f}s → "
+                    f"내부 {trips_internal:.0f} + 통과 {trips_through:.0f}통행 "
+                    f"(구역 내 대수는 유지)")
+            else:
+                log("⚠️ 통과 경로 표본에서 통행시간을 못 재 통과 교통을 건너뜁니다")
+        else:
+            log(f"⚠️ 경계를 넘는 도로가 없어 통과 교통을 건너뜁니다 "
+                f"(진입 {n_in} / 진출 {n_out})")
 
     taz_file = out / f"{prefix}.taz.xml"
     write_taz_xml(taz, str(taz_file))
@@ -534,6 +686,7 @@ def generate_demand(
             # 자유류(= 다른 차가 없다고 가정) 평균. N* 해석적 시드의 재료(§5-C).
             "freeflow_travel_s": round(ff_cost_s, 2),
             "freeflow_route_m": round(ff_len_m, 1),
+            "through": through_stats,
         },
     )
     if result.routing_rate < 0.9:

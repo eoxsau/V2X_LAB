@@ -74,6 +74,8 @@ class TrafficScenario:
     # 시나리오를 조사하려 했는데 bbox가 어디에도 없어서 재현을 못 했다(같은 net·같은 N*로
     # 다시 돌리면 98.3%가 나와, 무엇이 달랐는지 끝내 특정하지 못했다).
     area_bbox: Optional[tuple] = None
+    # 통과 교통 비율 p (대수 기준). 0이면 구역 내부 통행만.
+    through_ratio: float = 0.0
     demand_points: list = field(default_factory=list)   # sa_placement.DemandPoint
     # 피크 구간 엣지별 교통량 원본 — 배치 수요(demand_points)와 배경 차량 양쪽의 재료.
     # {edge_id, lat, lng, vehicle_count, mean_speed_kph} 형태로 직렬화해 캐시한다.
@@ -104,12 +106,15 @@ class TrafficScenario:
 
 def _cache_path(out_dir: Path, net_file: str, demand_scale: float,
                 window: tuple[float, float], step_min: float,
-                area_bbox: Optional[tuple[float, float, float, float]] = None) -> Path:
+                area_bbox: Optional[tuple[float, float, float, float]] = None,
+                through_ratio: float = 0.0) -> Path:
     from .calibration import _cache_key
     # area_bbox가 키에 **반드시** 들어가야 한다 — 같은 net이라도 수요 범위가 다르면
     # 완전히 다른 교통이다. 빠뜨리면 구역을 좁힌 뒤에도 예전(net 전체) 캐시가 적중한다.
+    # through_ratio도 같은 이유로 키다 — p를 바꾸면 통행 구성 자체가 달라진다.
     key = _cache_key(net_file, None, 0.0, {"scale": round(demand_scale, 4),
                                            "window": list(window), "step": step_min,
+                                           "through": round(through_ratio, 4),
                                            "bbox": [round(v, 6) for v in area_bbox] if area_bbox else None})
     return out_dir / f"scenario_{key}.json"
 
@@ -123,6 +128,7 @@ def build_traffic_scenario(
     step_min: float = DEFAULT_STEP_MIN,
     n_star: Optional[float] = None,
     area_bbox: Optional[tuple[float, float, float, float]] = None,
+    through_ratio: float = 0.0,
     force: bool = False,
     log: Optional[Callable[[str], None]] = None,
 ) -> TrafficScenario:
@@ -146,7 +152,7 @@ def build_traffic_scenario(
     scale = clamp_demand_scale(demand_scale)
     profile = build_time_profile(window[0], window[1], step_min)
 
-    cache_f = _cache_path(out, net_file, scale, window, step_min, area_bbox)
+    cache_f = _cache_path(out, net_file, scale, window, step_min, area_bbox, through_ratio)
     if cache_f.exists() and not force:
         try:
             data = json.loads(cache_f.read_text(encoding="utf-8"))
@@ -183,7 +189,7 @@ def build_traffic_scenario(
     d: DemandResult = generate_demand(
         net_file=net_file, out_dir=str(out), total_trips=total_trips,
         time_profile=profile, prefix=f"scn{round(scale * 100)}", bbox=area_bbox,
-        log=log, **_gen_kw)
+        through_ratio=through_ratio, log=log, **_gen_kw)
 
     # 3. 동적 SUMO — 정체 만들고 피크 스냅샷
     sim: SimResult = run_simulation(
@@ -218,6 +224,7 @@ def build_traffic_scenario(
         peak_time_s=sim.peak_time_s,
         n_vehicles=d.n_vehicles,
         area_bbox=tuple(area_bbox) if area_bbox else None,
+        through_ratio=float(through_ratio),
         demand_points=points,
         peak_edge_loads=[
             {"edge_id": ld.edge_id, "lat": ld.lat, "lng": ld.lng,

@@ -235,6 +235,68 @@ def routable_edges(net_or_file, vclass: str = "passenger") -> set[str]:
     return _reachable(main, fwd) & _reachable(main, bwd)
 
 
+def boundary_taz(
+    net_or_file,
+    bbox: tuple[float, float, float, float],
+    vclass: str = "passenger",
+    usable: Optional[set] = None,
+) -> tuple[dict, dict]:
+    """구역 경계를 넘나드는 엣지 → 통과 교통용 진입·진출 TAZ.
+
+    `(entry_taz, exit_taz)`를 돌려준다. 각각 `{"ext_in_N": [(edge_id, weight), ...], ...}`
+    형태로 방위(N/S/E/W)별로 나뉜다.
+
+    **방위를 나누는 이유**: 하나로 뭉치면 od2trips가 같은 쪽으로 들어와 같은 쪽으로 나가는
+    통행을 만든다. 구역을 가로지르지 않으니 통과 교통이 아니다. 호출 측에서 서로 다른
+    방위끼리만 OD를 만들면 반드시 구역을 지나간다.
+
+    **가중치는 용량(차로수 × 제한속도)**이다. 길이 가중을 쓰면 고속도로 한 조각이 골목과
+    같은 취급을 받는다 — 실제로 경계를 넘는 교통량은 그 도로가 얼마나 굵으냐로 갈린다.
+
+    진입/진출 판정은 엣지 **양 끝 노드**가 구역 안인지로 한다:
+        바깥 → 안 = 진입(여기서 출발하면 밖에서 들어오는 차가 된다)
+        안 → 바깥 = 진출(여기서 도착하면 밖으로 나가는 차가 된다)
+    """
+    net = _as_net(net_or_file)
+    minlng, minlat, maxlng, maxlat = bbox
+    entry: dict[str, list] = {}
+    exit_: dict[str, list] = {}
+
+    def _inside(lng: float, lat: float) -> bool:
+        return minlng <= lng <= maxlng and minlat <= lat <= maxlat
+
+    def _side(lng: float, lat: float) -> str:
+        """바깥 점이 어느 변을 넘었나 — 가장 많이 벗어난 축으로 정한다."""
+        d = {"W": minlng - lng, "E": lng - maxlng, "S": minlat - lat, "N": lat - maxlat}
+        return max(d, key=d.get)
+
+    for e in net.getEdges():
+        eid = e.getID()
+        if usable is not None and eid not in usable:
+            continue
+        try:
+            if not e.allows(vclass):
+                continue
+            fx, fy = e.getFromNode().getCoord()
+            tx, ty = e.getToNode().getCoord()
+            flng, flat = net.convertXY2LonLat(fx, fy)
+            tlng, tlat = net.convertXY2LonLat(tx, ty)
+        except Exception:
+            continue
+        f_in, t_in = _inside(flng, flat), _inside(tlng, tlat)
+        if f_in == t_in:
+            continue                      # 완전히 안이거나 완전히 밖 — 경계 엣지가 아니다
+        try:
+            w = max(e.getLaneNumber(), 1) * max(e.getSpeed(), 1.0)
+        except Exception:
+            w = 1.0
+        if t_in:                          # 바깥 → 안
+            entry.setdefault(f"ext_in_{_side(flng, flat)}", []).append((eid, w))
+        else:                             # 안 → 바깥
+            exit_.setdefault(f"ext_out_{_side(tlng, tlat)}", []).append((eid, w))
+    return entry, exit_
+
+
 def excluded_major_roads(net_or_file, vclass: str = "passenger") -> dict:
     """통행에 못 쓰이는 **주요 도로**를 종류별로 집계 — "여긴 왜 차가 없지?"의 답.
 
