@@ -239,7 +239,6 @@ def boundary_taz(
     net_or_file,
     bbox: tuple[float, float, float, float],
     vclass: str = "passenger",
-    usable: Optional[set] = None,
 ) -> tuple[dict, dict]:
     """구역 경계를 넘나드는 엣지 → 통과 교통용 진입·진출 TAZ.
 
@@ -265,34 +264,63 @@ def boundary_taz(
     def _inside(lng: float, lat: float) -> bool:
         return minlng <= lng <= maxlng and minlat <= lat <= maxlat
 
+    cx, cy = (minlng + maxlng) / 2.0, (minlat + maxlat) / 2.0
+    span_x = max(maxlng - minlng, 1e-9)
+    span_y = max(maxlat - minlat, 1e-9)
+
     def _side(lng: float, lat: float) -> str:
-        """바깥 점이 어느 변을 넘었나 — 가장 많이 벗어난 축으로 정한다."""
-        d = {"W": minlng - lng, "E": lng - maxlng, "S": minlat - lat, "N": lat - maxlat}
-        return max(d, key=d.get)
+        """이 점이 구역의 어느 쪽인가 — N/S/E/W.
+
+        바깥 점은 '어느 변을 넘었나', 안쪽 점(망 자체의 끝)은 '중심에서 어느 방향인가'로
+        정한다. 망 끝도 정상 방위를 받아야 호출 측의 "서로 다른 방위끼리만 짝짓기" 규칙이
+        그대로 적용된다 — 별도 라벨을 주면 그 규칙에 걸려 짝이 아예 안 생긴다.
+        """
+        if not _inside(lng, lat):
+            d = {"W": minlng - lng, "E": lng - maxlng, "S": minlat - lat, "N": lat - maxlat}
+            return max(d, key=d.get)
+        return (("E" if lng > cx else "W")
+                if abs(lng - cx) / span_x > abs(lat - cy) / span_y
+                else ("N" if lat > cy else "S"))
+
+    # 문이 되려면 본토와 이어져야 한다. 단, `routable_edges`(본토→e→본토)보다 **약한**
+    # 조건이면 충분하다 — 출발지는 본토로 갈 수만 있으면 되고, 도착지는 본토에서 올 수만
+    # 있으면 된다. 고속도로 끝처럼 왕복이 안 되는 엣지가 여기서 살아난다.
+    comps = _scc_components(net, vclass)
+    main = set(comps[0]) if comps else set()
+    fwd, bwd = _routing_graph(net, vclass)
+    from_main = _reachable(main, fwd)      # 본토에서 갈 수 있는 엣지 = 도착지로 쓸 수 있다
+    to_main = _reachable(main, bwd)        # 본토로 갈 수 있는 엣지 = 출발지로 쓸 수 있다
 
     for e in net.getEdges():
         eid = e.getID()
-        if usable is not None and eid not in usable:
+        if eid not in fwd:                 # vclass 통행 불가
             continue
         try:
-            if not e.allows(vclass):
-                continue
             fx, fy = e.getFromNode().getCoord()
             tx, ty = e.getToNode().getCoord()
             flng, flat = net.convertXY2LonLat(fx, fy)
             tlng, tlat = net.convertXY2LonLat(tx, ty)
+            w = max(e.getLaneNumber(), 1) * max(e.getSpeed(), 1.0)
         except Exception:
             continue
         f_in, t_in = _inside(flng, flat), _inside(tlng, tlat)
-        if f_in == t_in:
-            continue                      # 완전히 안이거나 완전히 밖 — 경계 엣지가 아니다
-        try:
-            w = max(e.getLaneNumber(), 1) * max(e.getSpeed(), 1.0)
-        except Exception:
-            w = 1.0
-        if t_in:                          # 바깥 → 안
+
+        # (a) 구역 경계를 가로지르는 엣지
+        if f_in != t_in:
+            if t_in and eid in to_main:                     # 바깥 → 안
+                entry.setdefault(f"ext_in_{_side(flng, flat)}", []).append((eid, w))
+            elif (not t_in) and eid in from_main:            # 안 → 바깥
+                exit_.setdefault(f"ext_out_{_side(tlng, tlat)}", []).append((eid, w))
+            continue
+
+        # (b) **망 자체의 끝** — 데이터가 여기서 끝나 더 갈 데가 없는 엣지.
+        # 고속도로가 대표적이다: 나들목 간격이 km 단위라 어떤 창을 잡아도 중간이 잘리고,
+        # 잘린 끝은 (a)의 "경계를 가로지름"에 걸리지 않는다(양 끝이 모두 구역 안일 수도 있다).
+        # SUMO는 경로 끝에 도달한 차를 제거하므로 out=0은 그대로 **나가는 문**이고,
+        # 아무도 이어주지 않는 in=0은 그대로 **들어오는 문**이다. 새로 만들 게 없다.
+        if not bwd.get(eid) and eid in to_main:
             entry.setdefault(f"ext_in_{_side(flng, flat)}", []).append((eid, w))
-        else:                             # 안 → 바깥
+        elif not fwd.get(eid) and eid in from_main:
             exit_.setdefault(f"ext_out_{_side(tlng, tlat)}", []).append((eid, w))
     return entry, exit_
 

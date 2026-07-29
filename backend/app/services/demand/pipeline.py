@@ -573,7 +573,7 @@ def generate_demand(
     # 유입=유출은 통과 통행 하나가 진입 1 · 진출 1을 가지므로 **구조적으로 성립**한다.
     through_stats: dict = {}
     if through_ratio > 0.0 and bbox is not None:
-        entry_taz, exit_taz = boundary_taz(net, bbox, usable=routable_edges(net))
+        entry_taz, exit_taz = boundary_taz(net, bbox)
         n_in = sum(len(v) for v in entry_taz.values())
         n_out = sum(len(v) for v in exit_taz.values())
         if n_in and n_out:
