@@ -44,6 +44,15 @@ function App() {
   const [networkTelemetry, setNetworkTelemetry] = useState(null);
   const [routeEdges, setRouteEdges] = useState(null);
   const [backgroundVehicles, setBackgroundVehicles] = useState([]); // 다중차량 실험군 — 배경 차량 [{id,lat,lng}]
+  /* 교통 준비(N* 보정 등) 진행 상태 — null이면 준비 중 아님.
+     시작을 눌렀을 때 교통이 아직 없으면 백엔드가 기다리지 않고 "preparing"으로 돌려주고,
+     준비가 끝나면 스스로 시뮬을 시작한다. 그 사이 화면에 진행 상황을 보여주는 용도. */
+  const [trafficPrep, setTrafficPrep] = useState(null);
+  /* 준비 후 자동 시작된 런의 DB id — 시작 응답이 "preparing"이라 그때는 받을 수 없었다. */
+  const [autoStartRunId, setAutoStartRunId] = useState(null);
+  /* 사용자가 누른 시작이 준비를 기다리는 중인지. 구역 설정 직후의 백그라운드 준비도
+     preparing=true지만 그건 아무도 기다리지 않으므로, 끝났다고 실행 상태로 바꾸면 안 된다. */
+  const awaitingAutoStart = useRef(false);
   const wsRef = useRef(null);
 
   // 시뮬레이션 시트 — App으로 끌어올림(tab-simulation.jsx에 있던 걸 옮김). 시뮬레이션 탭뿐 아니라
@@ -119,6 +128,8 @@ function App() {
         setNetworkTelemetry(null);
         setRouteEdges(null);
         setBackgroundVehicles([]);
+        setTrafficPrep(null);
+        awaitingAutoStart.current = false;
         setSimHistory([]);
         setSimLogs([]);
         prevBsRef.current = null;
@@ -189,6 +200,25 @@ function App() {
           }]);
         } else if (msg.type === 'background_positions') {
           setBackgroundVehicles(msg.vehicles || []);
+        } else if (msg.type === 'traffic_prep') {
+          // 교통 준비 진행 상황. preparing이 내려가는 순간, 우리가 누른 시작이 대기 중이었다면
+          // 백엔드가 방금 시뮬을 자동으로 띄운 것이므로 여기서 실행 상태로 전환한다.
+          if (msg.preparing) {
+            setTrafficPrep({ stage: msg.stage, message: msg.message });
+            // 래치가 아니라 **매번 갱신**이다. 준비 중에 초기화로 취소하면 백엔드가
+            // pending_start를 풀고 그 사실이 여기로 오는데, 래치로 두면 뒤이어 배경 준비가
+            // 끝나는 순간 누르지도 않은 런이 "실행 중"으로 바뀐다.
+            awaitingAutoStart.current = !!msg.pending_start;
+          } else {
+            setTrafficPrep(null);
+            if (awaitingAutoStart.current) {
+              awaitingAutoStart.current = false;
+              // 자동 시작된 런의 DB id — 시작 응답이 "preparing"이라 run_id가 없었으므로
+              // 여기서 받아 시뮬레이션 탭의 currentRunIdRef에 넣어준다(도착 결과 저장용).
+              setAutoStartRunId(msg.run_id ?? null);
+              dispatch({ type: 'start' });
+            }
+          }
         }
       };
     }
@@ -322,6 +352,8 @@ function App() {
             setVehiclePos={setVehiclePos}
             simNotice={simNotice}
             setSimNotice={setSimNotice}
+            trafficPrep={trafficPrep}
+            autoStartRunId={autoStartRunId}
             networkTelemetry={networkTelemetry}
             setNetworkTelemetry={setNetworkTelemetry}
             simConfig={simConfig}

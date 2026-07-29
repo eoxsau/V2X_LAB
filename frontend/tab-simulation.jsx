@@ -629,7 +629,7 @@ function SheetGridView({ sheets, activeSheetIdx, onSelectSheet,
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, setSimLogs, simHistory, setSimHistory, routeEdges, setRouteEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, trafficPrep, autoStartRunId, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, setSimLogs, simHistory, setSimHistory, routeEdges, setRouteEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
@@ -701,6 +701,12 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [batchError, setBatchError] = useState(null);
   const prevArrived = useRef(false);
   const currentRunIdRef = useRef(null); // /api/simulation/start가 돌려준 DB simulation_runs.id — 도착 시 시트 데이터를 같은 행에 영구 저장하는 데 씀
+
+  // 교통 준비 후 **자동 시작**된 런은 시작 응답이 "preparing"이라 run_id가 없었다.
+  // WS traffic_prep이 뒤늦게 알려주므로 여기서 위 ref에 채워 넣는다.
+  useEffect(() => {
+    if (autoStartRunId != null) currentRunIdRef.current = autoStartRunId;
+  }, [autoStartRunId]);
 
   // 캡처된 결과가 있으면(이미 실행 완료된 시트) 그 로그를, 없으면(현재 진행 중인 시트) 실시간
   // simLogs를 보여준다 — 둘 다 같은 시트 안에서만 머무르고 분석보고서 탭으로는 넘어가지 않는다.
@@ -1682,14 +1688,15 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const { s, w, n, e } = area;
     const latSpan = n - s, lngSpan = e - w;
     const pt = (fLat, fLng) => ({ lat: s + latSpan * fLat, lng: w + lngSpan * fLng });
+    // ⚠️ 예전엔 여기서 setVehicleCount()도 불렀는데, 차량 수 UI가 제거되면서
+    // 그 setter가 사라졌다. 남아 있던 호출이 ReferenceError를 던져 이 함수가
+    // 중간에 죽고 있었다(2026-07-29). 배경 차량 수는 이제 교통량 배율이 정한다.
     if (kind === 'short') {
       setOrigin(pt(0.35, 0.35)); setOriginDone(true);
       setDest(pt(0.55, 0.55)); setDestDone(true);
-      setVehicleCount(1);
     } else if (kind === 'congested') {
       setOrigin(pt(0.15, 0.15)); setOriginDone(true);
       setDest(pt(0.85, 0.85)); setDestDone(true);
-      setVehicleCount(40);
     }
   }
 
@@ -1743,6 +1750,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       }
       currentRunIdRef.current = body.run_id ?? null;
       if (body.warning) setSimNotice(body.warning);
+      // 교통(N* 보정 등)이 아직 없으면 백엔드가 기다리지 않고 "preparing"으로 돌려준다.
+      // 준비가 끝나면 백엔드가 알아서 시작하고, WS traffic_prep(preparing=false)을 받은
+      // app.jsx가 그때 실행 상태로 전환한다 — 여기서 미리 start를 걸면 아직 달리지도
+      // 않은 런이 "실행 중"으로 보인다.
+      if (body.status === 'preparing') return;
       dispatch({ type: 'start' });
     } catch (e) {
       setSimError(e.message);
@@ -1755,6 +1767,43 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (vehiclePos) captureResultIntoActiveSheet(); // 도착 전 정지해도 그 시점 결과를 시트에 남김
   }
 
+  /* 재생 버튼 옆 초기화 — **실행 결과만** 지운다.
+     구역·출발지·도착지·기지국·생성 교통은 그대로 둬서 곧바로 다시 재생할 수 있어야 한다.
+     ⚠️ 예전에는 scope 없이 /api/simulation/reset을 불러 기본값 full로 갔고, 백엔드의
+     구역·도로망·생성 교통까지 날아갔다. 그러면 ready(= area && originDone && destDone)가
+     false가 되어 **재생 버튼이 영구히 비활성**이 됐다(2026-07-29 사용자 보고 1·2번).
+     구역까지 비우려면 탭 맨 아래 "전체 초기화"(clearAll)를 쓴다. */
+  async function clearRun() {
+    try {
+      await fetch(`${api}/api/simulation/reset?scope=runtime`, { method: 'POST' });
+    } catch (_) {}
+    setSimError(null);
+    setSimNotice(null);
+    setNetworkTelemetry(null);
+    setRouteCoords([]); setVehiclePos(null);
+    if (setSimLogs) setSimLogs([]);
+    if (setSimHistory) setSimHistory([]);
+    if (setRouteEdges) setRouteEdges(null);
+    if (setBackgroundVehicles) setBackgroundVehicles([]);
+    prevArrived.current = false;
+    currentRunIdRef.current = null;
+    // 시트는 실행 결과만 비운다 — config(출발지·도착지·알고리즘 선택)는 유지해야
+    // 같은 조건으로 바로 다시 돌릴 수 있다.
+    setSheets(prev => {
+      const next = prev.map((s, i) => i === activeSheetIdx ? { ...s, result: null, status: 'draft' } : s);
+      saveSimSheets(next);
+      return next;
+    });
+    // 실행 산출물 레이어만 정리 — 구역 사각형·기지국·출발/도착 마커는 건드리지 않는다.
+    if (groups.current.veh)       { groups.current.veh.remove(); groups.current.veh = null; }
+    if (groups.current.route)     { groups.current.route.clearLayers(); }
+    if (groups.current.connLines) { groups.current.connLines.clearLayers(); }
+    if (groups.current.bgVeh)     { groups.current.bgVeh.clearLayers(); }
+    bgVehMarkers.current = {};
+    dispatch({ type: 'reset' });
+  }
+
+  /* 전체 초기화 — 구역·출발지·도착지까지 전부 비운다. 탭 맨 아래에만 둔다. */
   async function clearAll() {
     try {
       await fetch(`${api}/api/simulation/reset`, { method: 'POST' });
@@ -1768,7 +1817,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSimNotice(null);
     setNetworkTelemetry(null);
     setRouteCoords([]); setVehiclePos(null);
-    setVehicleCount(1);
+    // ⚠️ 여기 있던 setVehicleCount(1)이 **정의되지 않은 setter**라 ReferenceError를 던졌고,
+    // 이 함수가 그 줄에서 죽어 아래의 시트 초기화·지도 레이어 정리가 통째로 실행되지
+    // 않았다. 그래서 "초기화를 해도 구역 사각형과 출발/도착 핀이 지도에 남는" 증상이
+    // 났다(2026-07-29 실측: 앞쪽 상태만 지워지고 areaRect.remove()는 호출 0회).
+    // 차량 수 UI가 제거될 때 같이 지워졌어야 할 줄이다.
     prevArrived.current = false;
     if (setBackgroundVehicles) setBackgroundVehicles([]);
     // 현재 시트도 빈 draft 상태로 되돌린다 — 안 그러면 화면은 지워져도 시트에 저장된 이전
@@ -2761,14 +2814,25 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           <div className="col gap8" style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
             <div className="row gap8">
               {!sim.running
-                ? <button className="btn good block" disabled={!ready || osmStage > 0} onClick={handleStart}>
-                    <Icon.play size={15} /> {sim.elapsed > 0 ? '재개' : '시작'}
+                ? <button className="btn good block" disabled={!ready || osmStage > 0 || !!trafficPrep} onClick={handleStart}>
+                    <Icon.play size={15} /> {trafficPrep ? '준비 중…' : (sim.elapsed > 0 ? '재개' : '시작')}
                   </button>
                 : <button className="btn block" style={{ borderColor: 'var(--warn-line)', color: 'var(--warn)' }} onClick={handleStop}>
                     <Icon.pause size={15} /> 정지
                   </button>}
-              <button className="btn icon" onClick={clearAll} title="시나리오 초기화"><Icon.reset size={15} /></button>
+              <button className="btn icon" onClick={clearRun} title="시뮬레이션 초기화 — 실행 결과만 지웁니다 (구역·출발지·도착지는 유지)"><Icon.reset size={15} /></button>
             </div>
+            {/* 교통 준비 안내 — 새 구역은 N* 보정에 수 분이 걸린다. 예전엔 시작을 눌러도
+                아무 표시 없이 응답이 멈춰 있어서, 사용자가 멈춘 줄 알고 시작을 여러 번
+                눌렀다(그러면 서로의 TraCI 연결을 끊어 런이 전멸했다). 이제 진행 상황을
+                보여주고 버튼을 잠그며, 준비가 끝나면 자동으로 시작된다. */}
+            {trafficPrep && (
+              <div style={{ padding: '9px 12px', background: 'var(--surface-2)', border: '1px solid var(--border)',
+                borderRadius: 9, fontSize: 10.5, lineHeight: 1.5 }}>
+                <div style={{ fontWeight: 600, marginBottom: 3 }}>교통량 계산 중…</div>
+                <div className="muted">{trafficPrep.message || '새 구역의 기준 교통량(N*)을 구하는 중입니다. 몇 분 걸릴 수 있고, 끝나면 시뮬레이션이 자동으로 시작됩니다.'}</div>
+              </div>
+            )}
             {/* 재생 배속 — 실행 중에도 바꿀 수 있어야 하므로 설정 잠금(isConfigLocked) 밖에 둔다 */}
             <div className="row between" style={{ alignItems: 'center' }}>
               <span className="muted" style={{ fontSize: 10.5 }}>배속</span>
@@ -2795,6 +2859,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 {osmWarning || simNotice}
               </div>
             )}
+
+            {/* 전체 초기화 — 구역까지 비우는 유일한 경로. 재생 옆 초기화(clearRun)와 달리
+                도로망·생성 교통이 사라져서 다음 실행 때 N* 보정을 처음부터 다시 해야 하므로,
+                실수로 누르지 않도록 맨 아래에 따로 둔다. */}
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 14, marginTop: 4 }}>
+              {/* 준비 중에도 누를 수 있어야 한다 — 비활성으로 두면 눌러도 아무 반응이 없어
+                  "초기화가 안 먹는다"로 보인다. 백엔드의 /api/simulation/reset이 대기 중인
+                  시작(pending_start)을 먼저 취소하므로, 준비가 끝나도 시뮬이 혼자 시작되지 않는다. */}
+              <button className="btn sm block" onClick={clearAll}
+                title="구역·출발지·도착지까지 모두 비웁니다. 교통량 계산 중이면 그 대기도 취소합니다."
+                style={{ borderColor: 'var(--warn-line)', color: 'var(--warn)' }}>
+                <Icon.reset size={13} /> 전체 초기화
+              </button>
+              <div className="muted" style={{ fontSize: 10, lineHeight: 1.5, marginTop: 6, textAlign: 'center' }}>
+                구역·출발지·도착지까지 모두 지웁니다. 교통량을 다시 계산해야 합니다.
+              </div>
+            </div>
           </div>
               </div>
             </>

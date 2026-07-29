@@ -432,6 +432,8 @@ _state = {
     "network_ready": False,
     "net_file": None,      # path to .net.xml
     "traffic_preparing": False,  # 백그라운드 N* 시드 산정 중 여부
+    "traffic_message": None,     # 교통 생성 진행 문구(최근 한 줄) — WS traffic_prep로 프런트에 표시
+    "pending_start": None,       # 교통 준비가 끝나면 자동 시작할 SimStartRequest (없으면 None)
     "nstar_seed": None,          # 해석적 N* 시드(보정 전 잠정값) — 배율 UI 표시용
     "traffic_scenario": None,  # demand.scenario.TrafficScenario — 생성 교통 1세트(구역·배율당 1회)
     "osm_file": None,      # path to downloaded .osm
@@ -3171,6 +3173,17 @@ def _demand_bbox() -> Optional[tuple[float, float, float, float]]:
         return None
 
 
+def _traffic_log(m: str) -> None:
+    """교통 생성 진행 로그 — 콘솔과 `_state` 양쪽에 남긴다.
+
+    콘솔에만 찍으면 사용자는 수 분간 아무것도 못 본다(멈춘 것과 구분 불가). WS가
+    `_state["traffic_message"]`를 읽어 `traffic_prep`으로 흘려보내므로, 여기 한 줄이
+    곧 화면의 "교통량 계산 중 …" 문구가 된다.
+    """
+    _state["traffic_message"] = m
+    print(f"[DEMAND] {m}", flush=True)
+
+
 def current_traffic_scenario(force: bool = False, build: bool = True):
     """현재 구역의 생성 교통 한 세트를 준비한다 (없으면 만들고, 있으면 캐시 재사용).
 
@@ -3218,7 +3231,7 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
                 demand_scale=scale,
                 area_bbox=_demand_bbox(),
                 force=force,
-                log=lambda m: print(f"[DEMAND] {m}", flush=True),
+                log=_traffic_log,
             )
         except Exception as exc:
             print(f"[DEMAND] 교통 생성 실패 — 기존 폴백을 씁니다: {exc}", flush=True)
@@ -3789,12 +3802,21 @@ def simulation_thread(
         # ⚠️ 순서가 중요하다. 예열을 타겟 추가 뒤에 두면 예열 15분(1,800스텝) 동안
         # 타겟이 경로를 다 달려 도착·소멸해버려서 사용자가 볼 게 없어진다.
         if _use_generated:
+            # `simulationStep()`을 스텝마다 부르면 예열 900스텝이 TraCI 왕복 900회다.
+            # `simulationStep(t)`는 "t까지 진행"을 **왕복 1회**로 시킨다. 다만 통째로 넘기면
+            # 그 사이 stop_evt를 못 봐서 정지·초기화가 예열이 끝날 때까지 안 먹으므로,
+            # 청크로 끊어 왕복은 60분의 1로 줄이고 취소 지점은 남긴다.
+            # (예열 자체는 원래도 sleep이 없어 전속력이었다 — 배속 노브와는 무관하다.)
             _warm_target = float(getattr(_scn, "warmup_until_s", 0.0) or 0.0)
-            _warmed = 0
-            while traci.simulation.getTime() < _warm_target and not stop_evt.is_set():
-                traci.simulationStep()
-                _warmed += 1
-            print(f"[SIM] 예열 {_warmed}스텝 → t={traci.simulation.getTime():.0f}s, "
+            _WARM_CHUNK_S = 60.0
+            _warm_calls = 0
+            while not stop_evt.is_set():
+                _now_s = traci.simulation.getTime()
+                if _now_s >= _warm_target:
+                    break
+                traci.simulationStep(min(_now_s + _WARM_CHUNK_S, _warm_target))
+                _warm_calls += 1
+            print(f"[SIM] 예열 왕복 {_warm_calls}회 → t={traci.simulation.getTime():.0f}s, "
                   f"주행 중 {len(traci.vehicle.getIDList())}대", flush=True)
             if stop_evt.is_set():
                 traci.close()
@@ -4125,15 +4147,18 @@ def simulation_thread(
                     _state["edge_telemetry"] = _estats
 
             # 다중차량 실험군 — 배경 차량 위치 갱신, 도착/소멸한 차량은 새 id로 즉시 교체 주입.
-            # 도착 감지(아이디 집합 비교)는 매 틱 수행하지만, 무거운 getPosition() 호출은
-            # WS background_positions 브로드캐스트와 같은 주기(4틱)로만 수행해 대수가 많을 때
-            # 틱당 TraCI 비용을 1/4로 줄인다.
+            # ⚠️ 갱신 주기가 두 분기에서 서로 다르다. 스냅샷 한 번의 원가가 다르기 때문이고,
+            # 같은 값으로 통일하면 안 된다(각 분기 주석 참조):
+            #   생성 교통  = 문맥 구독으로 왕복 1회(0.01초) → 매 스텝
+            #   고정 풀    = 차량별 TraCI 왕복(452대면 1.2초) → 4스텝마다
             if _use_generated:
                 # 생성 교통은 SUMO가 경로파일 스케줄대로 넣고 뺀다 — 우리가 채워 넣을 게 없다.
                 # 고정 풀을 유지하며 재주입하던 로직(아래 elif)은 여기선 오히려 해롭다:
                 # 도착한 차를 무작위 OD로 되살리면 애써 만든 수요 구조가 무너지고,
                 # `_bg_drivable_edges`도 비어 있어 IndexError가 난다(2026-07-27 실측).
-                if _due("bg_positions", 4):
+                # 구독으로 바꾼 뒤 스냅샷이 0.01초가 되어 게이트를 둘 이유가 없어졌다.
+                # 매 스텝 갱신해도 공짜에 가깝고, 회색 점이 4스텝씩 튀지 않는다.
+                if _due("bg_positions_ctx", 1):
                     # ⚠️ 차량별로 getPosition/convertGeo/getSpeed를 부르면 안 된다.
                     # TraCI는 소켓 프로토콜이라 호출 하나가 왕복 한 번이다. 배경 452대면
                     # 스냅샷 한 번에 1,356회 왕복이고, 실측에서 **시뮬 전체가 초당 0.3스텝**
@@ -4155,7 +4180,11 @@ def simulation_thread(
             elif _bg_vehicle_ids:
                 _live_ids = set(traci.vehicle.getIDList())
                 _new_bg_vehicle_ids = []
-                _fetch_bg_positions = _due("bg_positions", 4)
+                # ⚠️ 위 분기와 달리 여기는 **차량별 왕복**이라 4스텝 주기를 유지해야 한다.
+                # 452대면 스냅샷 한 번이 왕복 1,356회 = 1.2초다. 위를 1로 내렸다고 여기까지
+                # 따라 내리면 시뮬이 초당 0.3스텝으로 기어간다(2026-07-28 실측).
+                # 내리고 싶으면 먼저 이 분기도 _bg_ctx() 구독으로 옮겨야 한다.
+                _fetch_bg_positions = _due("bg_positions_poll", 4)
                 _bg_snapshot = [] if _fetch_bg_positions else None
                 for _bg_id in _bg_vehicle_ids:
                     if _bg_id in _live_ids:
@@ -5112,18 +5141,14 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
     return {"path": path, "route_coords": route_coords}
 
 
-@app.post("/api/simulation/start")
-async def start_simulation(req: SimStartRequest):
-    """Start SUMO simulation with Dijkstra routing between origin and dest."""
-    global _sim_thread, _stop_event, _pause_event
+def _launch_sim_thread(req: SimStartRequest) -> dict:
+    """교통이 준비된 상태에서 실제 시뮬 스레드를 띄운다.
 
-    if not _state["network_ready"]:
-        raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
-    if _active_batch_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="시나리오 배치가 실행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 배치가 끝난 후 다시 시도하세요.",
-        )
+    `start_simulation`(즉시 경로)과 `_prepare_then_start`(준비 후 자동 시작 경로)가
+    **같은 코드**를 쓰도록 뽑아낸 것이다. 호출 전에 `current_traffic_scenario()`가
+    끝나 있어야 한다 — 여기서는 만들지 않는다.
+    """
+    global _sim_thread, _stop_event, _pause_event
 
     # 기존 스레드 정리 (실행 중이거나 일시정지 중인 경우 모두) — 실시간 엔드포인트 전용 관심사,
     # _prepare_simulation_run()에는 포함하지 않는다(헤드리스 배치 러너는 _sim_thread를 안 씀).
@@ -5131,12 +5156,11 @@ async def start_simulation(req: SimStartRequest):
         _pause_event.clear()  # 일시정지 해제 후 종료 신호
         _stop_event.set()
         _sim_thread.join(timeout=5)
+    # ⚠️ 이벤트는 **여기서** 새로 만든다. 예전엔 교통 빌드(수 분) 전에 만들었는데,
+    # 그 사이 들어온 정지가 아직 시작도 안 한 스레드에 일시정지로 걸려서 step 1에
+    # 멈춘 채 뜨는 일이 있었다. 스레드 기동 직전에 만들면 그 창이 없어진다.
     _stop_event = threading.Event()
     _pause_event = threading.Event()
-
-    # 생성 교통을 미리 준비한다 — 무거우므로(N* 보정 포함 최대 수 분) executor에서.
-    # 이후 _prepare_simulation_run과 simulation_thread는 만들어진 것을 읽기만 한다.
-    await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
 
     _prepare_simulation_run(req)
     _route_algo = req.algorithm_config.get("route", "dijkstra")
@@ -5161,7 +5185,75 @@ async def start_simulation(req: SimStartRequest):
     )
 
     _sim_thread.start()
-    return {"ok": True, "mode": _state["sim_mode"], "warning": _state["warning"], "run_id": _state.get("simulation_run_id")}
+    return {"ok": True, "status": "running", "mode": _state["sim_mode"],
+            "warning": _state["warning"], "run_id": _state.get("simulation_run_id")}
+
+
+def _prepare_then_start(req: SimStartRequest) -> None:
+    """교통을 만들고(수 분) 끝나면 보관해둔 요청으로 자동 시작한다. 전용 스레드에서 돈다."""
+    try:
+        current_traffic_scenario()          # _traffic_build_lock으로 직렬화됨
+    except Exception as exc:                # 빌드 실패 — 대기를 풀고 사용자에게 알린다
+        _state["error"] = f"교통 생성에 실패했습니다: {exc}"
+        _state["pending_start"] = None
+        return
+    finally:
+        _state["traffic_preparing"] = False
+        _state["traffic_stage"] = None
+
+    # 기다리는 동안 초기화·구역 변경으로 요청이 취소·교체됐으면 그대로 버린다.
+    if _state.get("pending_start") is not req:
+        return
+    try:
+        _launch_sim_thread(req)
+    except HTTPException as exc:
+        _state["error"] = str(exc.detail)
+    except Exception as exc:
+        _state["error"] = f"시뮬레이션 시작에 실패했습니다: {exc}"
+    finally:
+        # ⚠️ 해제는 **반드시 기동 뒤에**. 여기서 먼저 풀면 WS가 preparing=false를
+        # 내보내는 시점에 simulation_run_id가 아직 없어서, 프런트가 자동 시작된 런의
+        # id를 못 받고 도착 결과를 시트에 못 붙인다. 기동 중 들어온 시작 요청이
+        # "preparing"으로 되돌아가는 것도 의도한 동작이다(아직 뜨는 중이므로).
+        _state["pending_start"] = None
+
+
+@app.post("/api/simulation/start")
+async def start_simulation(req: SimStartRequest):
+    """Start SUMO simulation with Dijkstra routing between origin and dest.
+
+    교통이 이미 준비돼 있으면 그 자리에서 시작하고, 아직이면 **기다리지 않고**
+    `status="preparing"`으로 즉시 돌려준다. 준비가 끝나면 백그라운드가 자동으로
+    시작하므로 프런트는 안내만 띄우면 된다. 예전처럼 여기서 5분을 붙잡으면
+    사용자에겐 멈춘 것으로 보이고, 그래서 시작을 여러 번 누르게 된다.
+    """
+    if not _state["network_ready"]:
+        raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
+    if _active_batch_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="시나리오 배치가 실행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 배치가 끝난 후 다시 시도하세요.",
+        )
+
+    # 이미 준비 중이면 새로 만들지 않고 같은 상태를 돌려준다 — 중복 시작 방지.
+    # ⚠️ 이 가드가 없으면 준비 대기 중 눌린 시작들이 락에 줄을 섰다가 한꺼번에 통과해
+    # 서로의 스레드를 죽인다. traci는 label 없는 **전역 연결 하나**를 공유하므로
+    # 먼저 끝난 스레드의 traci.close()가 살아있는 스레드의 연결까지 끊는다
+    # (2026-07-29 실측: 0.4초 안에 start 3건 → 전멸, step 1에서 정지).
+    if _state.get("pending_start") is not None:
+        return {"ok": True, "status": "preparing", "stage": _state.get("traffic_stage"),
+                "message": _state.get("traffic_message")}
+
+    scenario = current_traffic_scenario(build=False)
+    if scenario is None:
+        _state["pending_start"] = req
+        _state["traffic_preparing"] = True
+        _state["traffic_stage"] = "calibrating"
+        threading.Thread(target=_prepare_then_start, args=(req,), daemon=True).start()
+        return {"ok": True, "status": "preparing", "stage": "calibrating",
+                "message": _state.get("traffic_message")}
+
+    return _launch_sim_thread(req)
 
 
 def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str) -> dict:
@@ -5457,8 +5549,13 @@ def generate_scenarios(req: ScenarioGenerateRequest):
 
 @app.post("/api/simulation/stop")
 async def stop_simulation():
-    """시뮬레이션 일시정지 (스레드·TraCI 연결 유지)."""
+    """시뮬레이션 일시정지 (스레드·TraCI 연결 유지).
+
+    아직 교통 준비 대기 중이면 그 예약을 취소한다 — 안 그러면 정지를 눌러도
+    준비가 끝나는 순간 시뮬이 혼자 시작된다.
+    """
     global _pause_event
+    _state["pending_start"] = None
     _pause_event.set()
     _state["sim_running"] = False
     return {"ok": True}
@@ -5502,6 +5599,9 @@ async def reset_simulation(scope: str = "full"):
     """scope="runtime": 차량/경로/텔레메트리만 리셋, 구역·도로망은 유지 (새로고침용).
     scope="full"(기본, 하위호환): 구역·도로망·노드까지 전부 초기화."""
     global _stop_event, _sim_thread, _pause_event
+    # 교통 준비를 기다리던 예약을 먼저 취소한다 — 남겨두면 초기화 직후 준비가 끝나면서
+    # 사용자가 누르지도 않은 시뮬이 시작된다. (준비 스레드 자체는 캐시를 채우고 끝난다.)
+    _state["pending_start"] = None
     _pause_event.clear()  # 일시정지 해제 후 종료
     _stop_event.set()
     if _sim_thread and _sim_thread.is_alive():
@@ -7914,7 +8014,8 @@ async def websocket_endpoint(ws: WebSocket):
         last_telemetry = None
         last_cost_version = 0
         last_connected: bool | None = None  # None=unknown, True=connected, False=disconnected
-        bg_tick = 0  # 배경 차량 위치는 매 틱(100ms)이 아니라 더 느리게 보냄 (대충 보여주는 용도)
+        last_bg_veh = None  # 배경 차량 스냅샷 — 같은 객체면 다시 보내지 않는다
+        last_prep = None    # 교통 준비 상태 (preparing, stage, message) — 바뀔 때만 보낸다
         while True:
             pos = _state.get("vehicle_pos")
             err = _state.get("error")
@@ -7930,6 +8031,30 @@ async def websocket_endpoint(ws: WebSocket):
             if warn:
                 await ws.send_json({"type": "warning", "message": warn, "mode": _state.get("sim_mode")})
                 _state["warning"] = None
+
+            # 교통 준비(N* 보정 등) 진행 상황 — 시작을 눌렀는데 수 분간 아무 반응이 없으면
+            # 사용자는 멈춘 것으로 보고 시작을 또 누른다. 상태가 바뀔 때만 보낸다.
+            # preparing이 True→False로 바뀌는 마지막 한 번도 반드시 나가야 프런트가 안내를 지운다.
+            # `pending_start`는 **사용자가 시작을 눌러서** 기다리는 중인지를 구분한다.
+            # 구역 설정 직후의 백그라운드 준비(_prepare_traffic_async)도 preparing=True지만
+            # 그건 아무도 기다리지 않는 것이라, 끝났다고 시뮬을 시작하면 안 된다.
+            _pending = _state.get("pending_start") is not None
+            prep = (bool(_pending or _state.get("traffic_preparing")),
+                    _state.get("traffic_stage"),
+                    _state.get("traffic_message"),
+                    _pending,
+                    _state.get("simulation_run_id"))
+            if prep != last_prep:
+                await ws.send_json({
+                    "type": "traffic_prep",
+                    "preparing": prep[0],
+                    "stage": prep[1],
+                    "message": prep[2],
+                    "pending_start": prep[3],
+                    # 자동 시작된 런의 DB id — 프런트가 도착 결과를 같은 행에 붙이는 데 쓴다.
+                    "run_id": prep[4],
+                })
+                last_prep = prep
 
             if route and route is not last_route:
                 await ws.send_json({
@@ -7950,10 +8075,14 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "telemetry", **telemetry})
                 last_telemetry = telemetry
 
-            # 다중차량 실험군 — 배경 차량 위치는 매 틱이 아니라 4틱(~400ms)마다 한번씩만 전송
-            bg_tick += 1
+            # 다중차량 실험군 — 배경 차량 위치 전송.
+            # 예전엔 `bg_tick % 4`로 400ms마다 보냈다. 백엔드 스냅샷이 문맥 구독으로 싸지면서
+            # (1.2초 → 0.01초) 이 게이트가 남은 지연의 대부분이 됐다 → 틱 게이트를 없앤다.
+            # 대신 **스냅샷 객체가 바뀌었을 때만** 보낸다: 고정 풀 분기는 여전히 4스텝마다만
+            # 갱신하므로, 무조건 보내면 같은 좌표를 10Hz로 재전송하게 된다.
+            # (last_pos/last_route/last_telemetry와 같은 방식 — 갱신 시 새 리스트로 교체됨)
             bg_veh = _state.get("background_vehicles")
-            if bg_veh and bg_tick % 4 == 0:
+            if bg_veh and bg_veh is not last_bg_veh:
                 await ws.send_json({
                     "type": "background_positions",
                     "vehicles": [
@@ -7961,6 +8090,7 @@ async def websocket_endpoint(ws: WebSocket):
                         for v in bg_veh
                     ],
                 })
+                last_bg_veh = bg_veh
 
             # Disconnection detection: emit once when BS coverage is lost mid-simulation
             sim_running_now = _state.get("sim_running", False)
