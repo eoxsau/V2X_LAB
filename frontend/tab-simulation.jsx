@@ -629,7 +629,7 @@ function SheetGridView({ sheets, activeSheetIdx, onSelectSheet,
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, trafficPrep, autoStartRunId, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, setSimLogs, simHistory, setSimHistory, routeEdges, setRouteEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
+function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRouteCoords, setVehiclePos, simNotice, setSimNotice, trafficPrep, autoStartRunId, placementProgress, networkTelemetry, setNetworkTelemetry, simConfig, setSimConfig, backgroundVehicles, setBackgroundVehicles, simLogs, setSimLogs, simHistory, setSimHistory, routeEdges, setRouteEdges, sheets, setSheets, activeSheetIdx, setActiveSheetIdx, api, mode: appMode }) {
   const mapRef  = useRef(null);
   const mapObj  = useRef(null);
   const groups  = useRef({});
@@ -1324,7 +1324,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       return;
     }
 
-    const color = '#2E75B6'; // blue dot for now (no signal quality without BS)
+    // 빨간 점. 예전엔 기지국과 같은 파란 계열(#2E75B6)이라 지도에서 구분이 안 됐다.
+    // 기지국(파랑)·RSU(주황)과 겹치지 않는 색이어야 타겟 차량이 한눈에 보인다.
+    const color = '#E0463C';
     const icon  = carIcon(color);
     const pos   = [vehiclePos.lat, vehiclePos.lng];
 
@@ -1538,33 +1540,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }
 
-  async function runSaCompare() {
-    setSaCompareRunning(true);
-    setSaCompareError(null);
-    setSaCompareResult(null);
-    try {
-      const res = await fetch(`${api}/api/placement/compare-with-sa`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          origin,
-          dest,
-          network_mode: networkGen.toUpperCase(),
-          n_greedy: 2,
-          n_random: 2,
-          sa_iter: 2000,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'SA 비교군 실행 실패');
-      setSaCompareResult(data);
-    } catch (e) {
-      setSaCompareError(e.message);
-    } finally {
-      setSaCompareRunning(false);
-    }
-  }
-
   /* ── finalizeArea — real OSM + netconvert via backend ────────── */
   async function finalizeArea(bounds) {
     setArea({ s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() });
@@ -1675,10 +1650,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     } catch (_) { /* 배속은 부가 기능 — 실패해도 시뮬 진행을 막지 않는다 */ }
   }
 
-  // SA 비교군
-  const [saCompareRunning, setSaCompareRunning] = useState(false);
-  const [saCompareResult, setSaCompareResult] = useState(null);
-  const [saCompareError, setSaCompareError] = useState(null);
 
   // Lite 전용 예시 시나리오 프리셋 — 학부생이 출발지/도착지를 직접 찍지 않아도 현재 구역
   // 안에서 바로 시작할 수 있게, 구역(area) 내부 좌표를 비율로 계산해 채운다(특정 도시
@@ -1706,7 +1677,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setSimNotice(null);
 
     // 일시정지 상태이면 재개 (vehiclePos/routeCoords 유지 — 도착 완료 후 재시작은 제외)
-    if (!sim.running && sim.elapsed > 0 && !vehiclePos?.arrived) {
+    if (!sim.running && !sim.finished && sim.elapsed > 0 && !vehiclePos?.arrived) {
       try {
         const res = await fetch(`${api}/api/simulation/resume`, { method: 'POST' });
         const body = await res.json().catch(() => ({}));
@@ -2120,8 +2091,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 <div className="row between" style={{ marginTop: 4 }}>
                   <b style={{ fontSize: 15, whiteSpace: 'nowrap' }}>시뮬레이션 제어</b>
                   <div className="row gap8">
-                    <span className={'status-badge ' + (sim.running ? 'running' : sim.elapsed > 0 ? 'paused' : 'idle')}>
-                      <span className="dot" />{sim.running ? '실행 중' : sim.elapsed > 0 ? '일시정지' : '대기'}
+                    <span className={'status-badge ' + (sim.running ? 'running' : sim.finished ? 'done' : sim.elapsed > 0 ? 'paused' : 'idle')}>
+                      <span className="dot" />{sim.running ? '실행 중' : sim.finished ? '완료' : sim.elapsed > 0 ? '일시정지' : '대기'}
                     </span>
                     <button className="btn icon sm" onClick={() => setOpenPanel(null)} title="닫기">✕</button>
                   </div>
@@ -2546,8 +2517,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 </div>
                 <button className="btn sm block accent" disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0}
                   onClick={() => placeNodes('sa', saN, true, setSaPlacing)}>
-                  <Icon.antenna size={13} /> {saPlacing ? '최적화 중… (건물 차폐 계산 포함, 수십 초)' : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
+                  <Icon.antenna size={13} /> {saPlacing
+                    ? (placementProgress ? `최적화 중… ${placementProgress.pct}%` : '최적화 중…')
+                    : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
                 </button>
+                {/* 진행률 막대 — 예전엔 콘솔에만 찍혀서 사용자는 수 분 동안 멈춘 건지
+                    도는 건지 알 수 없었다. 백엔드가 WS로 pct·phase를 보낸다. */}
+                {saPlacing && placementProgress && (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ height: 6, background: 'var(--surface-3)', borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${placementProgress.pct}%`,
+                        background: 'var(--brand-2)', transition: 'width .3s ease' }} />
+                    </div>
+                    <div className="muted" style={{ fontSize: 10, marginTop: 4, textAlign: 'center' }}>
+                      {placementProgress.phase} — {placementProgress.pct}%
+                    </div>
+                  </div>
+                )}
                 {placeResult && (
                   <div style={{ fontSize: 10, marginTop: 8, lineHeight: 1.5 }}>
                     <div>무작위 배치 <span className="num">{placeResult.random_baseline_ms?.toFixed(1)}</span> ms
@@ -2567,73 +2553,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
 
-            {/* SA 비교군 — 동일 BS/RSU 수로 SA 최적 배치 결과를 헤드리스 평가해 나란히 비교 */}
-            {stations.length > 0 && origin && dest && (
-              <div style={{ marginTop: 10, padding: '12px 14px', background: 'var(--surface-2)', borderRadius: 10, border: '1px solid var(--border)' }}>
-                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>
-                  SA 비교군 <span style={{ fontWeight: 400, color: 'var(--ink-3)', fontSize: 11 }}>— 동일 조건 최적 배치와 수치 비교</span>
-                </div>
-                <div className="muted" style={{ fontSize: 11, marginBottom: 10, lineHeight: 1.5 }}>
-                  현재 배치(실험군 BS {stations.filter(s=>s.node_type!=='rsu').length}개 / RSU {stations.filter(s=>s.node_type==='rsu').length}개)와 동일한 수를
-                  SA로 최적 배치한 뒤 헤드리스 평가해 지연·PRR 수치를 비교합니다.
-                </div>
-                <button className="btn sm primary" onClick={runSaCompare}
-                  disabled={saCompareRunning || !origin || !dest}>
-                  {saCompareRunning
-                    ? <><Icon.reset size={12} className="spin" /> SA 비교군 실행 중…</>
-                    : <><Icon.compare size={12} /> SA 비교군 실행</>}
-                </button>
-                {saCompareError && <div style={{ color: 'var(--bad)', fontSize: 11.5, marginTop: 8 }}>{saCompareError}</div>}
-                {saCompareResult && (() => {
-                  const { user, sa_optimal, improvement } = saCompareResult;
-                  return (
-                    <div style={{ marginTop: 10 }}>
-                      <div className="tbl-wrap">
-                        <table className="tbl">
-                          <thead>
-                            <tr>
-                              <th style={{ fontSize: 11 }}>지표</th>
-                              <th style={{ fontSize: 11 }}>실험군 (사용자 배치)</th>
-                              <th style={{ fontSize: 11 }}>비교군 (SA 최적)</th>
-                              <th style={{ fontSize: 11 }}>개선</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {[
-                              ['평균 지연 (ms)', user.avg_latency_ms, sa_optimal.avg_latency_ms, 'low'],
-                              ['P95 지연 (ms)', user.p95_latency_ms, sa_optimal.p95_latency_ms, 'low'],
-                              ['PRR (%)', user.prr_pct, sa_optimal.prr_pct, 'high'],
-                              ['미커버 구간 (%)', user.uncovered_pct, sa_optimal.uncovered_pct, 'low'],
-                            ].map(([label, uv, sv, better]) => {
-                              const improved = better === 'low' ? sv < uv : sv > uv;
-                              const diff = better === 'low' ? uv - sv : sv - uv;
-                              return (
-                                <tr key={label}>
-                                  <td style={{ fontSize: 11.5 }}>{label}</td>
-                                  <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5 }}>{uv != null ? (+uv).toFixed(2) : '—'}</td>
-                                  <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5, color: improved ? 'var(--good)' : 'var(--bad)' }}>
-                                    {sv != null ? (+sv).toFixed(2) : '—'}
-                                  </td>
-                                  <td style={{ fontSize: 11, color: improved ? 'var(--good)' : 'var(--bad)' }}>
-                                    {diff != null ? (improved ? '▼' : '▲') + Math.abs(diff).toFixed(2) : '—'}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                      {improvement?.sa_cost_improvement_pct != null && (
-                        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-                          SA 배치의 가중평균 지연 개선율: <b style={{ color: 'var(--good)' }}>{improvement.sa_cost_improvement_pct.toFixed(1)}%</b>
-                          {' '}({improvement.sa_n_candidates}개 후보 중 {improvement.sa_iter}회 탐색)
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
           </div>
           )}
 
@@ -2815,7 +2734,9 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             <div className="row gap8">
               {!sim.running
                 ? <button className="btn good block" disabled={!ready || osmStage > 0 || !!trafficPrep} onClick={handleStart}>
-                    <Icon.play size={15} /> {trafficPrep ? '준비 중…' : (sim.elapsed > 0 ? '재개' : '시작')}
+                    <Icon.play size={15} /> {trafficPrep ? '준비 중…'
+                      : sim.finished ? '다시 시작'
+                      : sim.elapsed > 0 ? '재개' : '시작'}
                   </button>
                 : <button className="btn block" style={{ borderColor: 'var(--warn-line)', color: 'var(--warn)' }} onClick={handleStop}>
                     <Icon.pause size={15} /> 정지

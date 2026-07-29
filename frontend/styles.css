@@ -130,6 +130,9 @@ input, select { font-family: inherit; }
 .status-badge.paused .dot { background: var(--warn); }
 .status-badge.idle    { background: var(--surface-3); color: var(--ink-3); border-color: var(--border); }
 .status-badge.idle .dot { background: var(--ink-4); }
+/* 도착으로 끝난 런 — '일시정지'(주황)와 색으로도 구분해야 재개할 것이 없다는 게 보인다. */
+.status-badge.done    { background: var(--brand-tint); color: var(--brand); border-color: var(--brand-tint2); }
+.status-badge.done .dot { background: var(--brand); }
 @keyframes pulse { 0%,100%{ box-shadow: 0 0 0 0 currentColor; opacity:1 } 50%{ box-shadow: 0 0 0 4px transparent; opacity:.55 } }
 
 /* ============================================================ Page area */

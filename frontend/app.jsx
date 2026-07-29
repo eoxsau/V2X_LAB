@@ -8,9 +8,12 @@ const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${wind
    설정을 바꾸면 주행 경로(옛 설정)와 텔레메트리(새 설정)가 섞인다. configLocked() 참조. */
 function simReducer(s, a) {
   switch (a.type) {
-    case 'start':   return { ...s, running: true, started: true };
+    case 'start':   return { ...s, running: true, started: true, finished: false };
     case 'pause':   return { ...s, running: false };
-    case 'reset':   return { ...s, running: false, started: false, elapsed: 0, tick: 0 };
+    /* 도착으로 **끝난** 런. 일시정지와 반드시 구분해야 한다 — 도착한 런은 재개할 것이
+       없는데도 상태가 같으면 버튼이 '재개'로 뜬다(2026-07-29 사용자 보고). */
+    case 'finish':  return { ...s, running: false, finished: true };
+    case 'reset':   return { ...s, running: false, started: false, finished: false, elapsed: 0, tick: 0 };
     case 'tick':    return { ...s, elapsed: s.elapsed + 1, tick: s.tick + 1 };
     case 'mode':    return { ...s, mode: a.v };
     default: return s;
@@ -25,7 +28,7 @@ function configLocked(sim) {
 
 function App() {
   const [tab, setTab] = useState(() => location.hash.replace('#', '') || 'simulation');
-  const [sim, dispatch] = React.useReducer(simReducer, { running: false, started: false, elapsed: 0, tick: 0, mode: '5G' });
+  const [sim, dispatch] = React.useReducer(simReducer, { running: false, started: false, finished: false, elapsed: 0, tick: 0, mode: '5G' });
   const [bootReady, setBootReady]      = useState(false);
 
   // Lite/Professional 모드 게이트 — 선택 전엔 LandingPage만 보여준다(아래 return 직전 분기).
@@ -50,6 +53,8 @@ function App() {
   const [trafficPrep, setTrafficPrep] = useState(null);
   /* 준비 후 자동 시작된 런의 DB id — 시작 응답이 "preparing"이라 그때는 받을 수 없었다. */
   const [autoStartRunId, setAutoStartRunId] = useState(null);
+  /* 배치 최적화 진행률 {pct, phase}. null이면 돌고 있지 않음. */
+  const [placementProgress, setPlacementProgress] = useState(null);
   /* 사용자가 누른 시작이 준비를 기다리는 중인지. 구역 설정 직후의 백그라운드 준비도
      preparing=true지만 그건 아무도 기다리지 않으므로, 끝났다고 실행 상태로 바꾸면 안 된다. */
   const awaitingAutoStart = useRef(false);
@@ -105,12 +110,17 @@ function App() {
   }, []);
   const go = (id) => { location.hash = id; setTab(id); };
 
-  // sim clock — only tick locally while running
+  /* sim clock — **차량이 실제로 출발한 뒤부터** 센다.
+     시작을 누르면 교통 준비와 예열(SUMO를 화면 갱신 없이 수십 초 굴린다)이 먼저인데,
+     그동안 시계가 돌면 "출발도 안 했는데 시간이 흐르는" 그림이 된다.
+     ⚠️ 의존성은 vehiclePos 객체가 아니라 **불리언**이어야 한다. 객체를 그대로 넣으면
+        위치가 갱신될 때마다(약 0.1초) 인터벌이 초기화돼 1초 틱이 영영 안 온다. */
+  const hasDeparted = !!vehiclePos;
   useEffect(() => {
-    if (!sim.running) return;
+    if (!sim.running || !hasDeparted) return;
     const t = setInterval(() => dispatch({ type: 'tick' }), 1000);
     return () => clearInterval(t);
-  }, [sim.running]);
+  }, [sim.running, hasDeparted]);
 
   useEffect(() => {
     let closed = false;
@@ -179,7 +189,7 @@ function App() {
         } else if (msg.type === 'route') {
           setRouteCoords(msg.coords);
         } else if (msg.type === 'arrived') {
-          dispatch({ type: 'pause' });
+          dispatch({ type: 'finish' });
           setVehiclePos(v => v ? { ...v, arrived: true } : v);
         } else if (msg.type === 'warning') {
           setSimNotice(msg.message);
@@ -200,6 +210,8 @@ function App() {
           }]);
         } else if (msg.type === 'background_positions') {
           setBackgroundVehicles(msg.vehicles || []);
+        } else if (msg.type === 'placement_progress') {
+          setPlacementProgress(msg.progress || null);
         } else if (msg.type === 'traffic_prep') {
           // 교통 준비 진행 상황. preparing이 내려가는 순간, 우리가 누른 시작이 대기 중이었다면
           // 백엔드가 방금 시뮬을 자동으로 띄운 것이므로 여기서 실행 상태로 전환한다.
@@ -354,6 +366,7 @@ function App() {
             setSimNotice={setSimNotice}
             trafficPrep={trafficPrep}
             autoStartRunId={autoStartRunId}
+            placementProgress={placementProgress}
             networkTelemetry={networkTelemetry}
             setNetworkTelemetry={setNetworkTelemetry}
             simConfig={simConfig}

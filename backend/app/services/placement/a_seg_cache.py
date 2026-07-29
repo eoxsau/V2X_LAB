@@ -23,15 +23,74 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 A_SEG_PER_BUILDING_DB = 12.0     # latency v3.1 §7
 VEHICLE_HEIGHT_M = 1.5           # building_obstruction_analyzer._VEHICLE_HEIGHT_M와 동일
 
+# 이 규모 아래면 직렬이 더 빠르다 — 윈도우는 spawn이라 워커 하나 띄우는 데 1~2초가 든다.
+# (수요 × 후보)는 거리 컷오프 전 상한이라 실제 계산량보다 크지만, 문턱 판단에는 충분하다.
+_PARALLEL_MIN_PAIRS = 200_000
+
 
 def _log_noop(_: str) -> None:
     pass
+
+
+def _worker_count(n_demand: int, n_cand: int) -> int:
+    """쓸 워커 수. 작은 작업은 1(직렬)."""
+    if n_demand * n_cand < _PARALLEL_MIN_PAIRS:
+        return 1
+    return max(1, min(os.cpu_count() or 1, 8, n_demand))
+
+
+# ── 워커 프로세스 ─────────────────────────────────────────────────────────────
+# STRtree와 shapely 지오메트리는 프로세스 경계를 못 넘는다(피클 불가). 그래서 건물을
+# WKB로 한 번 보내고 **워커마다 트리를 한 번씩** 만든 뒤, 청크는 수요점만 실어 나른다.
+_W: dict = {}
+
+
+def _aseg_init(geoms_wkb, heights, cand_rows) -> None:
+    from shapely import wkb as _wkb
+    from shapely.strtree import STRtree
+    geoms = [_wkb.loads(b) for b in geoms_wkb]
+    _W["heights"] = heights
+    _W["tree"] = STRtree(geoms)
+    _W["cents"] = [g.centroid for g in geoms]
+    _W["cands"] = cand_rows          # [(cid, sx, sy, height_m, cover_m), ...]
+
+
+def _aseg_chunk(rows):
+    """rows = [(demand_id, dx, dy, lat), ...] → ([(demand_id, cand_id, a_seg_db), ...], 쌍 수)"""
+    from shapely.geometry import LineString
+    tree, cents, heights, cands = _W["tree"], _W["cents"], _W["heights"], _W["cands"]
+    out: list[tuple[str, str, float]] = []
+    n_pairs = 0
+    for did, dx, dy, lat in rows:
+        # 3857은 위도에 따라 거리가 늘어나므로 근사 보정 후 컷오프 판정
+        scale = math.cos(math.radians(lat)) or 1.0
+        for cid, sx, sy, ch, cov in cands:
+            if math.hypot(sx - dx, sy - dy) * scale > cov:
+                continue
+            n_pairs += 1
+            line = LineString([(dx, dy), (sx, sy)])
+            blocked = 0
+            for bi in tree.query(line, predicate="intersects"):
+                bi = int(bi)
+                bh = heights[bi]
+                if bh <= 0.0:
+                    blocked += 1            # 높이 미상 → 보수적 차단
+                    continue
+                t = max(0.0, min(1.0, line.project(cents[bi], normalized=True)))
+                h_beam = VEHICLE_HEIGHT_M + t * (ch - VEHICLE_HEIGHT_M)
+                if h_beam < bh:
+                    blocked += 1
+            if blocked:
+                out.append((did, cid, blocked * A_SEG_PER_BUILDING_DB))
+    return out, n_pairs
 
 
 class ASegTable:
@@ -71,6 +130,7 @@ def build_a_seg_table(
     cache_dir: Optional[str] = None,
     force: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[float, str], None]] = None,
 ) -> ASegTable:
     """(수요 × 후보) 쌍의 A_seg를 한 번에 계산하고 캐시한다.
 
@@ -94,50 +154,69 @@ def build_a_seg_table(
             return ASegTable(t)
 
     from pyproj import Transformer
-    from shapely.geometry import LineString
-    from shapely.strtree import STRtree
+    from shapely import wkb as _shapely_wkb
     from app.services.latency import formula_v31 as f31
 
-    # ── 건물을 미터 좌표로 한 번만 투영하고 STRtree를 한 번만 만든다 ──────────
+    # ── 건물을 미터 좌표로 한 번만 투영한다 ────────────────────────────────
     fwd = Transformer.from_crs(4326, 3857, always_xy=True)
     geoms_m = list(buildings_gdf.to_crs(3857).geometry)
     if "height_m" in buildings_gdf.columns:
         heights = [float(v or 0.0) for v in buildings_gdf["height_m"].fillna(0.0)]
     else:
         heights = [0.0] * len(geoms_m)
-    # 높이 미상은 런타임 분석기와 같이 **보수적으로 차단**으로 본다
-    tree = STRtree(geoms_m)
-    cents = [g.centroid for g in geoms_m]
+    # 높이 미상은 런타임 분석기와 같이 **보수적으로 차단**으로 본다.
+    # STRtree는 피클이 안 되므로 워커가 각자 만든다 — WKB로 넘긴다(한 번만 직렬화).
+    geoms_wkb = [_shapely_wkb.dumps(g) for g in geoms_m]
 
     dxy = [fwd.transform(d.lng, d.lat) for d in demand]
     cxy = [fwd.transform(c.lng, c.lat) for c in candidates]
     cover = [f31.resolve_coverage_radius(tech, c.node_type) for c in candidates]
 
+    # 워커에 넘길 납작한 표현 — geopandas/pyproj 객체를 프로세스 경계로 보내지 않는다.
+    demand_rows = [(d.id, dxy[i][0], dxy[i][1], d.lat) for i, d in enumerate(demand)]
+    cand_rows = [(c.id, cxy[i][0], cxy[i][1], c.height_m, cover[i])
+                 for i, c in enumerate(candidates)]
+
+    n_workers = _worker_count(len(demand), len(candidates))
     table: dict[tuple[str, str], float] = {}
     n_pairs = 0
-    for di, dp in enumerate(demand):
-        dx, dy = dxy[di]
-        for ci, cd in enumerate(candidates):
-            sx, sy = cxy[ci]
-            # 3857은 위도에 따라 거리가 늘어나므로 근사 보정 후 컷오프 판정
-            scale = math.cos(math.radians(dp.lat)) or 1.0
-            if math.hypot(sx - dx, sy - dy) * scale > cover[ci]:
-                continue
-            n_pairs += 1
-            line = LineString([(dx, dy), (sx, sy)])
-            blocked = 0
-            for bi in tree.query(line, predicate="intersects"):
-                bi = int(bi)
-                bh = heights[bi]
-                if bh <= 0.0:
-                    blocked += 1            # 높이 미상 → 보수적 차단
-                    continue
-                t = max(0.0, min(1.0, line.project(cents[bi], normalized=True)))
-                h_beam = VEHICLE_HEIGHT_M + t * (cd.height_m - VEHICLE_HEIGHT_M)
-                if h_beam < bh:
-                    blocked += 1
-            if blocked:
-                table[(dp.id, cd.id)] = blocked * A_SEG_PER_BUILDING_DB
+
+    def _serial() -> tuple[dict, int]:
+        # 직렬 — **병렬과 같은 함수**를 쓴다. 따로 구현하면 두 경로가 조용히 갈라진다.
+        _aseg_init(geoms_wkb, heights, cand_rows)
+        rows_, np_ = _aseg_chunk(demand_rows)
+        return {(a, b): v for a, b, v in rows_}, np_
+
+    if n_workers <= 1:
+        table, n_pairs = _serial()
+    else:
+        # 수요를 청크로 쪼갠다. 워커 수의 4배로 잘라야 진행률이 촘촘하고 부하도 고르게 퍼진다
+        # (수요점마다 커버 안 후보 수가 달라 청크가 크면 한 워커만 오래 남는다).
+        n_chunks = max(n_workers * 4, 1)
+        size = max(1, math.ceil(len(demand_rows) / n_chunks))
+        chunks = [demand_rows[i:i + size] for i in range(0, len(demand_rows), size)]
+        log(f"A_seg 병렬 계산 시작 — 워커 {n_workers}개, 청크 {len(chunks)}개 "
+            f"(후보 {len(candidates)} × 수요 {len(demand)})")
+        done = 0
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_aseg_init,
+                                     initargs=(geoms_wkb, heights, cand_rows)) as ex:
+                futs = [ex.submit(_aseg_chunk, c) for c in chunks]
+                for fut in as_completed(futs):
+                    rows, np_ = fut.result()
+                    for a, b, v in rows:
+                        table[(a, b)] = v
+                    n_pairs += np_
+                    done += 1
+                    frac = done / len(chunks)
+                    log(f"A_seg 진행 {done}/{len(chunks)} ({frac * 100:.0f}%)")
+                    if progress:
+                        progress(frac, "건물 차폐 계산")
+        except Exception as exc:
+            # 워커 기동 실패·메모리 부족 등 — 배치를 통째로 실패시키지 않는다.
+            # 느릴 뿐 답은 같으므로 직렬로 다시 한다.
+            log(f"⚠️ A_seg 병렬 실패({exc.__class__.__name__}: {exc}) — 직렬로 다시 계산합니다")
+            table, n_pairs = _serial()
 
     log(f"A_seg 계산: 쌍 {n_pairs}개(커버 안) 중 차폐 {len(table)}개 "
         f"| 후보 {len(candidates)} × 수요 {len(demand)}")

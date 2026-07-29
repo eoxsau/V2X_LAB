@@ -433,6 +433,7 @@ _state = {
     "net_file": None,      # path to .net.xml
     "traffic_preparing": False,  # 백그라운드 N* 시드 산정 중 여부
     "traffic_message": None,     # 교통 생성 진행 문구(최근 한 줄) — WS traffic_prep로 프런트에 표시
+    "placement_progress": None,  # 배치 최적화 진행률 {"pct", "phase"} — WS placement_progress
     "pending_start": None,       # 교통 준비가 끝나면 자동 시작할 SimStartRequest (없으면 None)
     "nstar_seed": None,          # 해석적 N* 시드(보정 전 잠정값) — 배율 UI 표시용
     "traffic_scenario": None,  # demand.scenario.TrafficScenario — 생성 교통 1세트(구역·배율당 1회)
@@ -3329,13 +3330,26 @@ def optimize_placement_v2(n_bs: int, n_rsu: int, tech: str, seed: Optional[int] 
     if not demand:
         return None
 
-    return optimize_placement_for_area(
-        net, buildings, demand, n_bs, n_rsu, tech=tech,
-        cache_dir=str(WORK_DIR / "_aseg"),
-        routable_edge_ids=_in_area or _routable,
-        seed=seed,
-        log=lambda m: print(f"[PLACE-V2] {m}", flush=True),
-    )
+    # 진행률을 _state에 남기면 WS가 프런트로 흘린다. 예전엔 콘솔에만 찍혀서, 사용자는
+    # 수 분 동안 "멈춘 건지 도는 건지" 알 방법이 없었다(2026-07-29 사용자 요청).
+    def _progress(frac: float, phase: str) -> None:
+        _state["placement_progress"] = {
+            "pct": round(max(0.0, min(1.0, frac)) * 100),
+            "phase": phase,
+        }
+
+    _state["placement_progress"] = {"pct": 0, "phase": "후보 생성"}
+    try:
+        return optimize_placement_for_area(
+            net, buildings, demand, n_bs, n_rsu, tech=tech,
+            cache_dir=str(WORK_DIR / "_aseg"),
+            routable_edge_ids=_in_area or _routable,
+            seed=seed,
+            log=lambda m: print(f"[PLACE-V2] {m}", flush=True),
+            progress=_progress,
+        )
+    finally:
+        _state["placement_progress"] = None
 
 
 _nstar_seed_lock = threading.Lock()
@@ -8102,6 +8116,7 @@ async def websocket_endpoint(ws: WebSocket):
         last_connected: bool | None = None  # None=unknown, True=connected, False=disconnected
         last_bg_veh = None  # 배경 차량 스냅샷 — 같은 객체면 다시 보내지 않는다
         last_prep = None    # 교통 준비 상태 (preparing, stage, message) — 바뀔 때만 보낸다
+        last_place = None   # 배치 최적화 진행률 — 바뀔 때만 보낸다
         while True:
             pos = _state.get("vehicle_pos")
             err = _state.get("error")
@@ -8141,6 +8156,13 @@ async def websocket_endpoint(ws: WebSocket):
                     "run_id": prep[4],
                 })
                 last_prep = prep
+
+            # 배치 최적화 진행률. None이면 "돌고 있지 않음" — 끝났을 때 한 번 보내야
+            # 프런트가 표시를 지울 수 있으므로 None으로 바뀌는 순간도 전송한다.
+            place = _state.get("placement_progress")
+            if place != last_place:
+                await ws.send_json({"type": "placement_progress", "progress": place})
+                last_place = place
 
             if route and route is not last_route:
                 await ws.send_json({

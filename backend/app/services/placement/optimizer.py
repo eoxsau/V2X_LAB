@@ -101,6 +101,7 @@ def optimize_placement_for_area(
     n_random: int = 2,
     seed: Optional[int] = None,
     log: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[float, str], None]] = None,
 ) -> PlacementResult:
     """구역 하나에 대해 BS N_BS개 + RSU N_RSU개를 **함께** 최적화한다.
 
@@ -120,8 +121,16 @@ def optimize_placement_for_area(
         return PlacementResult(tech=tech, n_bs=0, n_rsu=0)
     log(f"후보 BS {len(bs)}개 / RSU {len(rsu)}개 (K={k:g}), 수요 {len(demand)}점")
 
+    # 진행률은 A_seg가 0~90%를 쓴다 — 전체 시간의 대부분이 거기다. greedy는 반복마다
+    # 후보 전수를 훑는 구조라 중간 진행률을 만들 자연스러운 지점이 없어 90%에서 표시만 바꾼다.
+    def _aseg_progress(frac: float, phase: str) -> None:
+        if progress:
+            progress(frac * 0.9, phase)
+
     a_seg = build_a_seg_table(demand, list(bs) + list(rsu), buildings_gdf, tech,
-                              cache_dir=cache_dir, log=log)
+                              cache_dir=cache_dir, log=log, progress=_aseg_progress)
+    if progress:
+        progress(0.9, "배치 탐색")
 
     # 기본 0 = SA 건너뜀. 근거는 sa_engine.optimize의 sa_iter docstring(1-swap 전수 탐색 실측).
     n_iter = sa_iter if sa_iter is not None else 0
