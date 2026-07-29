@@ -493,6 +493,14 @@ _SIM_TICK_S = 0.1
 SIM_SPEED_MIN, SIM_SPEED_MAX = 0.25, 16.0
 _sim_speed_value = 1.0
 
+# 그린 구역 밖 엣지에 물리는 가상 통행시간(초). 경로 탐색이 구역 밖으로 새는 것을 막는다.
+# **금지가 아니라 페널티인 이유**: 구역 가장자리에서 출발·도착하면 안쪽 길만으로는
+# 연결이 없을 수 있는데, 금지하면 "경로 없음"으로 시뮬이 아예 안 뜬다. 큰 값을 물리면
+# 대안이 있을 때만 피하고 없으면 그대로 쓰므로 실패하지 않는다.
+# 값 근거: 구역 대각선이 수 km라 정상 경로의 자유류 통행시간은 길어야 수백 초다.
+# 1e5초(약 28시간)면 어떤 정상 경로보다도 압도적으로 비싸다.
+OUT_OF_AREA_TRAVELTIME_S = 1e5
+
 # 네트워크 텔레메트리 재계산 최소 간격(초, **벽시계**).
 #
 # `update_network_telemetry`는 노드마다 건물 차폐를 ray casting으로 다시 재는데,
@@ -834,12 +842,34 @@ def run_cmd(args: list, cwd=None, extra_env: dict | None = None) -> tuple[int, s
     return result.returncode, result.stdout, result.stderr
 
 
-def expand_bbox(bbox: BBox, margin_deg: float = 0.0025) -> BBox:
+# OSM 다운로드 시 그린 구역 밖으로 더 받아올 여유(m).
+#
+# 예전 값은 0.0025°(위도 278m / 경도 221m)였는데 너무 짧았다. 고속도로 나들목과 간선의
+# 바깥쪽 연결이 이 안에 안 들어와서, 구역 안 도로인데도 바깥쪽 끝이 허공에서 끝났다.
+# 2026-07-29 실측(안양 구역): 고속도로 8개(34.4 lane-km)와 primary 9개(5.3 lane-km)가
+# 통째로 통행 배정에서 빠졌고, 그 축의 교통량이 0이 되어 기지국 배치까지 비었다.
+#
+# ⚠️ 넓혀도 **교통량은 안 부푼다.** 수요는 `_demand_bbox()`(그린 구역)에만 깔린다.
+#    늘어나는 건 net 크기와 netconvert·A_seg 계산 시간뿐이다.
+# ⚠️ 대신 경로가 구역 밖으로 샐 여지가 커지므로, 타겟 경로에는 구역 밖 페널티가
+#    걸려 있어야 한다(`OUT_OF_AREA_TRAVELTIME_S` 참조).
+DOWNLOAD_MARGIN_M = 1000.0
+
+
+def expand_bbox(bbox: BBox, margin_m: float = DOWNLOAD_MARGIN_M) -> BBox:
+    """그린 구역을 사방으로 `margin_m` 만큼 넓힌다.
+
+    도(degree)가 아니라 **미터**로 받는다 — 같은 도수를 위·경도에 그대로 쓰면 위도 37°에서
+    경도 쪽이 cos(37°)≈0.8배로 좁아져, 동서 여유가 남북보다 20% 짧아진다.
+    """
+    dlat = margin_m / 111_320.0
+    coslat = math.cos(math.radians((bbox.s + bbox.n) / 2.0)) or 1e-6
+    dlng = margin_m / (111_320.0 * coslat)
     return BBox(
-        s=max(-90.0, bbox.s - margin_deg),
-        w=max(-180.0, bbox.w - margin_deg),
-        n=min(90.0, bbox.n + margin_deg),
-        e=min(180.0, bbox.e + margin_deg),
+        s=max(-90.0, bbox.s - dlat),
+        w=max(-180.0, bbox.w - dlng),
+        n=min(90.0, bbox.n + dlat),
+        e=min(180.0, bbox.e + dlng),
     )
 
 
@@ -3595,6 +3625,36 @@ def simulation_thread(
                 except Exception:
                     pass
 
+        # ── 타겟 경로를 그린 구역 안으로 묶기 ────────────────────────────────
+        # net은 다운로드 여유(expand_bbox) 때문에 그린 구역보다 넓다. 그대로 두면
+        # 최단경로가 구역 밖 간선으로 빠져나가, 사용자가 그리지도 않은 곳을 달리는
+        # 그림이 된다. 기지국·RSU 후보는 이미 구역으로 거르고 있었는데
+        # (`optimize_placement_v2`) **경로만 빠져 있었다**(2026-07-29 사용자 지적).
+        #
+        # 구역 밖 엣지에 큰 통행시간(`adaptTraveltime`)을 물린다. findRoute는 **기본 모드
+        # 그대로** 둔다 — 기본 모드가 adaptTraveltime을 반영하고, 집계(aggregated) 모드는
+        # 오히려 무시한다(시뮬 실측 통행시간을 쓰기 때문).
+        # 2026-07-29 실측(120쌍 중 구역 밖으로 새던 10개 경로, 구역 밖 엣지 54개):
+        #     기본 모드 54 → 10 (10개 중 6개가 완전히 안쪽으로)
+        #     집계 모드 54 → 54 (전혀 안 먹힘)
+        # 나머지 4개는 안쪽만으로 길이 없어 우회한 것이고, 그건 아래에서 경고로 알린다.
+        _out_of_area: set[str] = set()
+        _area_bbox = _demand_bbox()
+        if _area_bbox:
+            from app.services.demand.calibration import _edge_touches_bbox
+            for _e in net.getEdges():
+                try:
+                    if not _edge_touches_bbox(net, _e, _area_bbox):
+                        _out_of_area.add(_e.getID())
+                except Exception:
+                    continue
+            for _eid in _out_of_area:
+                try:
+                    traci.edge.adaptTraveltime(_eid, OUT_OF_AREA_TRAVELTIME_S)
+                except Exception:
+                    pass
+            print(f"[SIM] 구역 밖 엣지 {len(_out_of_area)}개에 경로 페널티 적용", flush=True)
+
         # Try candidate edge pairs until findRoute succeeds
         result = None
         from_edge, to_edge = from_candidates[0], to_candidates[0]
@@ -3822,6 +3882,17 @@ def simulation_thread(
                 traci.close()
                 _state["sim_running"] = False
                 return
+
+        # 페널티에도 불구하고 구역 밖을 지났다면 = 안쪽만으로는 길이 없었다는 뜻이다.
+        # 조용히 넘기면 사용자는 "왜 구역 밖을 달리지?"만 보게 되므로 이유를 알린다.
+        if _out_of_area:
+            _n_out = sum(1 for _e in edges if _e in _out_of_area)
+            if _n_out:
+                print(f"[SIM] ⚠️ 경로가 구역 밖 엣지 {_n_out}개를 지납니다", flush=True)
+                _state["warning"] = (
+                    f"경로가 그린 구역 밖을 {_n_out}개 구간 지납니다 — 구역 안쪽 도로만으로는 "
+                    f"출발지와 도착지가 이어지지 않아 우회했습니다. 구역을 넓히면 사라집니다."
+                )
 
         # Define vehicle type and add vehicle
         # Use DEFAULT_VEHTYPE (always exists in SUMO)

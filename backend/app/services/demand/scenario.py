@@ -69,6 +69,11 @@ class TrafficScenario:
     peak_time_s: float                 # 가장 붐빈 시각 = 배치 스냅샷 시점
 
     n_vehicles: int = 0
+    # 이 교통을 만들 때 쓴 **그린 구역**(minlng, minlat, maxlng, maxlat).
+    # 기록해두지 않으면 나중에 같은 조건으로 재현할 수 없다 — 2026-07-29에 생존율 31%짜리
+    # 시나리오를 조사하려 했는데 bbox가 어디에도 없어서 재현을 못 했다(같은 net·같은 N*로
+    # 다시 돌리면 98.3%가 나와, 무엇이 달랐는지 끝내 특정하지 못했다).
+    area_bbox: Optional[tuple] = None
     demand_points: list = field(default_factory=list)   # sa_placement.DemandPoint
     # 피크 구간 엣지별 교통량 원본 — 배치 수요(demand_points)와 배경 차량 양쪽의 재료.
     # {edge_id, lat, lng, vehicle_count, mean_speed_kph} 형태로 직렬화해 캐시한다.
@@ -212,6 +217,7 @@ def build_traffic_scenario(
         warmup_until_s=pick_target_depart_time(sim, max_halting=TARGET_MAX_HALTING),
         peak_time_s=sim.peak_time_s,
         n_vehicles=d.n_vehicles,
+        area_bbox=tuple(area_bbox) if area_bbox else None,
         demand_points=points,
         peak_edge_loads=[
             {"edge_id": ld.edge_id, "lat": ld.lat, "lng": ld.lng,
