@@ -33,6 +33,14 @@ def read_net(net_file: str):
     return sumolib.net.readNet(str(net_file))
 
 
+# 통행 배정에서 빠지면 "그 축 교통량이 0"이 되어 눈에 띄는 도로 종류.
+# 주택가 골목(residential)·이면도로는 몇 개 빠져도 정상이라 여기 넣지 않는다.
+_MAJOR_ROAD_TYPES = frozenset({
+    "motorway", "motorway_link", "trunk", "trunk_link",
+    "primary", "primary_link", "secondary", "secondary_link",
+})
+
+
 def _as_net(net_or_file):
     if isinstance(net_or_file, (str, os.PathLike)):
         return read_net(net_or_file)
@@ -160,10 +168,98 @@ def _scc_components(net, vclass: str = "passenger") -> list[list[str]]:
     return comps
 
 
+def _routing_graph(net, vclass: str = "passenger") -> tuple[dict, dict]:
+    """(정방향, 역방향) 인접 리스트 — `_scc_components`와 **같은** 통행 허용 규칙."""
+    fwd: dict[str, list[str]] = {}
+    bwd: dict[str, list[str]] = {}
+    for e in net.getEdges():
+        try:
+            if not e.allows(vclass):
+                continue
+        except Exception:
+            pass
+        fwd.setdefault(e.getID(), [])
+        bwd.setdefault(e.getID(), [])
+    for e in net.getEdges():
+        eid = e.getID()
+        if eid not in fwd:
+            continue
+        try:
+            outgoing = e.getAllowedOutgoing(vclass)
+        except Exception:
+            outgoing = e.getOutgoing()
+        for nxt in outgoing:
+            nid = nxt.getID()
+            if nid in fwd:
+                fwd[eid].append(nid)
+                bwd[nid].append(eid)
+    return fwd, bwd
+
+
+def _reachable(starts, graph: dict) -> set[str]:
+    from collections import deque
+    seen = set(starts)
+    q = deque(seen)
+    while q:
+        u = q.popleft()
+        for v in graph.get(u, []):
+            if v not in seen:
+                seen.add(v)
+                q.append(v)
+    return seen
+
+
 def routable_edges(net_or_file, vclass: str = "passenger") -> set[str]:
-    """최대 강연결성분에 속한 엣지 ID 집합 — 서로 왕복 가능한 '본토' 도로망."""
-    comps = _scc_components(_as_net(net_or_file), vclass)
-    return set(comps[0]) if comps else set()
+    """**통행이 실제로 지나갈 수 있는** 엣지 ID 집합.
+
+    판정: 본토(최대 SCC)에서 **갈 수 있고**, 동시에 본토로 **돌아올 수 있는** 엣지.
+    이 조건을 만족하면 본토의 임의의 O·D 쌍에 대해 `O → e → D` 경로가 존재하므로
+    duarouter가 실제로 그 엣지를 쓸 수 있다. 최대 SCC는 이 집합의 부분집합이다.
+
+    ⚠️ 예전에는 최대 SCC 자체를 썼는데, 그러면 **왕복이 안 되는 일방통행 간선**이
+    통째로 빠진다. 대표적으로 고속도로는 상·하행이 서로 다른 엣지라 SCC가 성립하지
+    않는다. 본토에서 올라타 램프로 내려올 수 있으면 통행에 쓸 수 있는데도 배제됐다.
+
+    ⚠️ 다만 이 완화가 **잘린 고속도로를 살리지는 못한다.** 구역 경계에서 끊긴 고속도로는
+    올라타면 내려올 방법이 없어(진출 램프가 구역 밖) 이 조건도 통과하지 못한다.
+    2026-07-29 실측(area-1b93a715): 본토→고속도로 진입 4개, 고속도로→본토 진출 2개인데
+    **교집합 0개**라 완화 전후가 동일했다(1,846 → 1,846). 그런 구역의 고속도로에 차를
+    태우려면 구역 밖에서 들어오는 통과 교통이 필요하다(별도 과제).
+    """
+    net = _as_net(net_or_file)
+    comps = _scc_components(net, vclass)
+    if not comps:
+        return set()
+    main = set(comps[0])
+    fwd, bwd = _routing_graph(net, vclass)
+    return _reachable(main, fwd) & _reachable(main, bwd)
+
+
+def excluded_major_roads(net_or_file, vclass: str = "passenger") -> dict:
+    """통행에 못 쓰이는 **주요 도로**를 종류별로 집계 — "여긴 왜 차가 없지?"의 답.
+
+    주택가 골목이 몇 개 빠지는 건 정상이지만 고속도로·간선이 통째로 빠지면 그 축의
+    교통량이 0이 되고, 기지국·RSU 배치까지 그 지역을 통째로 비운다. 그런데 지금까지
+    그 사실이 **아무 데도 드러나지 않아** 배치 결과만 보고는 원인을 알 수 없었다.
+    """
+    net = _as_net(net_or_file)
+    usable = routable_edges(net, vclass)
+    out: dict[str, dict] = {}
+    for e in net.getEdges():
+        try:
+            if not e.allows(vclass) or e.getID() in usable:
+                continue
+        except Exception:
+            continue
+        t = (e.getType() or "?").split(".")[-1]
+        if t not in _MAJOR_ROAD_TYPES:
+            continue
+        rec = out.setdefault(t, {"count": 0, "lane_km": 0.0})
+        rec["count"] += 1
+        rec["lane_km"] += e.getLength() * e.getLaneNumber() / 1000.0
+    for rec in out.values():
+        rec["lane_km"] = round(rec["lane_km"], 2)
+    return out
 
 
 def component_summary(net_or_file, vclass: str = "passenger") -> dict:

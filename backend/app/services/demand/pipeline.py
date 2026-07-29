@@ -33,6 +33,7 @@ from typing import Callable, Optional, Sequence
 from .assignment import (
     build_taz,
     component_summary,
+    excluded_major_roads,
     map_zones_to_taz,
     net_bbox,
     read_net,
@@ -131,6 +132,16 @@ def build_demand_context(
     log(f"수요 bbox {area[0]:.5f},{area[1]:.5f} ~ {area[2]:.5f},{area[3]:.5f} (ref_lat={ref_lat:.5f})")
     log(f"승용차 그래프: 엣지 {comp['vclass_edges']} / 최대성분 {comp['largest_component']} "
         f"({comp['largest_pct']}%) / 고립 {comp['isolated_edges']}")
+
+    # 주요 도로가 통행 배정에서 빠지면 그 축의 교통량이 0이 되고, 배치까지 그 지역을
+    # 통째로 비운다. 예전에는 이 사실이 아무 데도 안 드러나 결과만 보고는 원인을 알 수
+    # 없었다(2026-07-29: 고속도로 8개가 전부 빠져 우상단 교통량이 0이었다).
+    _excluded = excluded_major_roads(net)
+    if _excluded:
+        _detail = ", ".join(f"{t} {v['count']}개({v['lane_km']:.1f} lane-km)"
+                            for t, v in sorted(_excluded.items(), key=lambda kv: -kv[1]["lane_km"]))
+        log(f"⚠️ 통행에 못 쓰이는 주요 도로: {_detail} — 구역 안에 진입·진출이 모두 있지 "
+            f"않아 통행이 배정되지 않습니다. 이 축의 교통량은 0이 되고 배치도 비게 됩니다.")
 
     buildings, n_buildings = load_building_mass(area)
     if not buildings:
