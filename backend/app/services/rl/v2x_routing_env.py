@@ -82,6 +82,20 @@ from typing import Any, Optional
 
 from app.services.geo.spatial_grid import SpatialGrid
 
+try:
+    from app.services.buildings.building_obstruction_analyzer import (
+        _L_total as _ba_L_total,
+        _L_rsu   as _ba_L_rsu,
+    )
+    _BA_LATENCY_AVAILABLE = True
+except ImportError:
+    _BA_LATENCY_AVAILABLE = False
+
+try:
+    import app.services.routing.route_cost_function as _rcf
+except ImportError:
+    _rcf = None  # type: ignore
+
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 MAX_CANDIDATES: int = 5       # maximum outgoing edges per step
@@ -738,10 +752,28 @@ class V2XRoutingEnv:
             return 50.0
         dist_m = _haversine_m(lat, lng, float(bs.get("lat", 0)), float(bs.get("lng", 0)))
         cov_r = float(bs.get("coverage_radius_m", 400.0))
-        dist_pen = dist_m / max(cov_r, 1.0) * 15.0
-        cong = float(bs.get("congestion_penalty", 0.0))
-        edge_lat = float(bs.get("edge_latency_ms", 5.0))
-        return round(4.0 + dist_pen + cong + edge_lat, 2)
+        is_rsu = str(bs.get("type") or "").lower() in ("rsu", "roadside_unit", "rsu_node")
+        edge_lat = float(bs.get("edge_latency_ms") or (0.5 if is_rsu else 3.0))
+
+        if _BA_LATENCY_AVAILABLE:
+            n_veh = (
+                1
+                + int(bs.get("n_background_vehicles") or 0)
+                + int(bs.get("n_other_devices") or 0)
+                + int(bs.get("n_its_load") or 0)
+            )
+            net_mode = "5G"
+            if _rcf is not None:
+                net_mode = getattr(_rcf, "_active_network_mode", "5G")
+            if is_rsu:
+                return round(_ba_L_rsu(dist_m, cov_r) + edge_lat, 2)
+            else:
+                l_air, _, _, _ = _ba_L_total(dist_m, 0.0, n_veh, net_mode)
+                return round(l_air + edge_lat, 2)
+        else:
+            dist_pen = dist_m / max(cov_r, 1.0) * 15.0
+            cong = float(bs.get("congestion_penalty", 0.0))
+            return round(4.0 + dist_pen + cong + edge_lat, 2)
 
     def _blockage_score(self, lat: float, lng: float, bs: Optional[dict]) -> float:
         if bs is None:

@@ -36,6 +36,9 @@ class ITSTrafficLink:
     speed_kph: float | None
     travel_time_s: float | None
     created_date: str | None
+    # VDS 실교통량 필드 (openapi.its.go.kr /vdsInfo)
+    volume_veh_per_h: float | None = None  # 교통량 [대/시], Little's Law 분자
+    occupancy_pct: float | None = None     # 점유율 [%], 도로 검지기 루프 점유 비율
     raw_payload: dict = field(default_factory=dict)
 
 
@@ -50,4 +53,6 @@ class MatchedTrafficLink:
     geometry_wkt: str | None
     match_method: str
     confidence: float
+    volume_veh_per_h: float | None = None
+    occupancy_pct: float | None = None
 

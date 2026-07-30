@@ -208,10 +208,6 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
   // 실행 중 변경하면 주행 경로와 지연·자원할당 계산이 서로 다른 설정을 쓰게 된다.
   const isConfigLocked = configLocked(sim);
   const [tech, setTech] = useState(sim.mode === '6G' ? '6G' : '5G');
-  const [vals, setVals] = useState(() => {
-    const o = {}; DATA.params.forEach(p => { if (p.type !== 'tech') o[p.v] = p.def; }); return o;
-  });
-  const [saved, setSaved] = useState(false);
   const [buildingStatus, setBuildingStatus] = useState(null);
   // Stage-1: local draft of simulation config (applied on Save)
   const [cfgDraft, setCfgDraft] = useState(() => mergeWithDefaultConfig(simConfig));
@@ -234,12 +230,9 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
 
   function applyTech(t) {
     setTech(t);
-    setVals(v => ({ ...v, ...TECH_PRESETS[t] }));
     if (t !== '4G') dispatch({ type: 'mode', v: t });
     setCfgDraft(d => ({ ...d, policy_options: { ...d.policy_options, network_mode: t } }));
   }
-  function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
-
   function setWeight(k, raw) {
     const v = parseFloat(raw);
     setCfgDraft(d => ({ ...d, cost_weights: { ...d.cost_weights, [k]: isNaN(v) ? 0 : Math.max(0, Math.min(v, 20)) } }));
@@ -332,11 +325,8 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
         <div>
           <div className="eyebrow">Configuration</div>
           <h1>설정 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Settings</span></h1>
-          <div className="sub">통신 기술 파라미터 및 시뮬레이션 시스템 설정</div>
+          <div className="sub">네트워크 모드 및 시뮬레이션 알고리즘 설정</div>
         </div>
-        <button className={'btn ' + (saved ? 'good' : 'primary')} onClick={save}>
-          {saved ? <><Icon.check size={15} /> 저장 완료</> : <><Icon.check size={15} /> 설정 저장</>}
-        </button>
       </div>
 
       {/* 모드 전환 — Lite/Professional, 항상 표시(처음 선택을 나중에 바꿀 수 있는 유일한 통로) */}
@@ -377,41 +367,6 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
           <span style={{ lineHeight: 1.45 }}>6G 수치는 확정 표준이 아닌 연구 목표값입니다 (표준 확정 예정: Release 21, ~2029년). C_tech는 설계 파라미터로 3GPP/ITU 규정값이 아닙니다.</span>
         </div>
       </Card>
-
-      {mode === 'pro' && (
-      <Card title="기술 파라미터" en="Technical parameters"
-        right={
-          <div className="row gap8" style={{ alignItems: 'center' }}>
-            {isConfigLocked && <span className="cfg-lock-note">실행 중 잠김 — 초기화 후 변경</span>}
-            <span className="mono muted" style={{ fontSize: 10 }}>{tech} 프리셋 적용됨</span>
-          </div>
-        }
-        style={{ padding: 0 }}>
-        <fieldset className={'cfg-lock' + (isConfigLocked ? ' locked' : '')} disabled={isConfigLocked}>
-        <div className="tbl-wrap">
-          <table className="tbl">
-            <thead><tr><th>파라미터<span className="en">Parameter</span></th><th>변수<span className="en">Variable</span></th><th style={{ width: 160 }}>값<span className="en">Value</span></th><th>설명<span className="en">Description</span></th></tr></thead>
-            <tbody>
-              {DATA.params.filter(p => p.type !== 'tech').map(p => (
-                <tr key={p.v}>
-                  <td><b style={{ fontWeight: 600 }}>{p.name}</b></td>
-                  <td><span className="chip" style={{ fontFamily: 'var(--mono)' }}>{p.v}</span></td>
-                  <td>
-                    <div className="input-suffix" style={{ width: 140 }}>
-                      <input className="input" style={{ height: 32 }} value={vals[p.v] ?? p.def}
-                        onChange={e => setVals(v => ({ ...v, [p.v]: e.target.value }))} />
-                      {p.unit && <span className="sfx">{p.unit}</span>}
-                    </div>
-                  </td>
-                  <td><span className="muted" style={{ whiteSpace: 'normal', fontSize: 11.5, lineHeight: 1.4 }}>{p.note}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        </fieldset>
-      </Card>
-      )}
 
       {mode === 'pro' && buildingStatus && (
         <Card title="건물 데이터 상태" en="Building data status" style={{ marginTop: 18 }}>

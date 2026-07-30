@@ -30,7 +30,7 @@ from typing import Optional
 from app.services.rl.v2x_routing_env import V2XRoutingEnv, StepResult
 
 
-SUPPORTED_POLICIES = ("random", "greedy", "coverage")
+SUPPORTED_POLICIES = ("random", "greedy", "coverage", "ppo", "dqn")
 
 
 # ── Result types ──────────────────────────────────────────────────────────────

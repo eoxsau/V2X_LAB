@@ -14,9 +14,9 @@ from app.services.standard_link.standard_link_preprocessor import preprocess_sta
 from app.services.standard_link.standard_link_repository import StandardLinkRepository
 
 from .its_cache import ITS_CACHE
-from .its_client import fetch_its_traffic_info
+from .its_client import fetch_its_traffic_info, fetch_vds_traffic_info
 from .its_models import KST, classify_time_period
-from .its_parser import parse_its_traffic_xml
+from .its_parser import parse_its_traffic_xml, parse_vds_traffic_xml
 from .its_standard_link_matcher import match_its_to_standard_links, matched_to_dict
 
 
@@ -159,6 +159,76 @@ class TrafficFusionEngine:
             "time_period": resolved_period,
         }
 
+    def sync_vds(self, *, bbox: dict, time_period: str | None = None) -> dict:
+        """VDS 검지기 실교통량·점유율 동기화.
+
+        ITS trafficInfo(속도·혼잡)와 별개로 vdsInfo(volume, occupancy)를 가져와
+        enriched_links에 volume_veh_per_h / occupancy_pct 필드를 추가/갱신한다.
+
+        - volume_veh_per_h: 실측 교통량 [대/시], Little's Law로 BS 커버리지 내 차량 수 산출
+        - occupancy_pct: 검지기 루프 점유율 [%] → congestion_score 직접 갱신
+        """
+        resolved_period = time_period if time_period in ("peak", "off_peak") else classify_time_period(datetime.now(KST))
+        self.ensure_standard_links()
+        try:
+            xml_text = fetch_vds_traffic_info(
+                min_x=bbox["minX"], max_x=bbox["maxX"],
+                min_y=bbox["minY"], max_y=bbox["maxY"],
+            )
+        except Exception as e:
+            return {"error": str(e), "vds_records": 0, "matched": 0}
+
+        records = parse_vds_traffic_xml(xml_text)
+        if not records:
+            return {"vds_records": 0, "matched": 0, "warnings": ["VDS 응답에 레코드 없음"]}
+
+        links = self.standard_repo.links_in_bbox(bbox["minX"], bbox["minY"], bbox["maxX"], bbox["maxY"])
+        matched, stats = match_its_to_standard_links(records, links)
+
+        # enriched_links에 volume/occupancy 병합 (link_id 기준)
+        vds_by_link: dict[str, dict] = {}
+        for m in matched:
+            if m.standard_link_id:
+                vds_by_link[m.standard_link_id] = {
+                    "volume_veh_per_h": m.volume_veh_per_h,
+                    "occupancy_pct": m.occupancy_pct,
+                }
+                # occupancy가 있으면 congestion_score도 갱신
+                if m.occupancy_pct is not None:
+                    vds_by_link[m.standard_link_id]["congestion_score_vds"] = round(m.occupancy_pct / 100.0, 4)
+
+        for item in ITS_CACHE.enriched_links:
+            lid = item.get("standard_link_id") or item.get("its_link_id")
+            if lid and lid in vds_by_link:
+                item.update(vds_by_link[lid])
+
+        if postgis_available():
+            replace_traffic_snapshots(
+                [
+                    {
+                        "link_id": m.standard_link_id or m.its_link_id,
+                        "speed_kph": m.speed_kph,
+                        "travel_time_s": m.travel_time_s,
+                        "congestion_score": m.congestion_score,
+                        "collected_at": datetime.now(KST),
+                        "raw_payload": {
+                            "volume_veh_per_h": m.volume_veh_per_h,
+                            "occupancy_pct": m.occupancy_pct,
+                            "source": "vds",
+                        },
+                    }
+                    for m in matched
+                ],
+                time_period=resolved_period,
+            )
+
+        return {
+            "vds_records": len(records),
+            "matched": len(matched),
+            "links_updated": len(vds_by_link),
+            "time_period": resolved_period,
+        }
+
     def current_traffic(self, *, time_period: str = "peak") -> dict:
         if postgis_available():
             links = fetch_all_dicts(
@@ -180,6 +250,9 @@ class TrafficFusionEngine:
                         "travel_time_s": item.get("travel_time_s"),
                         "congestion_score": item.get("congestion_score"),
                         "geometry": (item.get("raw_payload") or {}).get("geometry", []),
+                        # VDS 실교통량 (raw_payload에 저장)
+                        "volume_veh_per_h": (item.get("raw_payload") or {}).get("volume_veh_per_h"),
+                        "occupancy_pct": (item.get("raw_payload") or {}).get("occupancy_pct"),
                     }
                     for item in links
                 ],
@@ -196,6 +269,8 @@ class TrafficFusionEngine:
                     "travel_time_s": item.get("travel_time_s"),
                     "congestion_score": item.get("congestion_score"),
                     "geometry": item.get("geometry", []),
+                    "volume_veh_per_h": item.get("volume_veh_per_h"),
+                    "occupancy_pct": item.get("occupancy_pct"),
                 }
                 for item in ITS_CACHE.enriched_links
             ],

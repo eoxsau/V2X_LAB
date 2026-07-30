@@ -1539,7 +1539,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       setBusy(false);
     }
   }
-
   /* ── finalizeArea — real OSM + netconvert via backend ────────── */
   async function finalizeArea(bounds) {
     setArea({ s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() });
@@ -1649,8 +1648,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       });
     } catch (_) { /* 배속은 부가 기능 — 실패해도 시뮬 진행을 막지 않는다 */ }
   }
-
-
   // Lite 전용 예시 시나리오 프리셋 — 학부생이 출발지/도착지를 직접 찍지 않아도 현재 구역
   // 안에서 바로 시작할 수 있게, 구역(area) 내부 좌표를 비율로 계산해 채운다(특정 도시
   // 좌표를 하드코딩하지 않으므로 어떤 구역을 그려도 항상 동작한다).
@@ -2552,7 +2549,6 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
               )}
             </div>
             {!area && <div className="muted" style={{ fontSize: 10.5, marginTop: 2 }}>먼저 구역을 설정하세요</div>}
-
           </div>
           )}
 

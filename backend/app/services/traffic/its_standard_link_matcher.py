@@ -72,6 +72,14 @@ def match_its_to_standard_links(records: list[ITSTrafficLink], links_gdf: gpd.Ge
             continue
 
         link_dict = link_row._asdict()
+
+        # occupancy가 있으면 직접 congestion_score로 사용 (도로 점유율 → 밀도 직접 지표)
+        # occupancy(%) / 100 = 루프 점유 비율 ≈ 정규화 밀도 (Greenshields 유도값보다 신뢰도 높음)
+        if record.occupancy_pct is not None:
+            cong = round(min(record.occupancy_pct / 100.0, 1.0), 4)
+        else:
+            cong = _congestion_score(record.speed_kph, record.travel_time_s, link_dict)
+
         matched.append(
             MatchedTrafficLink(
                 its_link_id=record.link_id,
@@ -79,10 +87,12 @@ def match_its_to_standard_links(records: list[ITSTrafficLink], links_gdf: gpd.Ge
                 road_name=record.road_name or link_dict.get("road_name"),
                 speed_kph=record.speed_kph,
                 travel_time_s=record.travel_time_s,
-                congestion_score=_congestion_score(record.speed_kph, record.travel_time_s, link_dict),
+                congestion_score=cong,
                 geometry_wkt=link_dict["geometry"].wkt if link_dict.get("geometry") is not None else None,
                 match_method=method,
                 confidence=confidence,
+                volume_veh_per_h=record.volume_veh_per_h,
+                occupancy_pct=record.occupancy_pct,
             )
         )
 

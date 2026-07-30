@@ -1,0 +1,42 @@
+# V4 Universal Policy — Additional Dependencies
+# Install on A100 server: pip install -r requirements_v4.txt
+#
+# Base requirements (requirements.txt) must be installed first.
+# Tested with CUDA 11.8 / 12.1 on NVIDIA A100 80 GB.
+
+# ── PyTorch Geometric (GATv2Conv Universal GNN) ───────────────────────────────
+# Install CUDA-specific wheels from https://pytorch-geometric.readthedocs.io
+# Example for CUDA 12.1 + PyTorch 2.3:
+#   pip install torch_geometric
+#   pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+#       -f https://data.pyg.org/whl/torch-2.3.0+cu121.html
+torch_geometric>=2.5.0
+
+# ── Meta-RL / MAML (no second-order required — FOMAML is implemented natively) ─
+# higher>=0.2.1   # optional: for full second-order MAML (not required for FOMAML)
+
+# ── Federated RL ─────────────────────────────────────────────────────────────
+flwr>=1.7.0              # Flower federated learning framework
+flwr-datasets>=0.0.2     # optional: for FL benchmark datasets
+
+# ── LLM API 클라이언트 (Bedrock / Vertex / Azure) ────────────────────────────
+anthropic>=0.40.0        # AWS Bedrock — Claude (BEDROCK_API_KEY)
+google-generativeai>=0.8.0  # Google Vertex AI — Gemini (GCP_API_KEY)
+openai>=1.50.0           # Azure OpenAI (AZURE_AI_API_KEY)
+python-dotenv>=1.0.0     # .env 자동 로드
+
+# ── Sionna GPU Channel Simulation ────────────────────────────────────────────
+# Requires TensorFlow 2.x (different from PyTorch — can coexist on A100)
+sionna>=0.15.0
+tensorflow>=2.14.0,<3.0.0
+tensorflow-probability>=0.23.0
+drjit-cuda>=0.4.4        # Sionna ray tracing backend
+mitsuba>=3.5.0           # 3D scene rendering for Sionna RT
+
+# ── Supporting utilities ─────────────────────────────────────────────────────
+scipy>=1.13.0            # RegularGridInterpolator for channel map lookup
+numpy>=1.26.0
+osmium>=3.7.0            # Python bindings for osmium (OSM PBF extraction)
+# Note: osmium system tool must also be installed:
+#   Ubuntu: apt-get install osmium-tool
+#   macOS:  brew install osmium-tool

@@ -306,6 +306,61 @@ function SectionOverview({ bundle, simLogs, vehiclePos, networkTelemetry, sim })
           </div>
         </Card>
       )}
+
+      {/* ── compact experiment setup (replaces Metadata tab) ── */}
+      {bundle?.scenario_metadata && (() => {
+        const meta = bundle.scenario_metadata;
+        const cfg  = summ?.used_config;
+        const originStr = meta.origin_lat != null ? `${Number(meta.origin_lat).toFixed(5)}, ${Number(meta.origin_lng).toFixed(5)}` : null;
+        const destStr   = meta.dest_lat   != null ? `${Number(meta.dest_lat).toFixed(5)}, ${Number(meta.dest_lng).toFixed(5)}`   : null;
+        return (
+          <details style={{ marginBottom: 16 }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: 12.5, padding: '10px 0', color: 'var(--ink-2)', listStyle: 'none', display: 'flex', alignItems: 'center', gap: 6, userSelect: 'none' }}>
+              <svg width="12" height="12" viewBox="0 0 12 12" style={{ flex: '0 0 auto', transition: 'transform 0.15s' }} className="details-chevron">
+                <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              실험 구성 <span className="muted" style={{ fontWeight: 400, fontSize: 11 }}>Run Setup</span>
+            </summary>
+            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
+              <Card title="런 식별자" en="Run identity" style={{ marginBottom: 0 }}>
+                <div className="col gap4" style={{ fontSize: 12 }}>
+                  {[
+                    ['런 ID',     meta.run_id || rs?.run_id,               true],
+                    ['시나리오 ID', meta.scenario_id || summ?.scenario_id, true],
+                    ['생성 시각',  summ?.generated_at ? new Date(summ.generated_at).toLocaleString('ko-KR') : null, false],
+                    ['시드(seed)', meta.seed ?? null,                       true],
+                    ['차량 수',   meta.vehicle_count != null ? `${meta.vehicle_count}대` : null, false],
+                    ['출발 좌표', originStr,                                 true],
+                    ['도착 좌표', destStr,                                   true],
+                  ].filter(([, v]) => v != null).map(([label, value, mono]) => (
+                    <div key={label} className="row between" style={{ borderBottom: '1px solid var(--border)', paddingBottom: 4 }}>
+                      <span className="muted" style={{ fontSize: 11 }}>{label}</span>
+                      <span style={{ fontFamily: mono ? 'var(--mono)' : undefined, fontSize: 11, fontWeight: 500 }}>{value}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+              <Card title="알고리즘 설정" en="Algorithm config" style={{ marginBottom: 0 }}>
+                <div className="col gap4" style={{ fontSize: 12 }}>
+                  {[
+                    ['네트워크 모드',      meta.network_mode],
+                    ['교통 시간대',        meta.traffic_time_period === 'peak' ? '첨두시 (peak)' : meta.traffic_time_period === 'off_peak' ? '비첨두시' : meta.traffic_time_period],
+                    ['경로 알고리즘',      algoLabel(meta.route_algorithm)],
+                    ['지연 알고리즘',      algoLabel(meta.latency_algorithm)],
+                    ['BS 선택 알고리즘',   algoLabel(meta.bs_selection_algorithm)],
+                    ['자원 할당 알고리즘', algoLabel(meta.resource_allocation_algorithm || meta.allocation_algorithm)],
+                  ].filter(([, v]) => v && v !== '—').map(([label, value]) => (
+                    <div key={label} className="row between" style={{ borderBottom: '1px solid var(--border)', paddingBottom: 4 }}>
+                      <span className="muted" style={{ fontSize: 11 }}>{label}</span>
+                      <span style={{ fontSize: 11, fontWeight: 500 }}>{value}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            </div>
+          </details>
+        );
+      })()}
     </>
   );
 }
@@ -1801,86 +1856,469 @@ function SectionExport({ bundle, simLogs, simHistory, simConfig, networkTelemetr
   );
 }
 
-// ── Metadata section ───────────────────────────────────────────────────────
+// ── Benchmark / Academic Comparison Sheet ─────────────────────────────────
 
-function KVRow({ label, value, mono }) {
+const BS_ALGO_LABELS = {
+  rl_bs_placement:       'RL 기지국 배치 최적화 (GNN-MAML)',
+  lowest_latency_bs:     'Lowest Latency BS',
+  nearest_bs:            'Nearest BS (위치 기반)',
+  load_balanced_bs:      'Load Balanced BS',
+  highest_confidence_bs: 'Highest Confidence BS',
+};
+
+// BS/Route 알고리즘 중 "제안 방법" 키 목록
+const PROPOSED_BS_ALGOS    = new Set(['rl_bs_placement']);
+const PROPOSED_ROUTE_ALGOS = new Set(['rl_routing']);
+const PROPOSED_ALLOC_ALGOS = new Set(['traffic_aware_allocation']);
+
+const ALLOC_ALGO_LABELS = {
+  traffic_aware_allocation:      'Traffic-Aware 할당 (RL 기반)',
+  equal_allocation:              'Equal Allocation (기준선)',
+  load_balancing_allocation:     'Load Balancing',
+  latency_minimizing_allocation: 'Latency Minimizing',
+  priority_based_allocation:     'Priority-Based',
+  lookahead_resource_allocation: 'Look-Ahead',
+};
+
+// rowCategories: 각 행이 'proposed' | 'baseline' | null
+function BenchmarkTablePanel({ id, title, cite, headers, rows, rowCategories, lowerBetter, copiedKey, onCopy }) {
+  // best-value 계산 시 제안 방법 행 제외하지 않음 (모든 행 포함)
+  const bests = headers.slice(1).map((_, ci) => {
+    const lb = lowerBetter?.[ci] ?? true;
+    const vals = rows.map(r => { const v = parseFloat(r[ci + 1]); return isNaN(v) ? null : v; }).filter(v => v !== null);
+    if (!vals.length) return null;
+    return lb ? Math.min(...vals) : Math.max(...vals);
+  });
+  const isEmpty = rows.length === 0;
+
+  // TSV 복사 시 "구분" 컬럼도 포함
+  function handleCopyWithCategory() {
+    const fullHeaders = rowCategories ? ['구분', ...headers] : headers;
+    const fullRows = rows.map((r, ri) => {
+      const cat = rowCategories?.[ri];
+      const catLabel = cat === 'proposed' ? '제안 방법' : cat === 'baseline' ? '비교군' : '';
+      return rowCategories ? [catLabel, ...r] : r;
+    });
+    onCopy(id, fullHeaders, fullRows);
+  }
+
   return (
-    <div className="row between" style={{ padding: '6px 0', borderBottom: '1px solid var(--border)', fontSize: 12 }}>
-      <span className="muted">{label}</span>
-      {mono
-        ? <span className="mono" style={{ fontWeight: 600, fontSize: 11.5 }}>{value ?? '—'}</span>
-        : <span style={{ fontWeight: 500 }}>{value ?? '—'}</span>}
+    <div>
+      {(title || cite) && (
+        <div className="row between" style={{ marginBottom: 6 }}>
+          <div>
+            {title && <span style={{ fontWeight: 600, fontSize: 12.5 }}>{title}</span>}
+            {cite && <span style={{ fontSize: 10, color: 'var(--ink-4)', marginLeft: 8, fontStyle: 'italic' }}>ref: {cite}</span>}
+          </div>
+        </div>
+      )}
+      <div className="row" style={{ justifyContent: 'flex-end', marginBottom: 6 }}>
+        <button
+          className={'btn sm' + (copiedKey === id ? ' good' : '')}
+          disabled={isEmpty}
+          onClick={handleCopyWithCategory}
+          title="탭 구분 텍스트로 복사 — Excel/Word 붙여넣기 가능">
+          {copiedKey === id
+            ? <><Icon.check size={12} /> 복사됨</>
+            : <><Icon.download size={12} /> 표 복사 (TSV)</>}
+        </button>
+      </div>
+      {isEmpty ? (
+        <div style={{ padding: '16px 12px', background: 'var(--surface-2)', borderRadius: 8, textAlign: 'center', fontSize: 11.5, color: 'var(--ink-4)', border: '1px solid var(--border)' }}>
+          비교 실행 버튼을 눌러 데이터를 생성하세요.
+        </div>
+      ) : (
+        <div className="tbl-wrap">
+          <table className="tbl">
+            <thead>
+              <tr>
+                {rowCategories && <th style={{ width: 70 }}>구분</th>}
+                {headers.map((h, i) => <th key={i} className={i > 0 ? 'r' : ''}>{h}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, ri) => {
+                const cat = rowCategories?.[ri];
+                const isProposed = cat === 'proposed';
+                return (
+                  <tr key={ri} style={isProposed ? { background: 'var(--brand-tint)', fontWeight: 700 } : {}}>
+                    {rowCategories && (
+                      <td style={{ whiteSpace: 'nowrap' }}>
+                        {isProposed
+                          ? <span style={{ fontSize: 10, padding: '2px 7px', borderRadius: 4, background: 'var(--brand-2)', color: '#fff', fontWeight: 700 }}>제안</span>
+                          : <span style={{ fontSize: 10, color: 'var(--ink-4)' }}>비교군</span>}
+                      </td>
+                    )}
+                    {row.map((cell, ci) => {
+                      if (ci === 0) return <td key={ci}><span style={{ fontSize: 11.5, fontWeight: isProposed ? 700 : 500 }}>{cell}</span></td>;
+                      const numVal = parseFloat(cell);
+                      const best = bests[ci - 1];
+                      const isBest = best !== null && !isNaN(numVal) && Math.abs(numVal - best) < 0.005;
+                      return (
+                        <td key={ci} className="r">
+                          <span className="num" style={{ fontWeight: isBest ? 700 : 400, color: isBest ? 'var(--good)' : 'inherit' }}>
+                            {cell}
+                          </span>
+                          {isBest && <span style={{ marginLeft: 2, fontSize: 9.5, color: 'var(--good)', verticalAlign: 'super' }}>★</span>}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
-function SectionMetadata({ bundle }) {
-  const meta   = bundle?.scenario_metadata;
-  const summ   = bundle?.simulation_summary;
-  const cfg    = summ?.used_config;
+function SectionBenchmarkSheet({ bundle, simConfig, mode }) {
+  const [cmpData, setCmpData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [copiedKey, setCopiedKey] = useState(null);
+  const [saResult, setSaResult] = useState(null);
+  const [saError, setSaError] = useState(null);
+  const pollRef = useRef(null);
 
-  if (!bundle?.available) {
-    return (
-      <Card title="메타데이터" en="Metadata" style={{ marginBottom: 18 }}>
-        <SectionEmpty msg="시뮬레이션을 실행하면 설정 및 런 식별자가 표시됩니다." />
-      </Card>
-    );
+  function fetchCmp() {
+    fetch(`${API_BASE}/api/route/compare-algorithms`)
+      .then(r => r.json())
+      .then(d => setCmpData(d?.status && d.status !== 'idle' ? d : null))
+      .catch(() => {});
+  }
+  useEffect(() => { fetchCmp(); }, []);
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+
+  function runComparison() {
+    setLoading(true);
+    setSaError(null);
+
+    // Fire SA comparison in parallel (uses cached edge_data from last simulation)
+    const netMode = simConfig?.policy_options?.network_mode || '5G';
+    const trafficPeriod = simConfig?.policy_options?.traffic_time_period || 'peak';
+    fetch(`${API_BASE}/api/placement/compare-with-sa`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ network_mode: netMode, traffic_time_period: trafficPeriod, n_greedy: 2, n_random: 2, sa_iter: 2000 }),
+    })
+      .then(r => r.json())
+      .then(d => { if (d && !d.detail) setSaResult(d); else setSaError(d?.detail || 'SA 비교 실패'); })
+      .catch(e => setSaError(e.message));
+
+    fetch(`${API_BASE}/api/route/compare-algorithms`, { method: 'POST' })
+      .then(() => {
+        if (pollRef.current) clearInterval(pollRef.current);
+        pollRef.current = setInterval(() => {
+          fetch(`${API_BASE}/api/route/compare-algorithms`)
+            .then(r => r.json())
+            .then(d => {
+              if (d.status !== 'running') {
+                clearInterval(pollRef.current);
+                pollRef.current = null;
+                setCmpData(d);
+                setLoading(false);
+              }
+            }).catch(() => {});
+        }, 1500);
+      }).catch(() => setLoading(false));
   }
 
-  const originStr = meta?.origin_lat != null ? `${Number(meta.origin_lat).toFixed(5)}, ${Number(meta.origin_lng).toFixed(5)}` : '—';
-  const destStr   = meta?.dest_lat   != null ? `${Number(meta.dest_lat).toFixed(5)}, ${Number(meta.dest_lng).toFixed(5)}`   : '—';
-  const cw = meta?.cost_weights || {};
-  const ns = meta?.norm_scales  || {};
+  function handleCopy(key, headers, rows) {
+    const lines = [headers.join('\t'), ...rows.map(r => r.join('\t'))];
+    try { navigator.clipboard.writeText(lines.join('\n')); } catch (_) {}
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2200);
+  }
+
+  const algoRows  = bundle?.algorithm_compare || [];
+  const bySel     = cmpData?.by_bs_selection || {};
+  const byAlloc   = cmpData?.by_allocation   || {};
+  const perBsAll  = bundle?.per_bs_metrics   || [];
+  const bsNodes   = perBsAll.filter(n => (n.node_type || 'bs').toLowerCase() !== 'rsu');
+  const rsuNodes  = perBsAll.filter(n => (n.node_type || '').toLowerCase() === 'rsu');
+  const hasData   = cmpData?.status === 'done';
+
+  const statusText = loading ? '비교 실행 중…'
+    : hasData  ? `완료 (${new Date((cmpData?.generated_at ?? 0) * 1000).toLocaleTimeString()})`
+    : '실행 전 — 버튼을 누르면 동일 환경에서 모든 알고리즘을 평가합니다';
+
+  // ① 경로 최적화 ─── proposed: rl_routing / baseline: 나머지 ─────────────
+  const routeHeaders = ['경로 알고리즘', '총 비용', '평균 지연 (ms)', '최대 지연 (ms)', '핸드오버 (회)', 'PRR (%)', '커버리지 (%)'];
+  const routeLB      = [true, true, true, true, false, false];
+
+  const _rlRouteInAlgos = algoRows.some(r => r.algorithm === 'rl_routing');
+  const _allRouteRows   = _rlRouteInAlgos ? algoRows : [
+    // RL 결과가 없을 경우 플레이스홀더 행을 맨 앞에 삽입
+    { algorithm: 'rl_routing', _placeholder: true },
+    ...algoRows,
+  ];
+  const routeRows       = _allRouteRows.map(r => [
+    r._placeholder ? 'RL 경로 최적화 (GNN-MAML)' : algoLabel(r.algorithm),
+    r._placeholder ? '—' : (r.total_cost          != null ? r.total_cost.toFixed(2)                        : '—'),
+    r._placeholder ? '—' : (r.average_latency_ms  != null ? r.average_latency_ms.toFixed(1)               : '—'),
+    r._placeholder ? '—' : (r.max_latency_ms      != null ? r.max_latency_ms.toFixed(1)                   : '—'),
+    r._placeholder ? '—' : (r.handover_count      != null ? String(r.handover_count)                      : '—'),
+    r._placeholder ? '—' : (r.prr_approx          != null ? (r.prr_approx * 100).toFixed(1)              : '—'),
+    r._placeholder ? '—' : (r.disconnection_ratio != null ? ((1 - r.disconnection_ratio) * 100).toFixed(1) : '—'),
+  ]);
+  const routeCategories = _allRouteRows.map(r =>
+    (r.algorithm === 'rl_routing' || r._placeholder) ? 'proposed' : 'baseline'
+  );
+
+  // ② 기지국 선택·배치 ─── proposed: rl_bs_placement / baseline: 나머지 ──
+  const bsHeaders = ['기지국 선택/배치 알고리즘', '평균 지연 (ms)', '총 비용', '핸드오버 (회)', '커버리지 위험 (%)'];
+  const bsLB      = [true, true, true, true];
+
+  // rl_bs_placement를 맨 앞으로, 나머지는 비교군으로
+  const _bsEntries = Object.entries(bySel);
+  const _rlBsEntry  = _bsEntries.find(([id]) => id === 'rl_bs_placement');
+  const _bsBaselines = _bsEntries.filter(([id]) => id !== 'rl_bs_placement');
+  const _bsOrdered   = _rlBsEntry
+    ? [_rlBsEntry, ..._bsBaselines]
+    : [['rl_bs_placement', { _placeholder: true }], ..._bsBaselines];
+
+  const bsRows = _bsOrdered.map(([id, v]) => [
+    BS_ALGO_LABELS[id] || id,
+    v._placeholder ? '—' : (v.avg_latency_ms != null ? v.avg_latency_ms.toFixed(1)        : '—'),
+    v._placeholder ? '—' : (v.total_cost     != null ? v.total_cost.toFixed(2)            : '—'),
+    v._placeholder ? '—' : (v.handover_count != null ? String(v.handover_count)           : '—'),
+    v._placeholder ? '—' : (v.coverage_risk  != null ? (v.coverage_risk * 100).toFixed(1) : '—'),
+  ]);
+  const bsCategories = _bsOrdered.map(([id]) =>
+    PROPOSED_BS_ALGOS.has(id) ? 'proposed' : 'baseline'
+  );
+
+  // ③ 자원할당 ─── proposed: traffic_aware_allocation ─────────────────────
+  const allocHeaders = ['자원할당 알고리즘', 'BS 활용률 (%)', '과부하 BS (개)', '자원 결손 (RB)'];
+  const allocLB      = [false, true, true];
+
+  const _allocEntries  = Object.entries(byAlloc);
+  const _allocProposed = _allocEntries.filter(([id]) => PROPOSED_ALLOC_ALGOS.has(id));
+  const _allocBaseline = _allocEntries.filter(([id]) => !PROPOSED_ALLOC_ALGOS.has(id));
+  const _allocOrdered  = [..._allocProposed, ..._allocBaseline];
+
+  const allocRows = _allocOrdered.map(([id, v]) => [
+    ALLOC_ALGO_LABELS[id] || id,
+    v.total_utilization   != null ? (v.total_utilization * 100).toFixed(1) : '—',
+    v.overloaded_bs_count != null ? String(v.overloaded_bs_count)          : '—',
+    v.total_deficit_rb    != null ? v.total_deficit_rb.toFixed(1)          : '—',
+  ]);
+  const allocCategories = _allocOrdered.map(([id]) =>
+    PROPOSED_ALLOC_ALGOS.has(id) ? 'proposed' : 'baseline'
+  );
+
+  // ④ 기지국·RSU 배치 ─────────────────────────────────────────────────────
+  function makeGroupRow(label, nodes) {
+    if (!nodes.length) return null;
+    const n       = nodes.length;
+    const avgCovR = nodes.reduce((s, x) => s + (x.coverage_radius_m ?? 400), 0) / n;
+    const avgLoad = nodes.reduce((s, x) => s + (x.load_ratio ?? 0), 0) / n;
+    const latNodes = nodes.filter(x => x.avg_latency_on_route_ms != null);
+    const avgLat   = latNodes.length
+      ? latNodes.reduce((s, x) => s + x.avg_latency_on_route_ms, 0) / latNodes.length
+      : null;
+    const totalEdges = nodes.reduce((s, x) => s + (x.affected_edge_count ?? 0), 0);
+    return [
+      label,
+      String(n),
+      avgCovR.toFixed(0),
+      (avgLoad * 100).toFixed(1),
+      avgLat !== null ? avgLat.toFixed(1) : '—',
+      String(totalEdges),
+    ];
+  }
+  const placementHeaders = ['배치 유형', '수량 (개)', '커버리지 반경 (m)', '평균 부하율 (%)', '평균 지연 (ms)', '담당 구간 수'];
+  const placementLB      = [null, false, true, true, false];
+  const placementRows    = [
+    makeGroupRow('기지국 (BS, Uu 인터페이스)', bsNodes),
+    makeGroupRow('노변기지국 (RSU, PC5 사이드링크)', rsuNodes),
+  ].filter(Boolean);
 
   return (
-    <>
-      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
-        {/* ── run identity ── */}
-        <Card title="런 식별자" en="Run identity">
-          <KVRow label="런 ID"       value={meta?.run_id || bundle?.run_summary?.run_id} mono />
-          <KVRow label="시나리오 ID" value={meta?.scenario_id || summ?.scenario_id} mono />
-          <KVRow label="생성 시각"   value={summ?.generated_at ? new Date(summ.generated_at).toLocaleString('ko-KR') : null} />
-          <KVRow label="시드(seed)"  value={meta?.seed ?? '미지정'} mono />
-          <KVRow label="차량 수"     value={meta?.vehicle_count != null ? `${meta.vehicle_count}대` : null} />
-          <KVRow label="시뮬 모드"   value={meta?.sim_mode} />
-          <KVRow label="출발 좌표"   value={originStr} mono />
-          <KVRow label="도착 좌표"   value={destStr} mono />
-        </Card>
-
-        {/* ── algorithm selection ── */}
-        <Card title="알고리즘 설정" en="Algorithm config">
-          <KVRow label="네트워크 모드"      value={meta?.network_mode} />
-          <KVRow label="교통량 배율"        value={meta?.demand_scale_pct != null ? `기준의 ${meta.demand_scale_pct}%` : null} />
-          <KVRow label="경로 알고리즘"      value={algoLabel(meta?.route_algorithm)} />
-          <KVRow label="지연 알고리즘"      value={algoLabel(meta?.latency_algorithm)} />
-          <KVRow label="BS 선택 알고리즘"   value={algoLabel(meta?.bs_selection_algorithm)} />
-          <KVRow label="자원 할당 알고리즘" value={algoLabel(meta?.resource_allocation_algorithm || meta?.allocation_algorithm)} />
-          <KVRow label="선택 알고리즘"      value={algoLabel(summ?.selected_algorithm)} />
-          <KVRow label="기준 알고리즘"      value={algoLabel(summ?.baseline_algorithm)} />
-        </Card>
-      </div>
-
-      {/* ── cost weights + norm scales ── */}
-      <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
-        <Card title="비용 가중치" en="Cost weights">
-          {[['w_distance', '거리'], ['w_time', '이동 시간'], ['w_latency', 'Latency'], ['w_load', 'BS 부하'], ['w_handover', '핸드오버'], ['w_blockage', '신호 차단'], ['w_coverage_risk', '커버리지 위험']].map(([k, lbl]) => (
-            <KVRow key={k} label={lbl} value={cw[k] != null ? Number(cw[k]).toFixed(2) : (cfg?.cost_weights?.[k] != null ? Number(cfg.cost_weights[k]).toFixed(2) : '—')} mono />
-          ))}
-        </Card>
-
-        <Card title="정규화 스케일" en="Norm scales">
-          {[['distance_km', '거리 (km)'], ['time_min', '시간 (min)'], ['latency_ms', 'Latency (ms)'], ['loss_db', '손실 (dB)']].map(([k, lbl]) => (
-            <KVRow key={k} label={lbl} value={ns[k] != null ? Number(ns[k]).toFixed(2) : (cfg?.norm_scales?.[k] != null ? Number(cfg.norm_scales[k]).toFixed(2) : '—')} mono />
-          ))}
-          <div style={{ marginTop: 12 }}>
-            <div className="muted" style={{ fontSize: 11, marginBottom: 6 }}>네트워크 관찰</div>
-            {(summ?.recommendation_text_seed?.network_observations || []).map((t, i) => (
-              <div key={i} style={{ fontSize: 11.5, padding: '4px 0', lineHeight: 1.5 }}>• {t}</div>
-            ))}
+    <div>
+      {/* ── 헤더 배너 ── */}
+      <div style={{
+        padding: '16px 18px', borderRadius: 10, marginBottom: 20,
+        background: 'var(--brand-tint)', border: '1px solid var(--brand-tint2)',
+      }}>
+        <div className="row between" style={{ alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ flex: '1 1 260px' }}>
+            <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 1.2, color: 'var(--brand-2)', fontWeight: 700, marginBottom: 4 }}>
+              Academic Benchmark
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>비교군 시트</div>
+            <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.65 }}>
+              동일 환경(구역·경로·BS 배치)에서 4개 최적화 차원의 알고리즘을 비교합니다.<br />
+              <span style={{ color: 'var(--brand-2)', fontWeight: 600 }}>★</span>
+              {' '}= 해당 지표 최우수값 &nbsp;·&nbsp; 각 표의 "표 복사(TSV)"로 Word·Excel 직접 붙여넣기 가능
+            </div>
           </div>
-        </Card>
+          <div className="col gap8" style={{ alignItems: 'flex-end', flexShrink: 0 }}>
+            <button className={'btn' + (loading ? ' disabled' : '')} onClick={runComparison} disabled={loading}>
+              {loading
+                ? <><Icon.reset size={13} className="spin" /> 비교 실행 중…</>
+                : <><Icon.chart size={13} /> 비교군 실행</>}
+            </button>
+            <div style={{ fontSize: 10, color: 'var(--ink-4)', textAlign: 'right' }}>
+              {statusText}
+            </div>
+          </div>
+        </div>
       </div>
-    </>
+
+      {/* ── ① 경로 최적화 ── */}
+      <Card title="① 경로 최적화 비교" en="Route Optimization" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--ink-4)', marginBottom: 10, lineHeight: 1.6 }}>
+          동일 기지국 배치·자원할당 조건에서 <b>경로탐색 알고리즘만</b> 변경. 평가 기준: 총 비용 · E2E 지연 · PRR.
+          {!_rlRouteInAlgos && (
+            <span style={{ display: 'block', marginTop: 4, color: 'var(--warn)', fontWeight: 600 }}>
+              ※ RL 경로 최적화 결과를 포함하려면 시뮬레이션 탭 → 시트에서 RL 알고리즘 선택 후 <b>전체 비교 실행</b>하세요.
+            </span>
+          )}
+          <span style={{ float: 'right', fontSize: 10, fontStyle: 'italic', color: 'var(--ink-4)' }}>
+            ref: Hung et al. IEEE VTM 2017; Ali et al. IEEE Access 2021
+          </span>
+        </div>
+        <BenchmarkTablePanel
+          id="route" headers={routeHeaders} rows={routeRows} rowCategories={routeCategories} lowerBetter={routeLB}
+          copiedKey={copiedKey} onCopy={handleCopy} />
+      </Card>
+
+      {/* ── ② 기지국 선택·배치 ── */}
+      <Card title="② 기지국 배치 최적화 비교" en="BS Placement / Selection" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--ink-4)', marginBottom: 10, lineHeight: 1.6 }}>
+          동일 경로에서 <b>기지국 선택·배치 정책만</b> 변경.
+          {' '}<span style={{ color: 'var(--brand-2)', fontWeight: 600 }}>제안 방법</span>은 GNN-MAML RL 기반 배치 최적화 (학습 전: Lowest Latency 폴백).
+          <span style={{ float: 'right', fontSize: 10, fontStyle: 'italic', color: 'var(--ink-4)' }}>
+            ref: 3GPP TS 22.186 §5.1; ETSI EN 302 637-2
+          </span>
+        </div>
+        <BenchmarkTablePanel
+          id="bs_sel" headers={bsHeaders} rows={bsRows} rowCategories={bsCategories} lowerBetter={bsLB}
+          copiedKey={copiedKey} onCopy={handleCopy} />
+      </Card>
+
+      {/* ── ③ 자원할당 ── */}
+      <Card title="③ 자원할당 최적화 비교" en="Resource Allocation" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--ink-4)', marginBottom: 10, lineHeight: 1.6 }}>
+          동일 경로·차량 밀도에서 <b>자원할당 알고리즘만</b> 변경.
+          {' '}<span style={{ color: 'var(--brand-2)', fontWeight: 600 }}>제안 방법</span>은 RL 기반 Traffic-Aware 할당. 목표: BS 활용률↑ · 과부하↓ · 자원 결손↓.
+          <span style={{ float: 'right', fontSize: 10, fontStyle: 'italic', color: 'var(--ink-4)' }}>
+            ref: Jain et al. 1984; ETSI TS 102 687 V1.1.1 §5.2
+          </span>
+        </div>
+        <BenchmarkTablePanel
+          id="alloc" headers={allocHeaders} rows={allocRows} rowCategories={allocCategories} lowerBetter={allocLB}
+          copiedKey={copiedKey} onCopy={handleCopy} />
+      </Card>
+
+      {/* ── ④ 기지국·RSU 배치 ── */}
+      <Card title="④ 기지국·RSU 배치 분석 (SA 비교)" en="BS / RSU Placement vs SA Optimal" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: 'var(--ink-4)', marginBottom: 10, lineHeight: 1.6 }}>
+          현재 배치된 노드를 유형별로 집계하고, SA 최적 배치와 성능을 비교합니다.
+          {' '}비교군 실행 버튼을 누르면 SA 비교가 자동으로 함께 실행됩니다.
+          <span style={{ float: 'right', fontSize: 10, fontStyle: 'italic', color: 'var(--ink-4)' }}>
+            ref: 3GPP TS 22.186 §4.2 (Uu/RSU); ETSI EN 302 637-2 §6 (PC5)
+          </span>
+        </div>
+        {placementRows.length === 0 ? (
+          <SectionEmpty msg="시뮬레이션 탭에서 기지국/RSU를 배치하고 시뮬레이션을 실행하세요." />
+        ) : (
+          <BenchmarkTablePanel
+            id="placement" headers={placementHeaders} rows={placementRows} lowerBetter={placementLB}
+            copiedKey={copiedKey} onCopy={handleCopy} />
+        )}
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(4,1fr)', gap: 10, marginTop: 14 }}>
+          <Stat label="기지국 (BS)" icon="antenna" value={bsNodes.length} unit="개" sub="Uu 인터페이스" />
+          <Stat label="RSU" icon="route" value={rsuNodes.length} unit="개" sub="PC5 사이드링크" />
+          <Stat label="총 커버 구간" icon="check"
+            value={perBsAll.reduce((s, n) => s + (n.affected_edge_count ?? 0), 0)} unit="구간" />
+          <Stat label="Jain 공정성" icon="chart"
+            value={bundle?.run_summary?.jain_fairness_index != null
+              ? bundle.run_summary.jain_fairness_index.toFixed(3) : '—'}
+            sub="[0,1] → 1=완전 공정 (Jain 1984)" />
+        </div>
+
+        {/* SA 비교군 결과 */}
+        {saError && (
+          <div style={{ marginTop: 12, padding: '8px 12px', background: 'var(--surface-2)', borderRadius: 8,
+            border: '1px solid var(--border)', color: 'var(--warn)', fontSize: 11.5 }}>
+            SA 비교 실패: {saError}
+          </div>
+        )}
+        {saResult && (() => {
+          const { user, sa_optimal, improvement } = saResult;
+          const saRows = [
+            ['평균 지연 (ms)', user?.avg_latency_ms, sa_optimal?.avg_latency_ms, 'low'],
+            ['P95 지연 (ms)', user?.p95_latency_ms, sa_optimal?.p95_latency_ms, 'low'],
+            ['PRR (%)',        user?.prr_pct,        sa_optimal?.prr_pct,        'high'],
+            ['미커버 구간 (%)', user?.uncovered_pct, sa_optimal?.uncovered_pct,  'low'],
+          ];
+          return (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                SA 최적 배치 vs 현재 배치 비교
+                <span style={{ fontWeight: 400, color: 'var(--ink-3)', fontSize: 11, marginLeft: 8 }}>— 동일 BS/RSU 수, SA 2000회 탐색</span>
+              </div>
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th style={{ fontSize: 11 }}>지표</th>
+                      <th style={{ fontSize: 11 }}>실험군 (현재 배치)</th>
+                      <th style={{ fontSize: 11 }}>비교군 (SA 최적)</th>
+                      <th style={{ fontSize: 11 }}>개선</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {saRows.map(([label, uv, sv, better]) => {
+                      const improved = better === 'low' ? sv < uv : sv > uv;
+                      const diff = better === 'low' ? uv - sv : sv - uv;
+                      return (
+                        <tr key={label}>
+                          <td style={{ fontSize: 11.5 }}>{label}</td>
+                          <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5 }}>{uv != null ? (+uv).toFixed(2) : '—'}</td>
+                          <td style={{ fontFamily: 'var(--mono)', fontSize: 11.5, color: improved ? 'var(--good)' : 'var(--bad)' }}>
+                            {sv != null ? (+sv).toFixed(2) : '—'}
+                          </td>
+                          <td style={{ fontSize: 11, color: improved ? 'var(--good)' : 'var(--bad)' }}>
+                            {diff != null ? (improved ? '▼' : '▲') + Math.abs(diff).toFixed(2) : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {improvement?.sa_cost_improvement_pct != null && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+                  SA 배치 지연 개선율: <b style={{ color: 'var(--good)' }}>{improvement.sa_cost_improvement_pct.toFixed(1)}%</b>
+                  {' '}({improvement.sa_n_candidates}개 후보 중 {improvement.sa_iter}회 탐색)
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </Card>
+
+      {/* ── 논문 인용 가이드 ── */}
+      <div style={{
+        padding: '12px 16px', background: 'var(--surface-2)', borderRadius: 8,
+        border: '1px solid var(--border)', fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.7,
+      }}>
+        <div style={{ fontWeight: 700, color: 'var(--ink-2)', marginBottom: 4 }}>논문 인용 가이드</div>
+        각 표의 <b>표 복사(TSV)</b>는 탭 구분 텍스트를 클립보드에 복사합니다.
+        Word에 직접 붙여넣거나 Excel → LaTeX (booktabs) 변환에 활용하세요.
+        비교는 동일 환경·동일 경로 조건에서 수행되므로 <i>controlled variable</i>로 기재 가능합니다.
+        <br />
+        <span style={{ color: 'var(--ink-4)' }}>
+          통제 변수: 시뮬레이션 구역, 출발지·목적지, BS/RSU 배치, 차량 밀도, ITS 시간대
+          &nbsp;·&nbsp; 독립 변수: 각 패널의 알고리즘 선택
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -1931,12 +2369,11 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
 
   const TAB_OPTIONS = mode === 'pro'
     ? [
-        { v: 'overview',  label: 'Overview'  },
-        { v: 'compare',   label: 'Compare'   },
-        { v: 'channel',   label: '채널·공정성' },
-        { v: 'explain',   label: 'Explain'   },
-        { v: 'export',    label: 'Export'    },
-        { v: 'metadata',  label: 'Metadata'  },
+        { v: 'overview',   label: 'Overview'  },
+        { v: 'compare',    label: 'Compare'   },
+        { v: 'channel',    label: '채널·공정성' },
+        { v: 'benchmark',  label: '비교군 시트' },
+        { v: 'export',     label: 'Export'    },
       ]
     : [{ v: 'explain', label: '분석' }];
 
@@ -1946,7 +2383,7 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
         <div>
           <div className="eyebrow">Analysis Report</div>
           <h1>분석 보고서 <span className="muted" style={{ fontSize: 14, fontWeight: 400 }}>Report</span></h1>
-          <div className="sub">Overview · Compare · Explain · Export · Metadata</div>
+          <div className="sub">Overview · Compare · 채널 · 비교군 · Export</div>
         </div>
         <div className="row gap8">
           {simLogs?.length > 0 && <Chip tone="good" dot>LIVE</Chip>}
@@ -1991,6 +2428,10 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
         <SectionChannel bundle={bundle} />
       )}
 
+      {(!bundleLoading || bundle) && subTab === 'benchmark' && mode === 'pro' && (
+        <SectionBenchmarkSheet bundle={bundle} simConfig={simConfig} mode={mode} />
+      )}
+
       {(!bundleLoading || bundle) && subTab === 'explain' && (
         <SectionExplain bundle={bundle} simLogs={simLogs} mode={mode} simConfig={simConfig} />
       )}
@@ -1999,9 +2440,6 @@ function ReportTab({ sim, simLogs, vehiclePos, networkTelemetry, routeCoords, ro
         <SectionExport bundle={bundle} simLogs={simLogs} simHistory={simHistory} simConfig={simConfig} networkTelemetry={networkTelemetry} routeEdges={routeEdges} mode={mode} />
       )}
 
-      {(!bundleLoading || bundle) && subTab === 'metadata' && mode === 'pro' && (
-        <SectionMetadata bundle={bundle} />
-      )}
     </div>
   );
 }

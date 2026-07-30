@@ -56,6 +56,56 @@ try:
 except ImportError:
     _F31_AVAILABLE = False
 
+# _L_total / _L_rsu: 물리 채널 지연 모델 (3GPP TR 38.901 + M/M/1 큐잉).
+# building_obstruction_analyzer는 geopandas를 쓰지만 _L_total/_L_rsu 자체는
+# geopandas 불필요. 임포트 실패 시 단순 공식으로 폴백한다.
+try:
+    from app.services.buildings.building_obstruction_analyzer import (
+        _L_total as _analyzer_L_total,
+        _L_rsu  as _analyzer_L_rsu,
+    )
+    _ANALYZER_LATENCY_AVAILABLE = True
+except ImportError:
+    _ANALYZER_LATENCY_AVAILABLE = False
+
+# 현재 네트워크 기술 모드 — set_network_mode()로 갱신.
+# 정책 설정이 변경될 때 main.py가 이 값을 동기화한다.
+_active_network_mode: str = "5G"
+
+
+def set_network_mode(mode: str) -> None:
+    """네트워크 기술 모드 갱신 (4G / 5G / 6G).
+
+    main.py의 정책 설정 저장 직후 호출해 _L_total의 TTI·BW·백홀 파라미터를
+    현재 시뮬레이션 모드에 맞게 동기화한다.
+    """
+    global _active_network_mode
+    if mode in ("4G", "5G", "6G"):
+        _active_network_mode = mode
+
+
+def _n_vehicles_from_node(node: dict) -> int:
+    """기지국 노드에서 실효 차량 수를 합산한다.
+
+    구성:
+      1 (ego)
+      + n_background_vehicles (Poisson 배경 차량)
+      + n_other_devices       (보행자 폰·IoT)
+      + n_its_load            (ITS 교통량 환산 V2X 차량)
+
+    출처: main.py _seed_its_congestion_load; _seed_other_device_load 참고.
+    """
+    return (
+        1
+        + int(node.get("n_background_vehicles") or 0)
+        + int(node.get("n_other_devices") or 0)
+        + int(node.get("n_its_load") or 0)
+    )
+
+
+def _is_rsu_node(node: dict) -> bool:
+    return str(node.get("type") or "").lower() in ("rsu", "roadside_unit", "rsu_node")
+
 
 def _build_latency_input(
     mid_lat: float,
@@ -296,11 +346,28 @@ def _find_best_bs_light(
         return None, 0.0, 50.0, 0.0, False
 
     cov_r = float(best_node.get("coverage_radius_m") or 400.0)
-    dist_pen = best_dist_m / max(cov_r, 1.0) * 15.0
-    cong = float(best_node.get("congestion_penalty") or 0.0)
-    edge_lat = float(best_node.get("edge_latency_ms") or 5.0)
-    pred_lat = round(4.0 + dist_pen + cong + edge_lat, 2)
     within_cov = best_dist_m <= cov_r
+    is_rsu = _is_rsu_node(best_node)
+    edge_lat = float(best_node.get("edge_latency_ms") or (0.5 if is_rsu else 3.0))
+
+    if _ANALYZER_LATENCY_AVAILABLE:
+        # 물리 채널 모델 (_L_total: 3GPP TR 38.901 2-Slope + M/M/1 큐잉 + 백홀/코어)
+        # RSU는 PC5 직접 통신 (_L_rsu: 1~3ms 거리 선형 모델, 큐잉·백홀 없음).
+        # n_vehicles에 ITS 교통량(n_its_load)과 배경 기기(n_other_devices) 포함.
+        n_veh = _n_vehicles_from_node(best_node)
+        if is_rsu:
+            pred_lat = round(_analyzer_L_rsu(best_dist_m, cov_r) + edge_lat, 2)
+        else:
+            l_air, _, _, _ = _analyzer_L_total(
+                best_dist_m, 0.0, n_veh, _active_network_mode
+            )
+            pred_lat = round(l_air + edge_lat, 2)
+    else:
+        # 폴백: 단순 선형 공식 (물리 모델 unavailable 시)
+        dist_pen = best_dist_m / max(cov_r, 1.0) * 15.0
+        cong = float(best_node.get("congestion_penalty") or 0.0)
+        pred_lat = round(4.0 + dist_pen + cong + edge_lat, 2)
+
     return best_node, best_dist_m, pred_lat, 0.0, within_cov
 
 
@@ -371,11 +438,29 @@ def _find_best_bs_full(
         return _find_best_bs_light(mid_lat, mid_lng, nodes)
 
     cov_r = float(best_node.get("coverage_radius_m") or 400.0)
-    dist_pen = best_obs.distance_m / max(cov_r, 1.0) * 15.0
-    cong = float(best_node.get("congestion_penalty") or 0.0)
-    edge_lat = float(best_node.get("edge_latency_ms") or 5.0)
-    pred_lat = round(4.0 + dist_pen + cong + best_obs.latency_penalty_ms + edge_lat, 2)
     within_cov = best_obs.distance_m <= cov_r
+    is_rsu = _is_rsu_node(best_node)
+    edge_lat = float(best_node.get("edge_latency_ms") or (0.5 if is_rsu else 3.0))
+
+    if _ANALYZER_LATENCY_AVAILABLE:
+        # 건물 차폐 손실(estimated_penetration_loss_db)을 _L_total의 A_seg_db로 전달 →
+        # SINR 역산 시 정확한 관통 감쇠 반영 (이중 계산 없음 — latency_penalty_ms는 무시).
+        n_veh = _n_vehicles_from_node(best_node)
+        if is_rsu:
+            pred_lat = round(_analyzer_L_rsu(best_obs.distance_m, cov_r) + edge_lat, 2)
+        else:
+            l_air, _, _, _ = _analyzer_L_total(
+                best_obs.distance_m,
+                best_obs.estimated_penetration_loss_db,
+                n_veh,
+                _active_network_mode,
+            )
+            pred_lat = round(l_air + edge_lat, 2)
+    else:
+        dist_pen = best_obs.distance_m / max(cov_r, 1.0) * 15.0
+        cong = float(best_node.get("congestion_penalty") or 0.0)
+        pred_lat = round(4.0 + dist_pen + cong + best_obs.latency_penalty_ms + edge_lat, 2)
+
     return best_node, best_obs.distance_m, pred_lat, best_obs.estimated_penetration_loss_db, within_cov
 
 

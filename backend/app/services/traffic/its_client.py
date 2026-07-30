@@ -16,6 +16,33 @@ def load_its_env() -> tuple[str | None, str | None]:
     return os.getenv("ITS_API_KEY"), os.getenv("ITS_API_BASE_URL") or DEFAULT_ITS_BASE_URL
 
 
+def fetch_vds_traffic_info(*, min_x: float, max_x: float, min_y: float, max_y: float) -> str:
+    """VDS 검지기 교통량·점유율 조회 (openapi.its.go.kr /vdsInfo).
+
+    반환 XML에 volume(대/시), occupancy(%), speed 포함.
+    VDS 검지기가 설치된 링크만 데이터 존재 — 미설치 링크는 Greenshields 폴백 사용.
+    """
+    api_key, base_url = load_its_env()
+    if not api_key:
+        raise RuntimeError("ITS_API_KEY is not configured in backend/.env")
+    url = base_url.rstrip("/") + "/vdsInfo"
+    resp = requests.get(
+        url,
+        params={
+            "apiKey": api_key,
+            "type": "all",
+            "minX": min_x,
+            "maxX": max_x,
+            "minY": min_y,
+            "maxY": max_y,
+            "getType": "xml",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
 def fetch_its_traffic_info(*, min_x: float, max_x: float, min_y: float, max_y: float, traffic_type: str = "all") -> str:
     api_key, base_url = load_its_env()
     if not api_key:
