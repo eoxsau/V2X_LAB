@@ -10,6 +10,7 @@ geopandas>=1.1.0
 shapely>=2.0.0
 pyogrio>=0.12.0
 pyarrow>=24.0.0
+openpyxl>=3.1.0        # 교통량조사 원본 xlsx 파싱 (scripts/preprocess_traffic_survey_gis.py)
 networkx>=3.4.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
