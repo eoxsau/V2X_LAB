@@ -168,12 +168,21 @@ def build_traffic_scenario(
         except Exception as exc:
             log(f"교통 캐시 무시 (읽기 실패: {exc})")
 
-    # 1. N* — 구역당 1회, net 해시 + 수요 범위로 캐시
+    # 1. N* — 구역당 1회, 수요 범위 + 통과 비율로 캐시
+    #
+    # ⚠️ 2026-07-30 — `through_ratio`를 **반드시** 함께 넘긴다. 예전엔 안 넘겨서
+    # N*는 통과 교통 0%로 재고 실제 교통은 30%로 만들었다. 조건이 다르면 N*가 가리키는
+    # 운영점("정체가 생겼다 풀리는 수준")이 실제로 굴리는 교통의 운영점이 아니다.
+    # 통과 통행은 구역을 가로질러 체류시간이 길어 같은 통행 수라도 구역 안 대수가 늘고,
+    # 자유류 통행시간(T_ff)도 함께 길어져 시드까지 달라진다.
+    # 캐시 키에도 넣어야 한다 — 안 넣으면 통과 비율을 바꿔도 옛 N*가 적중한다.
     cell_m = None
     if n_star is None:
         ns = cached_nstar(net_file, str(out), profile, log=log,
-                          bbox=area_bbox, cache_extra={"bbox": [round(v, 6) for v in area_bbox]
-                                                       if area_bbox else None})
+                          bbox=area_bbox, through_ratio=through_ratio,
+                          cache_extra={"bbox": [round(v, 6) for v in area_bbox]
+                                       if area_bbox else None,
+                                       "through": round(through_ratio, 4)})
         n_star = ns.n_star
         # ⚠️ 보정이 쓴 격자 셀 크기를 **그대로** 이어받는다. 다른 크기로 수요를 만들면
         # 분포가 달라져 N*이 가리키던 운영점이 아니게 된다(calibration에서 실어 보낸다).

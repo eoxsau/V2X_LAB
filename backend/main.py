@@ -1374,8 +1374,8 @@ def _resolved_network_mode() -> str:
 def _apply_tech_coverage(nodes: list[dict]) -> list[dict]:
     """커버리지 반경을 현재 network_mode 기준으로 실시간 재해상 (2026-07-16 결정).
 
-    노드에 저장된 고정값(구버전 500m 하드코딩 포함)은 무시한다 — BS는 d_edge
-    (4G 2000 / 5G 1000 / 6G 500m), RSU는 PC5 반경(100/150/250m). 이로써 4G/5G/6G
+    노드에 저장된 고정값(구버전 500m 하드코딩 포함)은 무시한다 — BS·RSU 모두 d_edge
+    (BS 4G 2000 / 5G 1000 / 6G 500m, RSU 4G 312 / 5G 156 / 6G 62m). 이로써 4G/5G/6G
     전환이 기존 배치 노드에도 즉시 반영된다.
     """
     if not F31_AVAILABLE:
@@ -1386,6 +1386,21 @@ def _apply_tech_coverage(nodes: list[dict]) -> list[dict]:
             mode, n.get("type") or n.get("node_type"),
         )
     return nodes
+
+
+def _coverage_radius_for_insert(node_type: str, mode: Optional[str] = None) -> float:
+    """DB에 노드를 넣을 때 기록할 커버리지 반경.
+
+    읽는 쪽은 `_apply_tech_coverage`·`_network_node_response`가 어차피 현재 모드로
+    다시 해상하므로 이 값은 폴백이다. 그래도 **같은 출처**에서 뽑아야 한다 —
+    예전엔 BS만 모드와 무관하게 500m로 박혀서(2026-07-30까지) F31이 없는 환경이나
+    DB를 직접 읽는 코드에서 4G/6G 배치가 5G-500m처럼 보였다.
+
+    mode : 자동 배치처럼 요청이 모드를 직접 지정하는 경로용. None이면 현재 정책 모드.
+    """
+    if F31_AVAILABLE:
+        return f31_resolve_coverage_radius(mode or _resolved_network_mode(), node_type)
+    return 150.0 if str(node_type or "").lower() in ("rsu", "rsu_node") else 500.0
 
 
 def merged_network_nodes() -> list[dict]:
@@ -3372,6 +3387,17 @@ def _demand_bbox() -> Optional[tuple[float, float, float, float]]:
         return None
 
 
+def _through_ratio() -> float:
+    """통과 교통 비율 p — 구역 밖에서 들어와 밖으로 나가는 통행의 **대수 기준** 비중.
+
+    0이면 구역 내부 통행만(종전 동작). N* 보정과 실제 교통 생성이 **같은 값**을 써야 하므로
+    두 경로가 이 한 곳을 본다 — 예전엔 시드·보정 경로가 이 값을 아예 안 받아서, N*는
+    통과 0%로 재고 교통은 30%로 만들었다(2026-07-30).
+    """
+    _pol = _state.get("policy_options") or {}
+    return max(0.0, min(0.9, float(_pol.get("through_traffic_pct", DEFAULT_THROUGH_PCT)) / 100.0))
+
+
 def _traffic_log(m: str) -> None:
     """교통 생성 진행 로그 — 콘솔과 `_state` 양쪽에 남긴다.
 
@@ -3402,9 +3428,7 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
 
     _pol = _state.get("policy_options") or {}
     scale = clamp_demand_scale(float(_pol.get("demand_scale_pct", 100.0)) / 100.0)
-    # 통과 교통 비율 p — 구역 밖에서 들어와 밖으로 나가는 통행의 **대수 기준** 비중.
-    # 0이면 종전과 동일(구역 내부 통행만).
-    through = max(0.0, min(0.9, float(_pol.get("through_traffic_pct", DEFAULT_THROUGH_PCT)) / 100.0))
+    through = _through_ratio()
     cached = _state.get("traffic_scenario")
     # 경로는 반드시 resolve()로 정규화해 비교할 것 — 문자열 그대로 비교하면
     # 'networks/wired.net.xml' vs 'networks\\wired.net.xml'처럼 구분자만 달라도
@@ -3568,8 +3592,11 @@ def _prepare_traffic_async() -> None:
             from app.services.demand.time_profile import build_time_profile
 
             profile = build_time_profile(DEFAULT_WINDOW[0], DEFAULT_WINDOW[1], DEFAULT_STEP_MIN)
+            # 통과 비율은 보정·생성과 **같은 값**을 쓴다. 안 넘기면 배율 UI가 보여주는
+            # "약 몇 대"가 실제로 만들 교통과 다른 조건에서 나온 값이 된다.
             seed, info = estimate_nstar_seed(
                 target_net, str(WORK_DIR / "_demand"), profile, bbox=_demand_bbox(),
+                through_ratio=_through_ratio(),
                 log=lambda m: print(f"[DEMAND] {m}", flush=True))
             # 계산하는 사이에 구역이 바뀌었으면 버린다 — 옛 결과로 새 상태를 덮지 않는다
             if _state.get("net_file") == target_net:
@@ -3620,6 +3647,85 @@ async def demand_status():
     }
 
 
+# OSM에 `lanes` 태그가 없는 도로에 줄 **차로 수 기본값** (방향당).
+#
+# ⚠️ 왜 덮어쓰나 (2026-07-31 실측). 통행 가능 도로의 **83%에 lanes 태그가 없다.**
+# 없으면 netconvert가 SUMO 기본 typemap의 값을 쓰는데 그게 tertiary=1 · residential=1이다.
+# 그런데 **같은 종류인데 태그가 있는 도로**를 세어보니 방향당 중앙 3차로 · 2차로였다:
+#
+#     종류          태그된 도로(실측)        SUMO 기본값     태그 없는 연장
+#     tertiary      중앙 3 · 평균 2.5 (317개)      1          37.7 km
+#     residential   중앙 2 · 평균 1.7 (53개)       1          74.6 km
+#
+# 그 결과 동네 큰길이 1차로가 되고, 1차로는 추월이 안 돼 한 대만 멈춰도 뒤가 통째로 선다.
+# 정체 상위 15개 엣지 중 10개가 이 기본값에서 온 도로였다.
+#
+# 같은 .osm으로 기본값만 바꿔 지은 망 비교(형상은 동일):
+#     기본 1/1  277 lane-km · 1차로 엣지 1854 → 12,000통행에서 동시주행 2,136대(정지 80%)
+#     3/2      420 lane-km · 1차로 엣지  315 → 12,000통행에서 동시주행 1,002대(정지 67%)
+#     교착 문턱  ~13,000 → ~15,000 (+15%)
+#
+# ⚠️ 이 값은 **상한 쪽 추정이다.** 지도를 그리는 사람들이 큰 도로부터 태그하는 경향이 있어
+# 태그된 표본이 실제보다 넓을 수 있다. 교통량이 과대하게 나오면 여기부터 2/1로 낮춰볼 것.
+OSM_LANE_DEFAULTS: dict[str, int] = {
+    "highway.tertiary": 3,
+    "highway.residential": 2,
+}
+
+# 신호등 추정 임계값 (m/s) — 교차로 진입차로들의 **제한속도 합**이 이 값을 넘으면 신호를 단다.
+#
+# ⚠️ 2026-07-31 — netconvert 기본값 69.4444를 그대로 쓰면 안 되는 이유. 위에서 차로 수를
+# 올리자 진입차로가 늘어 속도 합도 함께 커졌고, **신호등이 77 → 242개로 3배** 뛰었다.
+# 도로 폭을 고친 것과 신호등 개수는 원래 무관해야 하는데 딸려 움직인 것이다.
+#
+# 안양 구역(19.8 km²) 실측 — 차로 3/2 적용 상태에서 임계값만 바꿔가며:
+#     69.4(기본)  242개  12.2/km²   ← 차선 보정의 부작용
+#     90.0        113개   5.7/km²
+#    130.0         66개   3.3/km²   ← 차선 보정 전(77개)과 같은 수준
+#    200.0         55개   2.8/km²   ← OSM에 실제로 태그된 신호만 남음(추정 0)
+#
+# 130을 택한 근거: 차선 보정 **전과 같은 신호 밀도**를 유지한다. 즉 차로 수 변경이
+# 신호 개수에 영향을 주지 않게 되돌리는 값이지, 신호를 새로 줄이는 것이 아니다.
+#
+# 참고: 신호 개수 자체는 교착 문턱에 거의 영향이 없었다(242개 vs 55개로 77% 줄여도
+# 동시주행 1,465 vs 1,375로 차이 없음). 그래도 맞춰두는 이유는 **원인과 결과가 엉키면
+# 다음 실험을 못 믿게 되기 때문**이다.
+TLS_GUESS_THRESHOLD = 130.0
+
+
+def _osm_typemap() -> Optional[Path]:
+    """`OSM_LANE_DEFAULTS`를 적용한 netconvert 타입 파일 경로. 못 만들면 None.
+
+    SUMO가 설치와 함께 주는 `osmNetconvert.typ.xml`을 **읽어서 숫자만 바꿔** 쓴다.
+    통째로 복사해 두지 않는 이유: 그 파일엔 도로 종류 수십 개의 속도·우선순위·통행권이
+    들어 있고 SUMO 판올림마다 바뀐다. 사본을 두면 그 갱신을 놓친 채 굳는다.
+    여기서는 우리가 **의도적으로 다르게 두려는 값만** 표현한다.
+    """
+    import re as _re          # main.py는 re를 최상위에서 임포트하지 않는다(기존 관례)
+
+    if not SUMO_HOME:
+        return None
+    base = Path(SUMO_HOME) / "data" / "typemap" / "osmNetconvert.typ.xml"
+    if not base.exists():
+        print(f"[NET] SUMO 타입 파일을 찾지 못해 차로 기본값을 덮어쓰지 않습니다: {base}", flush=True)
+        return None
+    try:
+        text = base.read_text(encoding="utf-8")
+        for type_id, lanes in OSM_LANE_DEFAULTS.items():
+            text, n = _re.subn(
+                rf'(<type id="{_re.escape(type_id)}"\s+)numLanes="\d+"',
+                rf'\g<1>numLanes="{lanes}"', text)
+            if n == 0:
+                print(f"[NET] ⚠️ 타입 파일에서 {type_id}를 찾지 못했습니다 — SUMO 판이 바뀐 듯합니다",
+                      flush=True)
+        out = WORK_DIR / "osmNetconvert.lanes.typ.xml"
+        out.write_text(text, encoding="utf-8")
+        return out
+    except OSError as exc:
+        print(f"[NET] 타입 파일 생성 실패 — 기본값으로 진행합니다: {exc}", flush=True)
+        return None
+
+
 def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     """Convert OSM to SUMO network with netconvert.
 
@@ -3633,10 +3739,13 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     (실측: 영등포 구역 8개, 안양·의왕 구역 19개) --tls.guess-signals 만으로는 net에 신호가
     거의 생기지 않는다. 신호가 없으면 교차로 대기가 없어 정체가 "생겼다 풀리는" 현상 자체가
     안 나오므로 --tls.guess로 주요 교차로에 신호를 추정 생성한다(영등포 구역 2개 → 11개).
-    다만 --tls.guess는 --tls.guess.threshold(교차로 진입차로 속도 합, 기본 250)를 넘는
-    교차로에만 붙으므로 효과가 구역마다 크게 다르다 — 안양·의왕 구역은 기본 임계값에서 8개
-    그대로였고 임계값을 50까지 낮춰야 33개가 됐다. 정체가 안 생기면 이 임계값을 먼저 의심할 것.
-    과생성은 뒤따르는 --tls.discard-simple이 단순 교차로에서 걸러낸다.
+    다만 --tls.guess는 --tls.guess.threshold(교차로 진입차로 **속도 합**)를 넘는 교차로에만
+    붙으므로 효과가 구역마다 크게 다르다. 과생성은 뒤따르는 --tls.discard-simple이 단순
+    교차로에서 걸러낸다. 임계값은 아래 TLS_GUESS_THRESHOLD 참조.
+
+    ⚠️ 단위 주의: 이 옵션은 **m/s**를 받는다. netconvert 기본값은 69.4444(= 250 km/h)인데
+       예전 주석이 "기본 250"이라고만 적어둬서 km/h로 오해하기 쉬웠다(2026-07-31에 실제로
+       250~650을 시험했다가 전부 기본값의 3.6~9.4배라 신호가 아예 안 생겼다).
     """
     netconvert_bin = resolve_binary("netconvert")
     if not netconvert_bin:
@@ -3653,6 +3762,7 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
         "--ramps.guess",
         "--junctions.join",
         "--tls.guess",
+        "--tls.guess.threshold", f"{TLS_GUESS_THRESHOLD}",
         "--tls.guess-signals",
         "--tls.discard-loaded",
         "--tls.discard-simple",
@@ -3660,6 +3770,10 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
         "--no-warnings",
         "--log", str(log_file),
     ]
+    # OSM에 lanes 태그가 없는 도로의 차로 기본값을 올린다 (근거는 OSM_LANE_DEFAULTS 주석).
+    typemap = _osm_typemap()
+    if typemap is not None:
+        args += ["--type-files", str(typemap)]
     if bbox is not None:
         args += ["--keep-edges.in-geo-boundary", f"{bbox.w},{bbox.s},{bbox.e},{bbox.n}"]
     print(f"[NET] Running netconvert: {osm_file.name} → {net_file.name}", flush=True)
@@ -7164,9 +7278,7 @@ async def create_network_node(req: NetworkNodeCreateRequest):
             if best_id:
                 placed_lat = nodes_g[best_id]["lat"]
                 placed_lng = nodes_g[best_id]["lng"]
-        network_mode = (_state.get("policy_options") or {}).get("network_mode", "5G")
-        from app.services.buildings.building_obstruction_analyzer import _RSU_COVERAGE_RADIUS_M
-        cov_r = _RSU_COVERAGE_RADIUS_M.get(network_mode, 150.0)
+        cov_r = _coverage_radius_for_insert("rsu")
         rsu_num = sum(1 for n in (_state.get("network_nodes") or [])
                       if str(n.get("type") or "").lower() in ("rsu", "rsu_node"))
         name = f"RSU-{rsu_num + 1}"
@@ -7201,7 +7313,7 @@ async def create_network_node(req: NetworkNodeCreateRequest):
             "load": 0.0,
             "congestion_score": 0.0,
             "edge_latency_ms": 3.0,    # MEC/앱서버 처리 지연 (백홀+코어는 _L_total)
-            "coverage_radius_m": 500.0,
+            "coverage_radius_m": _coverage_radius_for_insert(req.node_type),
             "source": "user_created",
             "antenna_height_m": placement.antenna_height_m,
             "antenna_placement": placement.placement_type,
@@ -7277,7 +7389,6 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
     from app.services.placement.auto_placement import build_pool, blue_noise_place, nearest_neighbor_cv, PlacePoint
     from app.services.placement.sa_placement import optimize_placement
     from app.services.buildings.bs_placement import resolve_placement
-    from app.services.buildings.building_obstruction_analyzer import _RSU_COVERAGE_RADIUS_M
 
     if req.replace_existing:
         delete_user_created_network_nodes()
@@ -7377,7 +7488,7 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
                 "load": 0.0,
                 "congestion_score": 0.0,
                 "edge_latency_ms": 3.0,
-                "coverage_radius_m": 500.0,
+                "coverage_radius_m": _coverage_radius_for_insert("base_station", mode),
                 "source": "user_created",
                 "antenna_height_m": placement.antenna_height_m,
                 "antenna_placement": placement.placement_type,
@@ -7392,7 +7503,7 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
         if not rsu_pts and method != "sa":
             warnings.append("RSU 후보 교차로(degree≥3)가 없어 RSU를 배치하지 못했습니다.")
         cv_rsu = nearest_neighbor_cv(rsu_pts)
-        cov = _RSU_COVERAGE_RADIUS_M.get(mode, 150.0)
+        cov = _coverage_radius_for_insert("rsu", mode)
         num = rsu_base
         for p in rsu_pts:
             num += 1
@@ -7613,7 +7724,7 @@ async def compare_placement_with_sa(req: PlacementCompareRequest):
     from app.services.placement.sa_placement import (
         optimize_placement,
         _TECH_PARAMS as SA_TECH_PARAMS,
-        _RSU_COVERAGE_RADIUS_M as SA_RSU_COV,
+        _coverage_radius as sa_coverage_radius,
     )
 
     graph = _state.get("mock_graph")
@@ -7698,12 +7809,12 @@ async def compare_placement_with_sa(req: PlacementCompareRequest):
     # ── 5. SA 배치 → node dict 변환 ─────────────────────────────────────────
     def _sa_placed_to_node(p: dict, node_type: str) -> dict:
         tech = SA_TECH_PARAMS.get(mode, SA_TECH_PARAMS["5G"])
+        # 반경은 SA가 자리를 고를 때 쓴 것과 **같은 함수**로 뽑는다(formula_v31 d_edge).
+        cov_r = sa_coverage_radius(mode, node_type)
         if node_type == "rsu":
-            cov_r = SA_RSU_COV.get(mode, 150.0)
             edge_lat = 1.5
             capacity = 50.0
         else:
-            cov_r = tech["coverage_radius_m"]
             edge_lat = tech["L_base"]
             capacity = float(tech["C_tech"])
         return {

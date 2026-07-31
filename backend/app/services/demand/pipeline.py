@@ -65,7 +65,29 @@ DEFAULT_CELL_M = 300.0        # §3-2. BS 커버엔 충분, RSU는 엣지별 교
 # 즉 "OD 라인 수의 1%"라는 예전 규칙은 **통행당 셀 4~5 구간에서 잰 값**이고, 통행당 30
 # 구간으로 외삽하면 안 된다. 아래 비율을 넘지 않도록 셀을 키운다.
 MAX_OD_CELLS_PER_TRIP = 5.0
-MAX_CELL_M = 1000.0           # 이 이상 키우면 배치 최적화가 보는 공간 해상도가 무의미해진다
+
+# 셀 크기 상한 — 적응형 확대가 여기서 멈춘다.
+#
+# ⚠️ 2026-07-31 — 1000m에서 400m로 내렸다. 이전 값은 사실상 무제한이라 안양 구역에서
+# **734m까지 커졌고**, 그 결과 칸 하나에 아파트 단지가 통째로 들어가 수백 대가 큰길
+# 한두 개에서 쏟아졌다(도로 1.5%가 출발의 30%를 담당).
+#
+# 셀 크기별 정확도 실측 (안양, 차선 보정 후 net, 요청 통행 대비 최종 차량 수):
+#
+#     요청      400m    500m    734m
+#      5,000    131%    101%     88%
+#      8,000    110%     92%     87%
+#     11,000    103%     89%     86%
+#     15,000     96%     87%     85%
+#
+# ⚠️ 400m는 **통행량에 민감하다**(96~131%, 35%p 변동). N* 보정은 5,000~15,000을 오가며
+# 여러 레벨을 비교하는데, 레벨마다 요청→차량 비율이 다르면 그 비교가 성립하지 않는다.
+# 734m은 85~88%로 **일정하게 부족**해서 오히려 비교엔 안전했다(대신 항상 13% 모자람).
+# 500m가 그 중간(87~101%)이다.
+#
+# 지금은 공간 해상도를 우선해 400m를 택했다. 보정이 불안정해지면(레벨 간 판정이 뒤집히면)
+# **이 값을 500으로 올리는 것이 첫 번째 대응**이다.
+MAX_CELL_M = 400.0
 DEFAULT_LAMBDA = 0.9999       # §6-5. λ=0은 고밀도 도심에서 통행거리가 셀크기로 붕괴
 DEFAULT_MAX_REASSIGN_M = 900.0  # 셀 3칸. "걸어서 큰길까지" 정도가 타당한 상한
 
@@ -112,9 +134,14 @@ def build_demand_context(
     max_reassign_m: float = DEFAULT_MAX_REASSIGN_M,
     bbox_margin_m: Optional[float] = None,
     bbox: Optional[tuple[float, float, float, float]] = None,
+    through_ratio: float = 0.0,
     log: Optional[Callable[[str], None]] = None,
 ) -> DemandContext:
     """`generate_demand`의 통행량-무관 앞단을 한 번만 수행한다 (DemandContext 참조).
+
+    through_ratio : 앞단 계산에는 쓰이지 **않고**(통과 교통은 통행량 단계에서 붙는다)
+        배제된 주요 도로 경고 문구를 정확히 쓰기 위해서만 참조한다 — 통과 교통이 켜져
+        있으면 "교통량 0"이 거짓이 되므로.
 
     cell_size_m : 격자 셀 한 변(m). None이고 `design_trips`를 주면 `fit_cell_size`로
         자동 결정한다(둘 다 없으면 DEFAULT_CELL_M).
@@ -139,12 +166,28 @@ def build_demand_context(
     # 주요 도로가 통행 배정에서 빠지면 그 축의 교통량이 0이 되고, 배치까지 그 지역을
     # 통째로 비운다. 예전에는 이 사실이 아무 데도 안 드러나 결과만 보고는 원인을 알 수
     # 없었다(2026-07-29: 고속도로 8개가 전부 빠져 우상단 교통량이 0이었다).
-    _excluded = excluded_major_roads(net)
+    #
+    # ⚠️ 2026-07-30 — 문구를 세 갈래로 나눴다. 예전엔 배제되면 무조건 "교통량은 0이 되고
+    # 배치도 비게 됩니다"라고 했는데, 통과 교통이 켜져 있으면 **거짓이다**(안양 실측:
+    # 배제된 고속도로가 차량의 15.8%를 나른다). 거짓 경고는 이미 해결된 문제를 미해결로
+    # 보이게 만들고, 진짜로 비어 있는 축을 찾는 데 방해가 된다.
+    _excluded = excluded_major_roads(net, bbox=area)
     if _excluded:
+        _thr = sum(v["through_lane_km"] for v in _excluded.values())
+        _dead = sum(v["dead_lane_km"] for v in _excluded.values())
         _detail = ", ".join(f"{t} {v['count']}개({v['lane_km']:.1f} lane-km)"
                             for t, v in sorted(_excluded.items(), key=lambda kv: -kv[1]["lane_km"]))
-        log(f"⚠️ 통행에 못 쓰이는 주요 도로: {_detail} — 구역 안에 진입·진출이 모두 있지 "
-            f"않아 통행이 배정되지 않습니다. 이 축의 교통량은 0이 되고 배치도 비게 됩니다.")
+        if _dead > 0.1:
+            log(f"⚠️ 어떤 통행도 못 쓰는 주요 도로 {_dead:.1f} lane-km — 구역 안에 진입·진출이 "
+                f"모두 없고 망의 끝(통과 교통의 문)에도 닿지 않습니다. 이 축의 교통량은 0이 "
+                f"되고 배치도 비게 됩니다. (배제된 주요 도로 전체: {_detail})")
+        if _thr > 0.1 and through_ratio > 0.0:
+            log(f"ℹ️ 구역 내부 통행이 못 쓰는 주요 도로 {_thr:.1f} lane-km — 다만 통과 교통"
+                f"({through_ratio * 100:.0f}%)이 이 축을 지나갑니다(잘린 고속도로 등). "
+                f"내부 통행만으로는 비어 보이는 것이 정상입니다.")
+        elif _thr > 0.1:
+            log(f"⚠️ 주요 도로 {_thr:.1f} lane-km가 비어 있습니다 — **통과 교통을 켜면** "
+                f"이 축이 쓰입니다(policy_options.through_traffic_pct). 지금은 0%입니다.")
 
     buildings, n_buildings = load_building_mass(area)
     if not buildings:
@@ -539,7 +582,7 @@ def generate_demand(
             log("⚠️ 수요 범위를 net 전체로 잡습니다 — 그린 구역을 넘겨주면 훨씬 싸집니다(docstring 참조)")
         context = build_demand_context(
             net_file, cell_size_m=cell_size_m, lam=lam, max_reassign_m=max_reassign_m,
-            bbox_margin_m=bbox_margin_m, bbox=bbox, log=log)
+            bbox_margin_m=bbox_margin_m, bbox=bbox, through_ratio=through_ratio, log=log)
 
     net_path = context.net_file
     net = context.net

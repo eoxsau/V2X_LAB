@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from .assignment import read_net, routable_edges
+from .assignment import gate_routable_edges, read_net, routable_edges
 from .pipeline import DEFAULT_CELL_M, build_demand_context, generate_demand
 from .simulation import DEFAULT_STEP_LENGTH, run_simulation
 
@@ -74,14 +74,27 @@ HIGH_HALTING_NOTE = 0.85     # 이 위는 "매우 빡빡" 표시만 — 해소�
 # 너무 낮으면 정체가 덜할 뿐이지만, 너무 높으면 시뮬 자체가 무의미해진다.
 DEFAULT_SAFETY_FACTOR = 0.9
 
-# 1라운드에서 굴려볼 레벨 — 시드 대비 비율. **확실히 아래에서 출발한다**(2026-07-28).
+# 시드를 얼마나 믿는가 — 1라운드를 시드의 **몇 배 지점에 중심**을 두고 펼칠지.
 #
-# 시드 공식의 T_ff는 *자유류* 통행시간이라, 정체가 실제로 생기는 수준에서는 통행시간이
-# 3~4배로 늘어 밀도가 그만큼 과소평가된다. 즉 시드는 항상 실제 N*보다 크게 나온다.
-# 안양 실측: 시드 23,907 → 20,321통행에서 순간이동이 도착 대수를 넘는 완전 교착.
-# 실제 N*는 시드의 0.2~0.5배 어딘가다. 빗나가더라도 'low' 실행은 수십 초에 끝나지만
-# 'high'(교착) 실행은 수십 분이 걸리므로, 낮게 시작하는 쪽이 압도적으로 싸다.
-FIRST_ROUND_FRACS = (0.20, 0.35, 0.50, 0.70)
+# ⚠️ 2026-07-31 — 예전엔 `FIRST_ROUND_FRACS = (0.20, 0.35, 0.50, 0.70)`처럼
+# "시드 대비 비율"을 직접 박아뒀다. 그 비율은 **시드가 항상 4배쯤 크다는 사실을
+# 미리 반영해 낮춰 잡은 값**이었다 — 즉 틀린 시드를 다른 상수로 상쇄하고 있었다.
+# 그러면 나중에 시드를 실측 기반으로 고쳐 정확해지는 순간, 이 비율이 **너무 낮은 곳만
+# 뒤지게** 되어 답을 못 찾는다. 두 관심사를 분리한다:
+#
+#     SEED_TRUST      — 시드가 실제의 몇 배인가 (시드 공식을 고치면 이 값을 1.0으로)
+#     SEARCH_SPREAD   — 그 중심 주위로 얼마나 넓게 펼칠까 (탐색 모양, 시드와 무관)
+#
+# 지금 SEED_TRUST=0.25인 근거 (안양, 차선·신호·칸 보정 후 실측):
+#     시드 44,968  vs  실제 통과 최대 ~11,000  →  0.24
+# 시드 공식의 T_ff는 *자유류* 통행시간이라 정체 구간에서 3~4배로 늘어난다. 즉 시드는
+# 원리적으로 크게 나오고, k_target=2.8이 근거 없는 값이라 그 위에 오차가 더 얹힌다.
+SEED_TRUST = 0.25
+
+# 중심 대비 배수 — 3배 폭. 아래쪽을 촘촘히 두는 이유는 **비용 비대칭** 때문이다.
+# 'low' 실행은 ~180초에 끝나지만 'high'(교착)는 320~380초가 걸린다(실측). 위쪽을 촘촘히
+# 깔면 비싼 실행만 골라 밟는다.
+SEARCH_SPREAD = (0.5, 0.75, 1.0, 1.5)
 
 # 조기 종료가 성급해지지 않게 하는 하한 — 도착이 이보다 적으면 순간이동 비율을 안 본다.
 # (초반 몇십 대 구간에서는 텔포 2~3건만으로도 비율이 튄다)
@@ -109,7 +122,8 @@ def _log_noop(_: str) -> None:
 
 def network_lane_km(net_or_file, vclass: str = "passenger",
                     largest_component_only: bool = True,
-                    bbox: Optional[tuple[float, float, float, float]] = None) -> float:
+                    bbox: Optional[tuple[float, float, float, float]] = None,
+                    through_bbox: Optional[tuple[float, float, float, float]] = None) -> float:
     """통행 가능한 도로의 **차로연장**(lane-km).
 
     엣지 연장이 아니라 차로 수를 곱한 값이다 — 2차로 도로는 차를 두 배 담는다.
@@ -119,9 +133,26 @@ def network_lane_km(net_or_file, vclass: str = "passenger",
         수요를 그린 구역으로 좁혔으면(pipeline.generate_demand의 bbox) 여기도 같이 좁혀야
         한다 — 수요가 안 깔리는 도로까지 분모에 넣으면 시드가 그만큼 부풀기 때문이다.
         안양 실측: net 전체 211 lane-km vs 그린 구역에 걸친 것만 177 lane-km.
+
+    through_bbox : **통과 교통이 켜져 있을 때만** 준다. 그러면 통행 가능 판정을
+        `gate_routable_edges`(문을 O/D로 인정)로 바꾼다.
+
+        ⚠️ 왜 필요한가 (2026-07-30). 잘린 고속도로는 구역 내부 통행으로는 못 쓰지만
+        통과 교통은 실제로 그 위를 달린다(안양 실측: 차량의 15.8%, 주행거리의 10.8%).
+        그런데 `routable_edges` 기준으로 재면 그 도로가 **분모에서 빠진다** —
+        211.0 vs 256.3 lane-km로 18% 과소평가되고, 시드가 lane_km에 정비례하므로
+        시드도 그만큼 낮게 나온다. 차가 달리는 도로는 분모에 있어야 한다.
+
+        반대로 통과 교통이 꺼져 있으면 문에 차가 안 깔려 고속도로가 실제로 비므로
+        `routable_edges` 쪽이 사실에 맞다. 그래서 조건부로 둔다.
     """
     net = read_net(str(net_or_file)) if isinstance(net_or_file, (str, Path)) else net_or_file
-    keep = routable_edges(net, vclass) if largest_component_only else None
+    if not largest_component_only:
+        keep = None
+    elif through_bbox is not None:
+        keep = gate_routable_edges(net, through_bbox, vclass)
+    else:
+        keep = routable_edges(net, vclass)
     total = 0.0
     for e in net.getEdges():
         try:
@@ -217,7 +248,8 @@ def estimate_nstar_seed(
     """
     log = log or _log_noop
     # 수요를 그린 구역으로 좁혔으면 분모(lane_km)도 같이 좁힌다 — 안 그러면 시드가 부푼다
-    lane_km = _lane_km(net_file, demand_kwargs.get("bbox"), log)
+    lane_km = _lane_km(net_file, demand_kwargs.get("bbox"), log,
+                       demand_kwargs.get("through_ratio", 0.0))
     r_peak = peak_rate_per_hour(time_profile)
 
     d = generate_demand(net_file=net_file, out_dir=out_dir, total_trips=ref_trips,
@@ -269,8 +301,11 @@ def _verdict(sim) -> str:
     return "ok"
 
 
-def _lane_km(net_file, bbox, log) -> float:
+def _lane_km(net_file, bbox, log, through_ratio: float = 0.0) -> float:
     """그린 구역에 걸치는 lane-km. 0이 나오면 net 전체로 폴백한다.
+
+    through_ratio > 0이면 통과 교통이 쓰는 도로(잘린 고속도로 등)까지 분모에 넣는다 —
+    근거는 `network_lane_km`의 through_bbox 설명.
 
     ⚠️ bbox를 넓혀서 재면 안 된다 (2026-07-28 회귀). `_edge_touches_bbox`는 형상점이
     **하나라도** 들어오면 포함시키므로, 구역을 300m만 넓혀도 구역을 스치는 긴 엣지가 전부
@@ -281,8 +316,15 @@ def _lane_km(net_file, bbox, log) -> float:
     od2trips "No vehicles loaded"로 죽는데, 원인이 어디에도 안 드러난다. 애초에 그런 구역은
     `MIN_SETUP_AREA_KM2`가 막지만, 도로가 없는 산·바다 구역은 크기와 무관하게 나올 수 있다.
     """
-    lane_km = network_lane_km(net_file, bbox=bbox)
+    # 문 인식은 bbox가 있어야 성립한다(문은 그 경계를 기준으로 정해진다)
+    thr_bbox = bbox if (through_ratio > 0.0 and bbox is not None) else None
+    lane_km = network_lane_km(net_file, bbox=bbox, through_bbox=thr_bbox)
     if lane_km > 0 or bbox is None:
+        if thr_bbox is not None:
+            plain = network_lane_km(net_file, bbox=bbox)
+            if lane_km - plain > max(plain * 0.02, 1.0):
+                log(f"통과 교통이 쓰는 도로를 분모에 포함: {plain:.1f} → {lane_km:.1f} lane-km "
+                    f"(+{(lane_km / max(plain, 1e-9) - 1) * 100:.0f}%) — 잘린 고속도로 등")
         return lane_km
     lane_km = network_lane_km(net_file)
     log(f"⚠️ 그린 구역에 걸치는 도로가 없어 net 전체로 잽니다 ({lane_km:.1f} lane-km) — "
@@ -314,10 +356,11 @@ def calibrate_nstar(
     k_target: float = K_TARGET,
     max_rounds: int = 3,
     n_parallel: Optional[int] = None,
-    first_round_fracs: Sequence[float] = FIRST_ROUND_FRACS,
+    seed_trust: float = SEED_TRUST,
+    search_spread: Sequence[float] = SEARCH_SPREAD,
     lane_km: Optional[float] = None,
-    up_factor: float = 1.35,
-    down_factor: float = 0.7,
+    up_factor: float = 2.0,
+    down_factor: float = 0.5,
     tolerance: float = DEFAULT_TOLERANCE,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
     step_length: float = DEFAULT_STEP_LENGTH,
@@ -332,7 +375,9 @@ def calibrate_nstar(
        실제 정체 상태의 통행시간은 그 3~4배다. 그래서 시드×0.85는 "살짝 아래"가 아니라
        교착 구간 한복판이었다. 주석엔 "아래에서 위로 브래킷한다"고 적혀 있었지만 실제
        동작은 정반대였고, 가장 비싼 실행(교착)만 골라 밟았다.
-       → `first_round_fracs`로 **확실히 아래에서** 출발한다. 빗나가도 'low' 실행은 빠르다.
+       → `seed_trust`로 시드를 보정한 지점에 중심을 두고 `search_spread`로 펼친다.
+         시드 공식을 고쳐 정확해지면 `seed_trust`만 1.0으로 올리면 된다 —
+         탐색 모양(spread)은 건드릴 필요가 없다.
 
     2. **순차 이분은 코어를 1개만 쓴다.** 12코어 기기에서 6회를 줄세워 돌렸다.
        → 라운드당 `n_parallel`개를 동시에 굴린다. 각 실행은 별도 sumo 프로세스라
@@ -346,7 +391,8 @@ def calibrate_nstar(
     log = log or _log_noop
     # 호출부(cached_nstar)가 캐시 검증용으로 이미 쟀으면 그 값을 쓴다 — net 재파싱 수 초 절약
     if lane_km is None:
-        lane_km = _lane_km(net_file, demand_kwargs.get("bbox"), log)
+        lane_km = _lane_km(net_file, demand_kwargs.get("bbox"), log,
+                           demand_kwargs.get("through_ratio", 0.0))
     r_peak = peak_rate_per_hour(time_profile)
     workers = n_parallel or max(1, min(4, (os.cpu_count() or 4) // 2))
 
@@ -371,9 +417,10 @@ def calibrate_nstar(
         demand_kwargs["context"] = build_demand_context(
             net_file,
             cell_size_m=demand_kwargs.get("cell_size_m"),
-            design_trips=seed * min(first_round_fracs),
+            design_trips=seed * seed_trust * min(search_spread),
             n_slices=len(time_profile) if time_profile else 1,
             bbox=demand_kwargs.get("bbox"),
+            through_ratio=demand_kwargs.get("through_ratio", 0.0),
             log=log,
         )
         log(f"수요 앞단 준비 완료 — 이후 라운드가 공유합니다 ({time.time() - t_ctx:.1f}s)")
@@ -416,7 +463,11 @@ def calibrate_nstar(
         v = _verdict(sim)
         rec = {
             "tag": tag,
+            # `trips`는 **요청한** 수준(= N*의 단위)이다. 통과 교통이 있으면 generate_demand가
+            # 내부/통과로 쪼개면서 총량을 바꾸므로(대수 보존) 실제 생성량을 따로 남긴다.
+            # 시나리오 생성도 같은 변환을 거치니 N*를 요청 단위로 두는 게 맞다.
             "trips": round(level),
+            "trips_actual": round(d.total_trips),
             "vehicles": d.n_vehicles,
             "peak_running": sim.peak_running,
             "halting_ratio": sim.congestion_ratio,
@@ -434,13 +485,18 @@ def calibrate_nstar(
             flags.append("매우빡빡")
         if sim.aborted:
             flags.append(sim.abort_reason.split(":")[0])
-        log(f"  [{tag}] {level:.0f}통행 → 피크 {sim.peak_running}대 "
+        _act = (f"(실제 {d.total_trips:.0f})"
+                if abs(d.total_trips - level) > max(level * 0.01, 1.0) else "")
+        log(f"  [{tag}] {level:.0f}통행{_act} → 피크 {sim.peak_running}대 "
             f"정지 {sim.congestion_ratio * 100:.0f}% 잔류 {rec['leftover']} "
             f"텔포 {rec['teleports']} → **{v}**"
             f"{' [' + '·'.join(flags) + ']' if flags else ''} ({rec['seconds']}s)")
         return level, v, rec
 
-    levels = [seed * f for f in first_round_fracs][:workers]
+    # 1라운드 — 시드를 신뢰도로 보정한 지점을 중심으로 펼친다
+    center = seed * seed_trust
+    levels = [center * f for f in search_spread][:workers]
+    log(f"1라운드 중심 {center:.0f}통행 (시드 {seed:.0f} × 신뢰도 {seed_trust})")
     for rnd in range(max_rounds):
         levels = [lv for lv in levels
                   if lv >= 1.0 and not any(abs(lv - t) < max(t * 0.02, 1.0) for t in tested)]
@@ -546,8 +602,9 @@ def _nstar_cache_key(net_file: str, time_profile, k_target: float,
     램프 엣지였다. 도로망은 사실상 같은데 바이트 해시는 그 0.3%에 완전히 반응했다.
     게다가 파일 머리에 생성 시각 주석까지 들어간다.
 
-    → 키는 **bbox + 시간프로파일 + k_target**으로 잡고, 적중 여부는 `cached_nstar`가
+    → 키는 **bbox + 시간프로파일 + k_target + extra**로 잡고, 적중 여부는 `cached_nstar`가
       **lane_km 5% 이내**인지로 검증한다. 미세한 흔들림은 흡수하고 진짜 도로망 변화는 잡는다.
+      (`extra`엔 통과 비율처럼 통행 구성을 바꾸는 인자가 들어온다 — `cached_nstar` 참조.)
       (N*는 애초에 run-to-run ±10% 변동이 있고 안전계수 0.9로 흡수하는 값이라,
        5% 흔들림은 그 노이즈 안에 이미 묻힌다.)
 
@@ -577,9 +634,15 @@ def cached_nstar(
 ) -> NStarResult:
     """구역·창 설정당 1회만 산정하고 재사용한다 ("교통 1회, 평가 여러 번").
 
-    캐시 키 = **그린 구역(bbox) + 시간 프로파일 + k_target** (`_nstar_cache_key` 참조).
+    캐시 키 = **그린 구역(bbox) + 시간 프로파일 + k_target + cache_extra**
+    (`_nstar_cache_key` 참조). 호출부는 `cache_extra`에 통과 비율처럼 **통행 구성을 바꾸는
+    인자**를 반드시 실어야 한다 — 안 넣으면 그 인자를 바꿔도 옛 N*가 적중한다.
     적중 판정은 키만으로 하지 않고 **도로 차로연장(lane_km)이 `LANE_KM_TOLERANCE` 이내**
     인지 함께 본다 — 같은 구역이라도 도로가 실제로 늘거나 줄었으면 N*이 달라져야 하므로.
+
+    `through_ratio` 등 나머지 kwargs는 `calibrate_nstar`를 거쳐 `generate_demand`까지
+    그대로 흘러간다. **보정과 실제 교통 생성이 같은 인자를 받아야** N*가 가리키는 운영점이
+    실제로 굴리는 교통의 운영점과 일치한다(2026-07-30 이전에는 어긋나 있었다).
 
     검증에 net을 한 번 읽어야 해서 수 초가 들지만, 놓치면 보정 전체(수 분)를 다시 돈다.
     잰 값은 `calibrate_nstar`로 넘겨 중복 계산을 없앤다.
@@ -593,7 +656,8 @@ def cached_nstar(
     lane_km: Optional[float] = None
     if cfile.exists() and not force:
         data = json.loads(cfile.read_text(encoding="utf-8"))
-        lane_km = _lane_km(net_file, kwargs.get("bbox"), log)
+        lane_km = _lane_km(net_file, kwargs.get("bbox"), log,
+                           kwargs.get("through_ratio", 0.0))
         cached_km = float(data.get("lane_km") or 0.0)
         rel = abs(lane_km - cached_km) / max(cached_km, 1e-9)
         if rel <= LANE_KM_TOLERANCE:

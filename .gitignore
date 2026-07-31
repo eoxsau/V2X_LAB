@@ -55,3 +55,6 @@ design.html
 design_extracted/
 backend/networks/_demand/
 backend/networks/_aseg/
+
+# netconvert 타입 파일 — 실행 시 SUMO 원본에서 자동 생성 (main.py _osm_typemap)
+backend/networks/*.typ.xml

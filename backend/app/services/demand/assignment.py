@@ -282,58 +282,119 @@ def boundary_taz(
                 if abs(lng - cx) / span_x > abs(lat - cy) / span_y
                 else ("N" if lat > cy else "S"))
 
-    # 문이 되려면 본토와 이어져야 한다. 단, `routable_edges`(본토→e→본토)보다 **약한**
-    # 조건이면 충분하다 — 출발지는 본토로 갈 수만 있으면 되고, 도착지는 본토에서 올 수만
-    # 있으면 된다. 고속도로 끝처럼 왕복이 안 되는 엣지가 여기서 살아난다.
     comps = _scc_components(net, vclass)
     main = set(comps[0]) if comps else set()
     fwd, bwd = _routing_graph(net, vclass)
-    from_main = _reachable(main, fwd)      # 본토에서 갈 수 있는 엣지 = 도착지로 쓸 수 있다
-    to_main = _reachable(main, bwd)        # 본토로 갈 수 있는 엣지 = 출발지로 쓸 수 있다
 
+    # ── 1단계: 문 **후보**를 모은다 (연결성은 아직 안 본다) ────────────────────
+    #   진입 후보 = 바깥→안으로 경계를 넘거나, 아무도 이어주지 않는 엣지(망의 시작점)
+    #   진출 후보 = 안→바깥으로 넘거나, 더 갈 데가 없는 엣지(망의 끝)
+    # 망의 시작·끝을 문으로 쓰는 이유: 고속도로는 나들목 간격이 km 단위라 어떤 창을 잡아도
+    # 중간이 잘리고, 잘린 끝은 경계 안쪽에 생겨 (a) 조건에 안 걸린다. SUMO는 경로 끝에
+    # 도달한 차를 제거하므로 out=0은 그대로 나가는 문, in=0은 들어오는 문이다.
+    geom: dict[str, tuple] = {}
+    ent_cand: set[str] = set()
+    exit_cand: set[str] = set()
     for e in net.getEdges():
         eid = e.getID()
         if eid not in fwd:                 # vclass 통행 불가
             continue
         try:
-            fx, fy = e.getFromNode().getCoord()
-            tx, ty = e.getToNode().getCoord()
-            flng, flat = net.convertXY2LonLat(fx, fy)
-            tlng, tlat = net.convertXY2LonLat(tx, ty)
+            flng, flat = net.convertXY2LonLat(*e.getFromNode().getCoord())
+            tlng, tlat = net.convertXY2LonLat(*e.getToNode().getCoord())
             w = max(e.getLaneNumber(), 1) * max(e.getSpeed(), 1.0)
         except Exception:
             continue
         f_in, t_in = _inside(flng, flat), _inside(tlng, tlat)
-
-        # (a) 구역 경계를 가로지르는 엣지
+        geom[eid] = (flng, flat, tlng, tlat, w)
         if f_in != t_in:
-            if t_in and eid in to_main:                     # 바깥 → 안
-                entry.setdefault(f"ext_in_{_side(flng, flat)}", []).append((eid, w))
-            elif (not t_in) and eid in from_main:            # 안 → 바깥
-                exit_.setdefault(f"ext_out_{_side(tlng, tlat)}", []).append((eid, w))
-            continue
+            (ent_cand if t_in else exit_cand).add(eid)
+        else:
+            if not bwd.get(eid):
+                ent_cand.add(eid)
+            if not fwd.get(eid):
+                exit_cand.add(eid)
 
-        # (b) **망 자체의 끝** — 데이터가 여기서 끝나 더 갈 데가 없는 엣지.
-        # 고속도로가 대표적이다: 나들목 간격이 km 단위라 어떤 창을 잡아도 중간이 잘리고,
-        # 잘린 끝은 (a)의 "경계를 가로지름"에 걸리지 않는다(양 끝이 모두 구역 안일 수도 있다).
-        # SUMO는 경로 끝에 도달한 차를 제거하므로 out=0은 그대로 **나가는 문**이고,
-        # 아무도 이어주지 않는 in=0은 그대로 **들어오는 문**이다. 새로 만들 게 없다.
-        if not bwd.get(eid) and eid in to_main:
+    # ── 2단계: 후보를 **본토 또는 다른 문**과의 연결로 검증한다 ────────────────
+    #
+    # ⚠️ 2026-07-30 — 예전엔 `to_main`/`from_main`(본토 도달 여부)만 봤다. 그래서
+    # **본토를 한 번도 지나지 않는 통과 경로가 통째로 탈락했다.** 고속도로를 타고 들어와
+    # 고속도로로 빠지는 차가 바로 그 경우인데, 그게 통과 교통의 대표 패턴이다.
+    #
+    # 안양 net 실측 — 고속도로가 본토와 안 닿는 두 개의 편도 본선을 이룬다:
+    #     남행: 546511395·58794139(시작) → 58794132 → ┬ 1454894395 → 본토
+    #                                                 └ 58794095#1(끝) ← from_main=False
+    #     북행: 본토 → 682918000 ─┬→ AddedOnRamp → 58858257#1(끝)
+    #           58858257#0(시작) ─┘                  ← to_main=False
+    # 4차로 2,076m와 2,186m(합 17.1 lane-km)가 이 이유로 문에서 빠져 있었다.
+    #
+    # → 도착지 후보 전체를 목표로 두고 "진입 후보에서 갈 수 있나", 출발지 후보 전체를
+    #   출발로 두고 "진출 후보에 닿을 수 있나"를 본다. 후보를 전부 시드에 넣으므로
+    #   한 번만 훑어도 고정점이다(반복 불필요).
+    from_src = _reachable(main | ent_cand, fwd)   # 어디든 출발지에서 갈 수 있는 엣지
+    to_dst = _reachable(main | exit_cand, bwd)    # 어디든 도착지에 닿을 수 있는 엣지
+
+    for eid in ent_cand:
+        if eid in to_dst:                          # 나갈 방법이 있어야 출발지로 쓸 수 있다
+            flng, flat, _, _, w = geom[eid]
             entry.setdefault(f"ext_in_{_side(flng, flat)}", []).append((eid, w))
-        elif not fwd.get(eid) and eid in from_main:
+    for eid in exit_cand:
+        if eid in from_src:                        # 올 방법이 있어야 도착지로 쓸 수 있다
+            _, _, tlng, tlat, w = geom[eid]
             exit_.setdefault(f"ext_out_{_side(tlng, tlat)}", []).append((eid, w))
     return entry, exit_
 
 
-def excluded_major_roads(net_or_file, vclass: str = "passenger") -> dict:
+def gate_routable_edges(
+    net_or_file,
+    bbox: tuple[float, float, float, float],
+    vclass: str = "passenger",
+) -> set[str]:
+    """**통과 교통까지 감안한** 통행 가능 엣지 — `boundary_taz`의 문을 O/D로 인정한다.
+
+    `routable_edges`는 "본토에서 갔다가 본토로 돌아올 수 있나"를 묻는다. 구역 안에서
+    출발해 구역 안에서 끝나는 통행에는 그게 맞다. 하지만 통과 교통이 켜져 있으면 문이
+    출발지·도착지가 되므로 판정 기준이 달라진다 — 잘린 고속도로가 여기서 살아난다.
+
+    안양 net 실측: routable 211.0 lane-km(고속도로 0) → 이 함수 256.3(고속도로 37.1).
+    승용차 전체가 257.9이므로 사실상 쓰이는 도로를 다 담는다.
+
+    ⚠️ 통과 교통이 **꺼져 있으면 쓰지 말 것.** 그때는 문에 차가 안 깔리므로 고속도로가
+       실제로 비어 있고, `routable_edges` 쪽이 사실에 맞다.
+    """
+    net = _as_net(net_or_file)
+    entry, exit_ = boundary_taz(net, bbox, vclass)
+    ent_e = {eid for taz in entry.values() for eid, _ in taz}
+    exit_e = {eid for taz in exit_.values() for eid, _ in taz}
+    comps = _scc_components(net, vclass)
+    main = set(comps[0]) if comps else set()
+    fwd, bwd = _routing_graph(net, vclass)
+    return _reachable(main | ent_e, fwd) & _reachable(main | exit_e, bwd)
+
+
+def excluded_major_roads(
+    net_or_file,
+    vclass: str = "passenger",
+    bbox: Optional[tuple[float, float, float, float]] = None,
+) -> dict:
     """통행에 못 쓰이는 **주요 도로**를 종류별로 집계 — "여긴 왜 차가 없지?"의 답.
 
     주택가 골목이 몇 개 빠지는 건 정상이지만 고속도로·간선이 통째로 빠지면 그 축의
     교통량이 0이 되고, 기지국·RSU 배치까지 그 지역을 통째로 비운다. 그런데 지금까지
     그 사실이 **아무 데도 드러나지 않아** 배치 결과만 보고는 원인을 알 수 없었다.
+
+    bbox : 주면 각 종류를 **통과 교통이 쓸 수 있는 몫**(`through_lane_km`)과 그마저도
+        못 쓰는 몫(`dead_lane_km`)으로 나눈다.
+
+        ⚠️ 왜 나눠야 하나 (2026-07-30). 이 함수는 `routable_edges`(구역 **내부** 통행
+        기준)만 봤고, 호출부는 그걸로 "이 축의 교통량은 0이 됩니다"라고 경고했다.
+        그런데 통과 교통이 켜져 있으면 **사실이 아니다** — 안양 실측에서 배제된 고속도로가
+        차량의 15.8%를 나른다. 경고가 거짓이면 이미 해결된 문제를 미해결로 보이게 만들고,
+        진짜로 비어 있는 축을 찾는 데 방해가 된다.
     """
     net = _as_net(net_or_file)
     usable = routable_edges(net, vclass)
+    gate_usable = gate_routable_edges(net, bbox, vclass) if bbox is not None else set()
     out: dict[str, dict] = {}
     for e in net.getEdges():
         try:
@@ -344,11 +405,18 @@ def excluded_major_roads(net_or_file, vclass: str = "passenger") -> dict:
         t = (e.getType() or "?").split(".")[-1]
         if t not in _MAJOR_ROAD_TYPES:
             continue
-        rec = out.setdefault(t, {"count": 0, "lane_km": 0.0})
+        rec = out.setdefault(t, {"count": 0, "lane_km": 0.0,
+                                 "through_lane_km": 0.0, "dead_lane_km": 0.0})
+        lk = e.getLength() * e.getLaneNumber() / 1000.0
         rec["count"] += 1
-        rec["lane_km"] += e.getLength() * e.getLaneNumber() / 1000.0
+        rec["lane_km"] += lk
+        if e.getID() in gate_usable:
+            rec["through_lane_km"] += lk       # 통과 교통은 쓸 수 있다
+        else:
+            rec["dead_lane_km"] += lk          # 아무 통행도 못 쓴다
     for rec in out.values():
-        rec["lane_km"] = round(rec["lane_km"], 2)
+        for k in ("lane_km", "through_lane_km", "dead_lane_km"):
+            rec[k] = round(rec[k], 2)
     return out
 
 
