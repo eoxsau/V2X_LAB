@@ -36,7 +36,7 @@ from typing import Optional
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _BASE = Path(__file__).parent.parent.parent.parent.parent  # backend/
 _DB_PATH = _BASE / "data" / "regions.db"
-_PBF_PATH = Path.home() / "Desktop" / "AI_network_lab" / "data" / "raw" / "south-korea-260711.osm.pbf"
+_PBF_PATH = _BASE.parent / "data" / "raw" / "south-korea-260711.osm.pbf"
 _GRAPH_CACHE_DIR = _BASE / "data" / "v4_graph_cache"
 
 # ── OSM highway types kept for V2X routing ────────────────────────────────────
@@ -88,9 +88,15 @@ class DomainRandomizer:
         Controls reproducibility of the region split (not per-episode).
     """
 
-    def __init__(self, train: bool = True, seed: Optional[int] = 42) -> None:
+    def __init__(
+        self,
+        train: bool = True,
+        seed: Optional[int] = 42,
+        max_nodes: Optional[int] = None,
+    ) -> None:
         self._train = train
         self._rng = random.Random(seed)
+        self._max_nodes = max_nodes  # None = use global _MAX_NODES
         _GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         all_regions = self._load_region_list()
@@ -110,15 +116,50 @@ class DomainRandomizer:
         if not pool:
             return None
 
+        cap = self._max_nodes or _MAX_NODES
         for _ in range(20):   # retry limit
             region = self._rng.choice(pool)
             graph = self._load_or_build_graph(region)
             if graph is None or len(graph["nodes"]) < _MIN_NODES:
                 continue
+            # Trim graph to max_nodes if requested
+            graph = self._trim_graph(graph, cap)
+            if len(graph["nodes"]) < _MIN_NODES:
+                continue
             task = self._make_task(region, graph)
             if task is not None:
                 return task
         return None
+
+    def _trim_graph(self, graph: dict, max_nodes: int) -> dict:
+        """BFS-trim graph to at most max_nodes nodes from a random seed node."""
+        nodes = graph["nodes"]
+        if len(nodes) <= max_nodes:
+            return graph
+        adj = graph["adjacency"]
+        seed = self._rng.choice(list(nodes.keys()))
+        visited, queue = {seed}, deque([seed])
+        while queue and len(visited) < max_nodes:
+            u = queue.popleft()
+            for v, _ in adj.get(u, []):
+                if v not in visited:
+                    visited.add(v)
+                    queue.append(v)
+                    if len(visited) >= max_nodes:
+                        break
+        trimmed_nodes = {k: v for k, v in nodes.items() if k in visited}
+        trimmed_adj = {
+            k: [(nb, d) for nb, d in vs if nb in visited]
+            for k, vs in adj.items() if k in visited
+        }
+        return {
+            "nodes": trimmed_nodes,
+            "adjacency": trimmed_adj,
+            "way_tags": {
+                k: v for k, v in graph.get("way_tags", {}).items()
+                if k[0] in visited and k[1] in visited
+            },
+        }
 
     def pre_cache_all(self, verbose: bool = True) -> None:
         """

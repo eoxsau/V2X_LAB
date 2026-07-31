@@ -120,6 +120,17 @@ except ImportError:
     RL_AVAILABLE = False
 
 try:
+    from app.services.rl.v4.inference_module import V4InferenceModule as _V4InferenceModule
+    from app.services.rl.v4.sim_adapter import V4RoutingAdapter as _V4RoutingAdapter
+    from app.services.rl.v4.universal_gnn_policy import UniversalGNNPolicy as _UniversalGNNPolicy
+    from app.services.rl.rl_trainer import set_v4_adapter as _set_v4_adapter
+    _V4_INFERENCE_AVAILABLE = True
+except ImportError:
+    _V4_INFERENCE_AVAILABLE = False
+
+_v4_policy: "Optional[_V4InferenceModule]" = None
+
+try:
     from app.services.latency import LATENCY_REGISTRY
     LATENCY_AVAILABLE = True
 except ImportError:
@@ -154,6 +165,11 @@ except ImportError:
 
 from app.services.traffic.its_cache import ITS_CACHE
 from app.services.traffic.traffic_fusion_engine import TRAFFIC_FUSION_ENGINE
+try:
+    from app.services.rl.v4.traffic_mapper import TrafficMapper as _TrafficMapper
+    _TRAFFIC_MAPPER_AVAILABLE = True
+except ImportError:
+    _TRAFFIC_MAPPER_AVAILABLE = False
 from app.services.regions.region_service import (
     get_sido_list, get_sigungu_list, get_dong_list,
     get_region, get_children, get_region_by_bbox,
@@ -275,6 +291,43 @@ async def _cleanup_synthetic_nodes() -> None:
         if removed:
             print(f"[startup] Removed {removed} stale synthetic network node(s) from DB", flush=True)
     except Exception:
+        pass
+
+
+@app.on_event("startup")
+async def _load_v4_policy() -> None:
+    global _v4_policy
+    if not _V4_INFERENCE_AVAILABLE:
+        return
+    model_path = Path(__file__).parent / "app/services/rl/models/v4/v4_policy.pt"
+    if not model_path.exists():
+        return
+    try:
+        # V4InferenceModule: BS 선택 (predict_bs)
+        _v4_policy = _V4InferenceModule(str(model_path))
+        print(f"[startup] V4 GNN policy (BS selector) loaded from {model_path}", flush=True)
+
+        # V4RoutingAdapter: 경로 결정 (v4_gnn policy → run_episode)
+        gnn_policy = _UniversalGNNPolicy.load(str(model_path))
+        gnn_policy.eval()
+        adapter = _V4RoutingAdapter(gnn_policy)
+        _set_v4_adapter(adapter)
+        print("[startup] V4 RoutingAdapter registered → v4_gnn policy 사용 가능", flush=True)
+    except Exception as _e:
+        print(f"[startup] V4 policy load failed: {_e}", flush=True)
+
+
+def _rebuild_v4_graph() -> None:
+    """Rebuild V4 GNN graph cache when BS/RSU layout changes."""
+    if _v4_policy is None or not _v4_policy.is_ready:
+        return
+    nodes = _state.get("network_nodes") or []
+    bs_nodes = [n for n in nodes if n.get("type") in ("BS", "bs", "5G", "4G") or not n.get("type")]
+    if not bs_nodes:
+        return
+    try:
+        _v4_policy.build_graph(road_nodes=[], bs_nodes=bs_nodes)
+    except Exception as _e:
         pass
 
 from app.services.demand.scenario import (background_vehicles_from_scenario,
@@ -1475,7 +1528,8 @@ def _refresh_realtime_bs_vehicle_counts(nodes: list[dict]) -> None:
         vlat, vlng = v.get("lat"), v.get("lng")
         if vlat is None or vlng is None:
             continue
-        node, *_ = _find_best_bs_light(vlat, vlng, nodes)
+        _v4_node = _v4_policy.predict_bs(vlat, vlng) if (_v4_policy and _v4_policy.is_ready) else None
+        node = _v4_node if _v4_node is not None else (lambda r: r[0])(_find_best_bs_light(vlat, vlng, nodes))
         if node is not None:
             nid = str(node.get("id") or node.get("name") or "")
             counts[nid] = counts.get(nid, 0) + 1
@@ -1483,7 +1537,8 @@ def _refresh_realtime_bs_vehicle_counts(nodes: list[dict]) -> None:
     # ── ego 차량(veh0) 배정 — 항상 V2X 탑재 ───────────────────────────────────
     ego_nid: str | None = None
     if veh_pos and veh_pos.get("lat") is not None:
-        ego_node, *_ = _find_best_bs_light(veh_pos["lat"], veh_pos["lng"], nodes)
+        _v4_ego = _v4_policy.predict_bs(veh_pos["lat"], veh_pos["lng"]) if (_v4_policy and _v4_policy.is_ready) else None
+        ego_node = _v4_ego if _v4_ego is not None else (lambda r: r[0])(_find_best_bs_light(veh_pos["lat"], veh_pos["lng"], nodes))
         if ego_node is not None:
             ego_nid = str(ego_node.get("id") or ego_node.get("name") or "")
 
@@ -2099,6 +2154,7 @@ def _run_resource_allocation(
             base_stations=bs_nodes,
             vehicles=vehicles,
             road_graph=graph,
+            traffic_data=_state.get("its_traffic_data"),
             lookahead_results=la_result,
             route_candidates=simple_candidates,
         )
@@ -4624,7 +4680,8 @@ def simulation_thread(
                             try:
                                 _vx, _vy = traci.vehicle.getPosition(_bg_id)
                                 _vlon, _vlat = traci.simulation.convertGeo(_vx, _vy)
-                                _nearest_bs, *_ = _find_best_bs_light(_vlat, _vlon, _bs_nodes_for_reroute)
+                                _v4_reroute = _v4_policy.predict_bs(_vlat, _vlon) if (_v4_policy and _v4_policy.is_ready) else None
+                                _nearest_bs = _v4_reroute if _v4_reroute is not None else (lambda r: r[0])(_find_best_bs_light(_vlat, _vlon, _bs_nodes_for_reroute))
                                 if _nearest_bs is not None:
                                     _bs_load = float(_nearest_bs.get("load") or 0.0)
                                     _bs_cap = float(_nearest_bs.get("capacity") or 100.0)
@@ -4991,6 +5048,7 @@ async def setup_network(req: SetupRequest):
             # Synthetic nodes are kept in-memory only — not persisted to DB — so they
             # never appear alongside user-created stations.
             _state["network_nodes"] = merged_network_nodes()
+            _rebuild_v4_graph()
 
             mapping_stats = TRAFFIC_FUSION_ENGINE.prepare_current_network_mappings(
                 osm_file=Path(_state["osm_file"]),
@@ -5193,6 +5251,7 @@ async def setup_network_region(req: RegionSetupRequest):
                 traffic_lambda=(_state.get("policy_options") or {}).get("traffic_lambda", 5.0),
             )
             _state["network_nodes"] = merged_network_nodes()
+            _rebuild_v4_graph()
 
             mapping_stats = TRAFFIC_FUSION_ENGINE.prepare_current_network_mappings(
                 osm_file=osm_file,
@@ -5237,6 +5296,7 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
     # Reload network nodes from the DB so any user-created base stations
     # added since the last setup/run are included as connection candidates.
     _state["network_nodes"] = merged_network_nodes()
+    _rebuild_v4_graph()
 
     _state["sim_running"] = True
     _state["vehicle_pos"] = None
@@ -5846,23 +5906,66 @@ def generate_scenarios(req: ScenarioGenerateRequest):
     bbox = _state.get("current_bbox") or {}
     graph = _state["mock_graph"]
 
+    bbox_s, bbox_n = bbox.get("s", 37.4), bbox.get("n", 37.6)
+    bbox_w, bbox_e = bbox.get("w", 126.9), bbox.get("e", 127.1)
+    lat_span = (bbox_n - bbox_s) * 0.3
+    lng_span = (bbox_e - bbox_w) * 0.3
+
     prompt = f"""당신은 V2X 차량-네트워크 시뮬레이션의 시나리오 설계자입니다.
 아래 사용자 설명에 맞는 시뮬레이션 시나리오 {count}개를 생성하세요.
+각 시나리오는 교통 상황·시간대·통신 환경이 다양하게 분포해야 합니다.
 
 === 사용자 설명 ===
 {req.description}
 
-=== 제약 조건 ===
-- 모든 origin/dest 좌표는 반드시 아래 bbox 범위 안에 있어야 합니다:
-  남쪽(lat 최소)={bbox.get('s')}, 북쪽(lat 최대)={bbox.get('n')}, 서쪽(lng 최소)={bbox.get('w')}, 동쪽(lng 최대)={bbox.get('e')}
-- origin과 dest는 서로 달라야 하고, 직선거리로 최소 200m 이상 떨어져야 합니다.
-- vehicle_count는 1~30 사이 정수로, 사용자 설명의 의도(예: "혼잡"은 큰 값, "단일 차량"은 1)를 반영하세요.
-- label은 시나리오를 한국어로 간단히 설명하는 10자 내외 문구로 작성하세요.
+=== bbox 제약 ===
+남쪽(lat 최소)={bbox_s:.6f}, 북쪽(lat 최대)={bbox_n:.6f}, 서쪽(lng 최소)={bbox_w:.6f}, 동쪽(lng 최대)={bbox_e:.6f}
+좌표는 반드시 이 범위 안에 있어야 합니다. 범위가 약 {lat_span*111000:.0f}m × {lng_span*88000:.0f}m이므로
+origin과 dest는 충분히 다양한 위치를 써서 경로가 서로 겹치지 않게 하세요.
+
+=== 필드 설명 ===
+- label: 시나리오를 한국어로 간단히 설명 (10자 내외, 예: "퇴근 혼잡", "야간 저밀도")
+- scenario_type: "rush_hour" | "off_peak" | "highway" | "emergency" | "night" | "normal"
+- origin / dest: lat·lng 좌표 — origin과 dest는 직선거리 최소 300m 이상 떨어져야 합니다
+- vehicle_count: 1~30 (rush_hour=20~30, off_peak=5~10, highway=10~20, emergency=2~5, night=1~5, normal=5~15)
+- demand_scale_pct: 교통량 배율 10~300 (rush_hour=150~250, off_peak=40~70, highway=100~200, emergency=30~60, night=20~40, normal=80~120)
+- network_mode: "4G" | "5G" | "6G" — highway/emergency는 "5G" 또는 "6G" 권장
+
+=== 생성 예시 (few-shot) ===
+
+예시 1 — 퇴근 혼잡 시나리오:
+{{
+  "label": "퇴근 혼잡", "scenario_type": "rush_hour",
+  "origin": {{"lat": {bbox_s + lat_span * 1.2:.6f}, "lng": {bbox_w + lng_span * 0.8:.6f}}},
+  "dest":   {{"lat": {bbox_n - lat_span * 0.9:.6f}, "lng": {bbox_e - lng_span * 1.1:.6f}}},
+  "vehicle_count": 25, "demand_scale_pct": 200, "network_mode": "5G"
+}}
+
+예시 2 — 고속도로 긴급:
+{{
+  "label": "고속도로 긴급", "scenario_type": "emergency",
+  "origin": {{"lat": {bbox_s + lat_span * 0.5:.6f}, "lng": {bbox_w + lng_span * 1.5:.6f}}},
+  "dest":   {{"lat": {bbox_n - lat_span * 0.3:.6f}, "lng": {bbox_e - lng_span * 0.4:.6f}}},
+  "vehicle_count": 3, "demand_scale_pct": 45, "network_mode": "6G"
+}}
+
+예시 3 — 야간 저밀도:
+{{
+  "label": "야간 저밀도", "scenario_type": "night",
+  "origin": {{"lat": {bbox_s + lat_span * 0.3:.6f}, "lng": {bbox_w + lng_span * 2.0:.6f}}},
+  "dest":   {{"lat": {bbox_n - lat_span * 1.4:.6f}, "lng": {bbox_e - lng_span * 0.8:.6f}}},
+  "vehicle_count": 2, "demand_scale_pct": 25, "network_mode": "4G"
+}}
 
 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 출력하지 마세요.
 {{
   "scenarios": [
-    {{"label": "...", "origin": {{"lat": 0.0, "lng": 0.0}}, "dest": {{"lat": 0.0, "lng": 0.0}}, "vehicle_count": 1}}
+    {{
+      "label": "...", "scenario_type": "normal",
+      "origin": {{"lat": 0.0, "lng": 0.0}},
+      "dest":   {{"lat": 0.0, "lng": 0.0}},
+      "vehicle_count": 10, "demand_scale_pct": 100, "network_mode": "5G"
+    }}
   ]
 }}"""
 
@@ -5894,6 +5997,10 @@ def generate_scenarios(req: ScenarioGenerateRequest):
     warnings: list[str] = []
     seed_base = req.seed_base if req.seed_base is not None else 0
 
+    _VALID_CW_KEYS = {"w_distance", "w_time", "w_latency", "w_load",
+                      "w_resource", "w_handover", "w_blockage", "w_future"}
+    _VALID_NETWORK_MODES = {"4G", "5G", "6G"}
+
     for i, raw in enumerate(raw_scenarios[:count]):
         label = str(raw.get("label") or f"시나리오 {i + 1}")
         origin = raw.get("origin") or {}
@@ -5914,10 +6021,26 @@ def generate_scenarios(req: ScenarioGenerateRequest):
             warnings.append(f"'{label}': origin/dest가 같은 도로 노드로 snap되어 제외했습니다.")
             continue
 
-        vehicle_count = max(1, min(int(raw.get("vehicle_count") or 1), 30))
+        vehicle_count = max(1, min(int(raw.get("vehicle_count") or 10), 30))
+        demand_scale_pct = max(10.0, min(float(raw.get("demand_scale_pct") or 100.0), 300.0))
+        network_mode = raw.get("network_mode") or "5G"
+        if network_mode not in _VALID_NETWORK_MODES:
+            network_mode = "5G"
+        scenario_type = str(raw.get("scenario_type") or "normal")
+
+        # Build simulation_config overrides so _evaluate_route_scenario applies them
+        policy_overrides: dict = {"demand_scale_pct": demand_scale_pct, "network_mode": network_mode}
+        sim_cfg: dict = {"policy_options": policy_overrides}
+        raw_cw = raw.get("cost_weights")
+        if isinstance(raw_cw, dict):
+            filtered_cw = {k: v for k, v in raw_cw.items() if k in _VALID_CW_KEYS}
+            if filtered_cw:
+                sim_cfg["cost_weights"] = filtered_cw
+
         scenarios.append({
             "id": f"gen-{i + 1}",
             "label": label,
+            "scenario_type": scenario_type,
             "mode": "route_metrics",
             "source": "llm_generated",
             "origin": {"lat": snapped_origin["lat"], "lng": snapped_origin["lng"]},
@@ -5925,6 +6048,9 @@ def generate_scenarios(req: ScenarioGenerateRequest):
             "origin_node_id": origin_node_id,
             "dest_node_id": dest_node_id,
             "vehicle_count": vehicle_count,
+            "demand_scale_pct": demand_scale_pct,
+            "network_mode": network_mode,
+            "simulation_config": sim_cfg,
             "seed": seed_base + i,
         })
 
@@ -6493,6 +6619,7 @@ def run_allocation(algorithm_id: Optional[str] = None):
             base_stations=bs_nodes,
             vehicles=vehicles,
             road_graph=graph,
+            traffic_data=_state.get("its_traffic_data"),
             route_candidates=_state.get("k_path_candidates") or [],
         )
         alloc_inp = AllocationInput(
@@ -6614,7 +6741,7 @@ def get_resource_demand(node_id: Optional[str] = None, lookahead_hops: int = 3):
             base_stations=bs_nodes,
             vehicles=vehicles,
             road_graph=graph,
-            traffic_data=None,
+            traffic_data=_state.get("its_traffic_data"),
             lookahead_results=la_result,
             route_candidates=k_candidates,
         )
@@ -7111,7 +7238,154 @@ def get_v4_status():
         "n_sionna_channel_maps": n_sionna,
         "llm_available": llm_ok,
         "v4_available": _V4_AVAILABLE,
+        "v4_bs_selector_ready": _v4_policy is not None and _v4_policy.is_ready,
     }
+
+
+class V4ValidateRequest(BaseModel):
+    n: int = 30
+    policy: str = "v4_gnn"  # "v4_gnn" | "greedy" | "random" | "coverage"
+    holdout: bool = True
+
+
+@app.post("/api/rl/v4/validate")
+def run_v4_validate(req: V4ValidateRequest):
+    """
+    UniversalV2XEnv × DomainRandomizer(holdout)에서 N=30 에피소드 다중 시드 평가.
+
+    policy : "v4_gnn" (학습된 FOMAML 모델), "greedy", "random", "coverage"
+    반환값 : mean±std KPI + 95% CI (CLT, t-분포) — 논문 Table 용도.
+    """
+    if not _V4_INFERENCE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="V4 모듈 없음 (torch-geometric 설치 필요)")
+    try:
+        from app.services.rl.v4.domain_randomizer import DomainRandomizer
+        from app.services.rl.v4.statistical_validator import StatisticalValidator
+        from app.services.rl.v4.universal_v2x_env import UniversalV2XEnv
+        from app.services.rl.v4.universal_gnn_policy import UniversalGNNPolicy
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"V4 임포트 실패: {e}")
+
+    try:
+        dr = DomainRandomizer(train=not req.holdout, seed=42)
+
+        if req.policy == "v4_gnn":
+            model_path = Path(__file__).parent / "app/services/rl/models/v4/v4_policy.pt"
+            if not model_path.exists():
+                raise HTTPException(status_code=404,
+                    detail="학습된 모델 없음. train_v4.py로 학습 먼저 실행하세요.")
+            gnn = UniversalGNNPolicy.load(str(model_path))
+            gnn.eval()
+            import torch
+            def policy_fn(obs):
+                import torch
+                with torch.no_grad():
+                    action, _, _ = gnn.act(obs, deterministic=True)
+                return int(action)
+        elif req.policy == "greedy":
+            policy_fn = None  # UniversalV2XEnv 기본 greedy
+        elif req.policy == "random":
+            import random
+            policy_fn = lambda obs: random.randrange(5)
+        elif req.policy == "coverage":
+            policy_fn = None
+        else:
+            raise HTTPException(status_code=400, detail=f"지원하지 않는 정책: {req.policy}")
+
+        validator = StatisticalValidator(policy_fn=policy_fn, randomizer=dr, n=req.n)
+        result = validator.run(verbose=False)
+        return result.summary()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class V4PolicyCompareRequest(BaseModel):
+    n_seeds: int = 30
+    policies: list = ["random", "greedy", "coverage", "v4_gnn"]
+    n_scenarios: int = 5  # origin-dest 쌍 수 (랜덤 샘플)
+    max_steps: int = 200
+
+
+@app.post("/api/rl/v4/policy-compare")
+def run_policy_compare(req: V4PolicyCompareRequest):
+    """
+    다중 정책 공정 비교 — 동일 V2XRoutingEnv 시나리오로 평가.
+
+    Wilcoxon signed-rank 검정 + 95% CI 포함 논문 수준 비교 보고서 반환.
+    결과는 results/policy_comparison_{timestamp}.json 에도 저장됨.
+
+    v4_gnn 포함 시: 학습된 모델(models/v4/v4_policy.pt)이 필요함.
+    """
+    if not RL_AVAILABLE:
+        raise HTTPException(status_code=503, detail="RL 모듈 없음")
+
+    graph = _state.get("mock_graph")
+    nodes = _state.get("network_nodes") or []
+    if not graph or not graph.get("nodes"):
+        raise HTTPException(status_code=400, detail="도로 그래프 없음 — 시뮬레이션 먼저 설정하세요.")
+
+    bs_nodes = [n for n in nodes if str(n.get("type", "")).lower() not in ("rsu", "roadside_unit")]
+    if not bs_nodes:
+        raise HTTPException(status_code=400, detail="기지국 노드 없음")
+
+    try:
+        from app.services.rl.evaluation.policy_comparison import PolicyComparisonRunner
+        from app.services.rl.v4.sim_adapter import V4RoutingAdapter
+        from app.services.rl.v4.universal_gnn_policy import UniversalGNNPolicy
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"비교 모듈 임포트 실패: {e}")
+
+    # origin-dest 쌍: 그래프 노드 중 랜덤 샘플
+    import random as _rnd
+    all_node_ids = list(graph["nodes"].keys())
+    if len(all_node_ids) < 2:
+        raise HTTPException(status_code=400, detail="노드 수 부족 (최소 2개)")
+    _rnd.seed(42)
+    n_pairs = min(req.n_scenarios, len(all_node_ids) // 2)
+    pairs = []
+    shuffled = all_node_ids[:]
+    _rnd.shuffle(shuffled)
+    for i in range(n_pairs):
+        pairs.append((shuffled[i * 2], shuffled[i * 2 + 1]))
+
+    # v4_gnn 어댑터 준비
+    v4_adapter = None
+    if "v4_gnn" in req.policies:
+        model_path = Path(__file__).parent / "app/services/rl/models/v4/v4_policy.pt"
+        if model_path.exists():
+            try:
+                gnn = UniversalGNNPolicy.load(str(model_path))
+                gnn.eval()
+                v4_adapter = V4RoutingAdapter(gnn)
+            except Exception as _ae:
+                pass  # v4_gnn 불가 시 해당 정책만 제외되지 않도록 runner에서 처리
+
+    try:
+        runner = PolicyComparisonRunner(
+            graph=graph,
+            road_nodes=graph["nodes"],
+            bs_nodes=bs_nodes,
+            origin_dest_pairs=pairs,
+            policies=req.policies,
+            n_seeds=req.n_seeds,
+            max_steps=req.max_steps,
+            v4_adapter=v4_adapter,
+        )
+        report = runner.run()
+        runner.print_table(report)
+        try:
+            saved = runner.save_report(report, "results")
+        except Exception:
+            saved = None
+        from dataclasses import asdict
+        result = asdict(report)
+        if saved:
+            result["saved_to"] = saved
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/llm/chat")
@@ -7203,6 +7477,7 @@ def _network_node_response(row: dict) -> dict:
 def _refresh_active_network_nodes() -> None:
     if _state.get("network_ready"):
         _state["network_nodes"] = merged_network_nodes()
+        _rebuild_v4_graph()
 
 
 @app.get("/network-nodes")
@@ -7921,6 +8196,22 @@ async def sync_its_traffic(req: TrafficSyncRequest):
         ],
     }
     result["vds"] = vds_result
+
+    # TrafficMapper: annotate mock_graph + build its_traffic_data for demand_calculator
+    if _TRAFFIC_MAPPER_AVAILABLE and ITS_CACHE.enriched_links:
+        _mock_graph = _state.get("mock_graph")
+        if _mock_graph:
+            try:
+                _scn_peek = current_traffic_scenario(build=False)
+                _tm = _TrafficMapper(
+                    enriched_links=ITS_CACHE.enriched_links,
+                    peak_edge_loads=getattr(_scn_peek, "peak_edge_loads", None) if _scn_peek else None,
+                )
+                _tm.annotate_mock_graph(_mock_graph)
+                _state["its_traffic_data"] = _tm.as_traffic_data()
+            except Exception as _tm_e:
+                print(f"[ITS] TrafficMapper 오류 (무시됨): {_tm_e}", flush=True)
+
     return result
 
 
@@ -8790,12 +9081,64 @@ def parse_scenario(req: ScenarioParseRequest):
 === 설정 스키마 ===
 {schema_doc}
 
+=== 변환 예시 (few-shot) ===
+
+예시 1 — 고속도로 시나리오:
+입력: "고속도로 위주 고속 주행 시나리오로 설정해줘"
+출력:
+{{
+  "diff": {{
+    "cost_weights": {{"w_load": 5, "w_latency": 8}},
+    "algorithm_selection": {{"route_algorithm": "adaptive_astar"}},
+    "policy_options": {{}}
+  }},
+  "rationale": {{
+    "w_load": "고속도로에서 BS 과부하 회피 중요성이 높아 부하 가중치 상향",
+    "w_latency": "고속 이동 환경에서 지연 민감도 상향",
+    "route_algorithm": "adaptive_astar는 간선 도로 구조에서 빠른 최적 경로 탐색"
+  }}
+}}
+
+예시 2 — URLLC 지연 최소화:
+입력: "지연을 최우선으로, URLLC 10ms 기준 충족을 목표로 설정"
+출력:
+{{
+  "diff": {{
+    "cost_weights": {{"w_latency": 15, "w_distance": 2}},
+    "algorithm_selection": {{"latency_algorithm": "full_composite_latency"}},
+    "policy_options": {{}}
+  }},
+  "rationale": {{
+    "w_latency": "URLLC 10ms 기준 달성을 위해 지연 가중치 최대화",
+    "w_distance": "지연 최우선이므로 거리 가중치를 최소화해 경로 길이보다 지연 절감 선호",
+    "latency_algorithm": "full_composite_latency는 전파·큐잉·처리 지연을 모두 합산해 정밀 계산"
+  }}
+}}
+
+예시 3 — 혼잡 완화:
+입력: "혼잡이 심한 도심 구간의 로드밸런싱을 개선하고 싶어"
+출력:
+{{
+  "diff": {{
+    "cost_weights": {{"w_load": 12, "w_blockage": 6}},
+    "algorithm_selection": {{"base_station_selection_algorithm": "load_aware",
+                            "resource_allocation_algorithm": "traffic_aware_allocation"}},
+    "policy_options": {{}}
+  }},
+  "rationale": {{
+    "w_load": "BS 부하 분산 목적으로 부하 가중치 대폭 상향",
+    "w_blockage": "도심 밀집 건물 환경에서 신호 차폐 손실 가중치 상향",
+    "base_station_selection_algorithm": "load_aware는 과부하 BS를 피해 균형 있게 선택",
+    "resource_allocation_algorithm": "traffic_aware_allocation은 실시간 트래픽에 따라 자원 재배분"
+  }}
+}}
+
 === 사용자 입력 ===
 {req.input_text}
 
 === 작업 지침 ===
 - 사용자 입력에서 실제로 바뀌어야 한다고 판단되는 키만 diff에 포함하세요. 바뀌지 않는 키는 절대 포함하지 마세요.
-- 스키마에 없는 키를 만들지 마세요.
+- 스키마에 없는 키를 만들지 마세요. algorithm_selection의 값은 반드시 스키마의 후보 목록 중 하나여야 합니다.
 - 각 변경 키마다 한 줄짜리 변경 이유(rationale)를 작성하세요.
 - 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 출력하지 마세요.
 
@@ -8829,6 +9172,19 @@ def parse_scenario(req: ScenarioParseRequest):
     rationale = parsed.get("rationale") or {}
     if not isinstance(diff, dict):
         diff = {}
+
+    # Schema guard: strip unknown keys from algorithm_selection
+    _KNOWN_ALGO_KEYS = {"route_algorithm", "latency_algorithm",
+                        "base_station_selection_algorithm", "resource_allocation_algorithm"}
+    algo_sel = diff.get("algorithm_selection")
+    if isinstance(algo_sel, dict):
+        diff["algorithm_selection"] = {k: v for k, v in algo_sel.items()
+                                       if k in _KNOWN_ALGO_KEYS}
+    _KNOWN_WEIGHT_KEYS = {"w_distance", "w_time", "w_latency", "w_load",
+                          "w_resource", "w_handover", "w_blockage", "w_future"}
+    cw = diff.get("cost_weights")
+    if isinstance(cw, dict):
+        diff["cost_weights"] = {k: v for k, v in cw.items() if k in _KNOWN_WEIGHT_KEYS}
 
     return {"ok": bool(diff), "provider": provider_used, "diff": diff, "rationale": rationale}
 
@@ -8875,6 +9231,29 @@ def chat_scenario(req: ScenarioChatRequest):
 
 {schema_doc}
 
+=== 대화 예시 (응답 형식 참고) ===
+
+사용자: "w_latency가 뭐야?"
+→ {{
+  "reply": "w_latency는 경로 비용 함수에서 E2E 전송 지연(latency)에 부여하는 가중치입니다. 값이 클수록 지연이 낮은 경로를 강하게 선호하게 됩니다. 현재 설정된 값보다 높이면 지연 최소화 우선 경로를 찾고, 낮추면 거리·부하 등 다른 요소와 균형을 맞춥니다.",
+  "diff": {{"cost_weights": {{}}, "algorithm_selection": {{}}, "policy_options": {{}}}},
+  "rationale": {{}}
+}}
+
+사용자: "지연 가중치를 12로 높여줘"
+→ {{
+  "reply": "w_latency를 현재 값에서 12로 높였습니다. 지연 최소화 경로를 더 강하게 선호하게 됩니다.",
+  "diff": {{"cost_weights": {{"w_latency": 12}}, "algorithm_selection": {{}}, "policy_options": {{}}}},
+  "rationale": {{"w_latency": "사용자가 명시적으로 12로 지정"}}
+}}
+
+사용자: "로드밸런싱 좀 개선해줄 수 있어?"
+→ {{
+  "reply": "로드밸런싱을 개선하려면 w_load(BS 부하 가중치)를 높이거나 base_station_selection_algorithm을 load_aware로 바꾸는 방법이 있습니다. 어떤 방향으로 바꿔드릴까요?",
+  "diff": {{"cost_weights": {{}}, "algorithm_selection": {{}}, "policy_options": {{}}}},
+  "rationale": {{}}
+}}
+
 === 대화 기록 (최근 순) ===
 {chr(10).join(history_lines)}
 
@@ -8883,9 +9262,9 @@ def chat_scenario(req: ScenarioChatRequest):
   설명만 작성하고, diff는 비워두세요(섹션 모두 빈 객체).
 - 마지막 사용자 메시지가 설정 변경 요청이면: reply에 무엇을 어떻게 바꿨는지 한두 문장으로
   확인하고, diff에 실제로 바뀌어야 하는 키만 포함하세요. 스키마에 없는 키는 절대 만들지
-  마세요. 바뀌지 않는 키는 diff에 넣지 마세요.
-- 변경 요청인지 질문인지 모호하면 설명을 우선하고 diff는 비워둔 채, 어떤 값으로
-  바꾸고 싶은지 되물어보세요.
+  마세요. algorithm_selection의 값은 반드시 스키마의 후보 목록 중 하나여야 합니다.
+- 변경 요청인지 질문인지 모호하면 설명을 먼저 하고 diff는 비워둔 채, 구체적인 목표값을
+  되물어보세요.
 - 각 변경 키마다 한 줄짜리 변경 이유(rationale)를 작성하세요.
 - 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 출력하지 마세요.
 
@@ -8921,6 +9300,19 @@ def chat_scenario(req: ScenarioChatRequest):
     rationale = parsed.get("rationale") or {}
     if not isinstance(diff, dict):
         diff = {}
+
+    # Schema guard: strip unknown algorithm/weight keys hallucinated by LLM
+    _KNOWN_ALGO_KEYS = {"route_algorithm", "latency_algorithm",
+                        "base_station_selection_algorithm", "resource_allocation_algorithm"}
+    algo_sel = diff.get("algorithm_selection")
+    if isinstance(algo_sel, dict):
+        diff["algorithm_selection"] = {k: v for k, v in algo_sel.items()
+                                       if k in _KNOWN_ALGO_KEYS}
+    _KNOWN_WEIGHT_KEYS = {"w_distance", "w_time", "w_latency", "w_load",
+                          "w_resource", "w_handover", "w_blockage", "w_future"}
+    cw = diff.get("cost_weights")
+    if isinstance(cw, dict):
+        diff["cost_weights"] = {k: v for k, v in cw.items() if k in _KNOWN_WEIGHT_KEYS}
 
     return {"ok": True, "provider": provider_used, "reply": reply, "diff": diff, "rationale": rationale}
 

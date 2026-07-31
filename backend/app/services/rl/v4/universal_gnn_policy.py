@@ -204,6 +204,32 @@ if _TORCH_GEO_AVAILABLE:
             entropy = dist.entropy()
             return log_probs, values.squeeze(-1), entropy
 
+        def encode_nodes(self, data: "Data") -> "torch.Tensor":
+            """
+            Run GNN layers and return per-node embeddings [N, gnn_out].
+            Used by V4InferenceModule to cache embeddings once per graph build.
+            """
+            with torch.no_grad():
+                x, ei, ea = data.x, data.edge_index, data.edge_attr
+                h = F.elu(self.gnn1(x, ei, ea))
+                h = F.elu(self.gnn2(h, ei, ea))
+            return h
+
+        def select_bs(
+            self,
+            node_embs: "torch.Tensor",
+            pos_emb: "torch.Tensor",
+            bs_indices: "torch.Tensor",
+        ) -> int:
+            """
+            Among BS nodes (given by bs_indices), return the index into bs_indices
+            of the BS whose embedding is most similar to pos_emb.
+            Used by V4InferenceModule.predict_bs().
+            """
+            bs_embs = node_embs[bs_indices]         # [n_bs, gnn_out]
+            scores = torch.mv(bs_embs, pos_emb)     # dot-product similarity
+            return int(scores.argmax().item())
+
         def save(self, path: str) -> None:
             torch.save({"state_dict": self.state_dict()}, path)
 
@@ -304,7 +330,7 @@ def build_graph_obs(
                 math.sin(bear),
                 math.cos(bear),
                 hw,
-                lat_ms / 50.0,
+                min(lat_ms / 50.0, 1.0),
             ])
 
     x          = torch.tensor(node_feats,                dtype=torch.float32)

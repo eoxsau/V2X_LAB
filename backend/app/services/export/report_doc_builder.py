@@ -511,208 +511,438 @@ def render_report_markdown(doc: ReportDocument) -> str:
 # HTML renderer
 # ──────────────────────────────────────────────────────────────────────────────
 
-_HTML_STYLE = textwrap.dedent("""\
-    <style>
-      :root{--bg:#fff;--text:#111;--muted:#555;--border:#ddd;--accent:#1a6fcf;--surface:#f6f8fa;--th-bg:#eef2f7}
-      @media(prefers-color-scheme:dark){
-        :root{--bg:#0d1117;--text:#e6edf3;--muted:#8b949e;--border:#30363d;--accent:#58a6ff;--surface:#161b22;--th-bg:#21262d}
-      }
-      *{box-sizing:border-box;margin:0;padding:0}
-      body{font-family:system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.6;background:var(--bg);color:var(--text);padding:32px 24px;max-width:860px;margin:auto}
-      h1{font-size:22px;border-bottom:2px solid var(--accent);padding-bottom:8px;margin-bottom:4px}
-      h2{font-size:17px;margin-top:28px;margin-bottom:10px;color:var(--accent)}
-      h3{font-size:14px;margin-top:18px;margin-bottom:6px}
-      p.subtitle{color:var(--muted);margin-bottom:20px;font-style:italic}
-      table{border-collapse:collapse;width:100%;margin-bottom:12px;font-size:13px}
-      th{background:var(--th-bg);text-align:left;padding:6px 10px;border:1px solid var(--border)}
-      td{padding:5px 10px;border:1px solid var(--border)}
-      tr:nth-child(even) td{background:var(--surface)}
-      ul{padding-left:20px;margin-bottom:8px}
-      li{margin-bottom:3px}
-      blockquote{border-left:3px solid var(--accent);padding:8px 14px;background:var(--surface);margin:10px 0;color:var(--text)}
-      .badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:11px;background:var(--th-bg);border:1px solid var(--border)}
-      .formula{font-family:monospace;background:var(--surface);border:1px solid var(--border);padding:6px 12px;margin:6px 0;border-radius:4px;font-size:12.5px}
-      .ref{color:var(--muted);font-size:11px}
-      .muted{color:var(--muted);font-size:12px}
-      hr{border:none;border-top:1px solid var(--border);margin:20px 0}
-      ol.refs{padding-left:24px;font-size:12px;color:var(--muted);line-height:1.8}
-      @media print{body{max-width:none;padding:16px}h2{page-break-before:auto}}
-    </style>
-""")
+_HTML_STYLE = """<style>
+:root{
+  --bg:#F8FAFD;--surface:#FFF;--surface-2:#F1F5F9;
+  --accent:#1D4ED8;--accent-2:#3B82F6;--accent-light:#DBEAFE;
+  --good:#15803D;--good-bg:#DCFCE7;
+  --warn:#B45309;--warn-bg:#FEF3C7;
+  --bad:#B91C1C;--bad-bg:#FEE2E2;
+  --text:#0F172A;--text-2:#334155;--muted:#64748B;
+  --border:#E2E8F0;--th-bg:#EFF6FF;
+  --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#060B18;--surface:#0F172A;--surface-2:#1E293B;
+  --accent:#60A5FA;--accent-2:#93C5FD;--accent-light:#1A2F52;
+  --good:#4ADE80;--good-bg:#052E16;
+  --warn:#FCD34D;--warn-bg:#1C1200;
+  --bad:#F87171;--bad-bg:#2D0707;
+  --text:#F1F5F9;--text-2:#CBD5E1;--muted:#94A3B8;
+  --border:#1E293B;--th-bg:#1A2744;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 1px 2px rgba(0,0,0,.3);
+}}
+:root[data-theme="light"]{--bg:#F8FAFD;--surface:#FFF;--surface-2:#F1F5F9;--accent:#1D4ED8;--accent-2:#3B82F6;--accent-light:#DBEAFE;--good:#15803D;--good-bg:#DCFCE7;--warn:#B45309;--warn-bg:#FEF3C7;--bad:#B91C1C;--bad-bg:#FEE2E2;--text:#0F172A;--text-2:#334155;--muted:#64748B;--border:#E2E8F0;--th-bg:#EFF6FF;--shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06);}
+:root[data-theme="dark"]{--bg:#060B18;--surface:#0F172A;--surface-2:#1E293B;--accent:#60A5FA;--accent-2:#93C5FD;--accent-light:#1A2F52;--good:#4ADE80;--good-bg:#052E16;--warn:#FCD34D;--warn-bg:#1C1200;--bad:#F87171;--bad-bg:#2D0707;--text:#F1F5F9;--text-2:#CBD5E1;--muted:#94A3B8;--border:#1E293B;--th-bg:#1A2744;--shadow:0 1px 3px rgba(0,0,0,.4),0 1px 2px rgba(0,0,0,.3);}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:14px;line-height:1.6;background:var(--bg);color:var(--text);}
+.report-header{background:linear-gradient(135deg,var(--accent) 0%,#1E40AF 50%,var(--accent-2) 100%);color:#fff;padding:36px 40px 28px;margin-bottom:0;}
+.report-header h1{font-size:22px;font-weight:700;letter-spacing:-.3px;margin-bottom:6px;}
+.report-header .subtitle{opacity:.85;font-size:13px;margin-bottom:0;}
+.report-header .meta{display:flex;flex-wrap:wrap;gap:20px;font-size:12px;opacity:.75;border-top:1px solid rgba(255,255,255,.2);padding-top:12px;margin-top:16px;}
+.content{max-width:960px;margin:0 auto;padding:28px 32px 56px;}
+.section{margin-bottom:32px;}
+.section-title{font-size:14.5px;font-weight:700;padding:8px 0 8px 14px;border-left:3px solid var(--accent);margin-bottom:14px;color:var(--text);}
+h3.sub{font-size:13px;font-weight:600;color:var(--text-2);margin:16px 0 8px;}
+/* KPI grid */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:12px;margin-bottom:8px;}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow);}
+.kpi-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:8px;}
+.kpi-num{font-size:30px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums;margin-bottom:4px;}
+.kpi-unit{font-size:11.5px;color:var(--muted);}
+.kpi-ref{font-size:10.5px;color:var(--muted);margin-top:4px;}
+.kpi-badge{display:inline-flex;align-items:center;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:20px;margin-top:8px;}
+.c-good{color:var(--good);}.c-warn{color:var(--warn);}.c-bad{color:var(--bad);}.c-neutral{color:var(--muted);}
+.bg-good{background:var(--good-bg);color:var(--good);}
+.bg-warn{background:var(--warn-bg);color:var(--warn);}
+.bg-bad{background:var(--bad-bg);color:var(--bad);}
+.bg-neutral{background:var(--surface-2);color:var(--muted);}
+/* Config KV table */
+.kv-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:12px;box-shadow:var(--shadow);}
+table.kv{width:100%;border-collapse:collapse;font-size:13px;}
+table.kv td{padding:8px 14px;border-bottom:1px solid var(--border);}
+table.kv tr:last-child td{border-bottom:none;}
+table.kv td:first-child{font-weight:600;color:var(--text-2);width:42%;background:var(--surface-2);}
+/* Algorithm bar chart */
+.algo-list{display:flex;flex-direction:column;gap:10px;}
+.algo-row{display:flex;align-items:center;gap:10px;}
+.algo-name{width:210px;flex-shrink:0;font-size:12.5px;font-weight:500;color:var(--text-2);display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.algo-bar-bg{flex:1;height:24px;background:var(--surface-2);border-radius:5px;overflow:hidden;}
+.algo-bar-fill{height:100%;border-radius:5px;display:flex;align-items:center;padding-left:8px;font-size:11px;font-weight:700;color:#fff;min-width:24px;}
+.bar-selected{background:linear-gradient(90deg,var(--accent),var(--accent-2));}
+.bar-other{background:var(--muted);opacity:.4;}
+.algo-val{font-size:11.5px;color:var(--muted);flex-shrink:0;min-width:100px;text-align:right;font-variant-numeric:tabular-nums;}
+.winner-tag{font-size:10px;font-weight:700;background:var(--accent-light);color:var(--accent);border-radius:20px;padding:1px 7px;white-space:nowrap;}
+/* Data tables */
+.table-wrap{overflow-x:auto;margin-bottom:16px;}
+table.dt{border-collapse:collapse;width:100%;font-size:12px;min-width:560px;}
+table.dt th{background:var(--th-bg);text-align:left;padding:8px 11px;border:1px solid var(--border);font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.3px;}
+table.dt td{padding:6px 11px;border:1px solid var(--border);color:var(--text-2);}
+table.dt tr:nth-child(even) td{background:var(--surface-2);}
+.td-good{color:var(--good);font-weight:600;}
+.td-warn{color:var(--warn);font-weight:600;}
+.td-bad{color:var(--bad);font-weight:700;}
+/* Finding cards */
+.finding-list{display:flex;flex-direction:column;gap:8px;}
+.fc{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;gap:10px;align-items:flex-start;}
+.sev-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:5px;}
+.sev-h{background:var(--bad);}.sev-m{background:var(--warn);}.sev-l{background:var(--good);}.sev-n{background:var(--muted);}
+.fc-title{font-weight:600;font-size:13px;color:var(--text);}
+.fc-detail{font-size:11.5px;color:var(--muted);margin-top:2px;}
+/* Conclusion */
+.conclusion-block{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 24px;box-shadow:var(--shadow);}
+blockquote.finding{border-left:3px solid var(--accent);padding:12px 16px;background:var(--accent-light);border-radius:0 8px 8px 0;margin-bottom:14px;font-size:13.5px;line-height:1.7;}
+/* References */
+.refs-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 24px;box-shadow:var(--shadow);}
+ol.refs{padding-left:20px;font-size:11.5px;color:var(--muted);line-height:1.9;}
+.footnote{font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:12px;margin-top:14px;}
+hr.sep{border:none;border-top:1px solid var(--border);margin:28px 0;}
+@media print{.report-header{-webkit-print-color-adjust:exact;print-color-adjust:exact}.kpi-grid{break-inside:avoid}}
+</style>"""
 
 
-def _h(tag: str, text: str, cls: str = "") -> str:
-    c = f' class="{cls}"' if cls else ""
-    return f"<{tag}{c}>{_html.escape(str(text))}</{tag}>"
+def _kpi_card(label: str, value: Any, unit: str = "", *,
+              tone: str = "neutral", badge: str = "", ref: str = "") -> str:
+    if value is None:
+        val_str, color_cls = "—", "c-neutral"
+    else:
+        val_str = f"{value:.2f}" if isinstance(value, float) and value < 100 else \
+                  f"{value:.0f}" if isinstance(value, float) else str(value)
+        color_cls = f"c-{tone}" if tone in ("good", "warn", "bad") else "c-neutral"
+    badge_html = ""
+    if badge:
+        bcls = f"bg-{tone}" if tone in ("good", "warn", "bad") else "bg-neutral"
+        badge_html = f'<div class="kpi-badge {bcls}">{_html.escape(badge)}</div>'
+    ref_html = f'<div class="kpi-ref">{_html.escape(ref)}</div>' if ref else ""
+    return (f'<div class="kpi-card">'
+            f'<div class="kpi-label">{_html.escape(label)}</div>'
+            f'<div class="kpi-num {color_cls}">{_html.escape(val_str)}</div>'
+            f'<div class="kpi-unit">{_html.escape(unit)}</div>'
+            f'{badge_html}{ref_html}</div>')
 
 
-def _kv_table(rows: list[tuple[str, Any]]) -> str:
-    body = "".join(
-        f"<tr><td><strong>{_html.escape(str(k))}</strong></td>"
-        f"<td>{_html.escape('—' if v is None else str(v))}</td></tr>"
-        for k, v in rows
-    )
-    return f"<table><thead><tr><th>항목</th><th>값</th></tr></thead><tbody>{body}</tbody></table>"
+def _kv_row(key: str, val: Any) -> str:
+    v = "—" if val is None else _html.escape(str(val))
+    return f"<tr><td>{_html.escape(key)}</td><td>{v}</td></tr>"
 
 
-def _dict_table(d: dict) -> str:
-    return _kv_table([(k, v) for k, v in d.items()])
+def _kv_card(rows: list[tuple[str, Any]]) -> str:
+    body = "".join(_kv_row(k, v) for k, v in rows)
+    return f'<div class="kv-wrap"><table class="kv"><tbody>{body}</tbody></table></div>'
 
 
-def _algo_table_html(algos: list[dict]) -> str:
+def _algo_bar_chart(algos: list[dict], selected: str) -> str:
     if not algos:
-        return "<p class='muted'>알고리즘 데이터 없음</p>"
-    keys    = ["algorithm", "total_cost", "average_latency_ms", "prr_approx",
-               "handover_count", "average_bs_load", "summary_rank_score"]
-    headers = ["알고리즘", "총 비용", "평균 지연(ms)", "PRR", "핸드오버", "BS 부하", "순위 점수"]
-    head    = "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-    body    = ""
-    for row in algos:
-        body += "<tr>" + "".join(
-            f"<td>{_html.escape(str(row.get(k, '—')))}</td>" for k in keys
-        ) + "</tr>"
-    return f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
+        return '<p style="color:var(--muted);font-size:13px">알고리즘 데이터 없음</p>'
+    costs = [float(a.get("total_cost") or 0) for a in algos]
+    max_cost = max(costs) if costs else 1.0
+    parts = ['<div class="algo-list">']
+    for a, cost in zip(algos, costs):
+        algo_id = str(a.get("algorithm", "—"))
+        pct = int(cost / max_cost * 100) if max_cost > 0 else 0
+        is_sel = (algo_id == selected)
+        bar_cls = "bar-selected" if is_sel else "bar-other"
+        winner = '<span class="winner-tag">선택</span>' if is_sel else ""
+        lat = a.get("average_latency_ms")
+        prr = a.get("prr_approx")
+        meta = "  ·  ".join(filter(None, [
+            f"{lat:.1f} ms" if lat is not None else "",
+            f"PRR {prr:.3f}" if prr is not None else "",
+        ]))
+        parts.append(
+            f'<div class="algo-row">'
+            f'<div class="algo-name">{_html.escape(algo_id)}{winner}</div>'
+            f'<div class="algo-bar-bg">'
+            f'<div class="algo-bar-fill {bar_cls}" style="width:{pct}%">'
+            f'{_html.escape(f"{cost:.0f}") if pct > 15 else ""}</div></div>'
+            f'<div class="algo-val">{_html.escape(meta)}</div>'
+            f'</div>'
+        )
+    parts.append('</div>')
+    return "".join(parts)
 
 
-def _finding_items_html(items: list[dict], key_fields: list[str]) -> str:
+def _finding_list_html(items: list[dict], key_fields: list[str]) -> str:
     if not items:
-        return "<p class='muted'>해당 없음</p>"
-    lines = []
+        return '<p style="color:var(--muted);font-size:13px;padding:4px 0">해당 없음</p>'
+    sev_map = {"high": ("sev-h", "높음"), "medium": ("sev-m", "보통"),
+               "low": ("sev-l", "낮음")}
+    parts = ['<div class="finding-list">']
     for item in items:
-        parts = [str(item.get(f, "")) for f in key_fields if item.get(f) is not None]
-        lines.append("<li>" + _html.escape("  |  ".join(parts)) + "</li>")
-    return "<ul>" + "".join(lines) + "</ul>"
+        sev_raw = str(item.get("severity", "") or "").lower()
+        dot_cls, sev_label = sev_map.get(sev_raw, ("sev-n", sev_raw or "—"))
+        name = next((item.get(k) for k in ("street_name", "bs_name", "road_name")
+                     if item.get(k)), "—")
+        detail_parts = [
+            f"{f}: {item[f]}" for f in key_fields
+            if f not in ("street_name", "bs_name", "severity") and item.get(f) is not None
+        ][:5]
+        parts.append(
+            f'<div class="fc"><div class="sev-dot {dot_cls}"></div><div>'
+            f'<div class="fc-title">{_html.escape(str(name))} '
+            f'<span style="font-size:11px;color:var(--muted);font-weight:400">'
+            f'심각도: {_html.escape(sev_label)}</span></div>'
+            f'<div class="fc-detail">{_html.escape("  |  ".join(detail_parts))}</div>'
+            f'</div></div>'
+        )
+    parts.append('</div>')
+    return "".join(parts)
 
 
 def _edge_table_html(edges: list[dict]) -> str:
     if not edges:
-        return "<p class='muted'>데이터 없음</p>"
-    cols    = ["edge_index", "street_name", "latency_ms", "load_ratio",
-               "within_coverage", "handover", "cbr", "path_loss_db", "total_cost"]
-    headers = ["#", "도로명", "지연(ms)", "부하율", "커버리지", "핸드오버", "CBR†", "경로손실(dB)†", "비용"]
-    head    = "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-    body    = ""
+        return '<p style="color:var(--muted);font-size:13px">데이터 없음</p>'
+    cols = ["edge_index", "street_name", "latency_ms", "load_ratio",
+            "within_coverage", "handover", "cbr", "path_loss_db", "total_cost"]
+    hdrs = ["#", "도로명", "지연(ms)", "부하율", "커버리지", "핸드오버", "CBR†", "경로손실(dB)†", "비용"]
+    head = "<tr>" + "".join(f"<th>{h}</th>" for h in hdrs) + "</tr>"
+    body = ""
     for row in edges:
-        body += "<tr>" + "".join(
-            f"<td>{_html.escape(str(row.get(c, '')))}</td>" for c in cols
-        ) + "</tr>"
-    return f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
+        lat = row.get("latency_ms")
+        lat_cls = ("td-good" if lat is not None and lat < 20
+                   else "td-warn" if lat is not None and lat < 100
+                   else "td-bad" if lat is not None else "")
+        cells = []
+        for c in cols:
+            v = row.get(c)
+            raw = "—" if v is None else str(v)
+            if c == "latency_ms" and lat_cls:
+                cells.append(f'<td class="{lat_cls}">{_html.escape(raw)}</td>')
+            elif c in ("within_coverage", "handover"):
+                cls = "td-good" if v is True else ("td-bad" if v is False else "")
+                sym = ("&#10003;" if v is True else "&#10007;" if v is False else "—")
+                cells.append(f'<td class="{cls}">{sym}</td>')
+            else:
+                cells.append(f"<td>{_html.escape(raw)}</td>")
+        body += "<tr>" + "".join(cells) + "</tr>"
+    return (f'<div class="table-wrap"><table class="dt">'
+            f'<thead>{head}</thead><tbody>{body}</tbody></table></div>')
 
 
 def _bs_table_html(bs_rows: list[dict]) -> str:
     if not bs_rows:
-        return "<p class='muted'>데이터 없음</p>"
-    cols    = ["bs_name", "node_type", "load", "load_ratio", "severity",
-               "affected_edge_count", "avg_latency_on_route_ms", "jain_fairness_index"]
-    headers = ["BS명", "유형", "부하", "부하율", "심각도", "영향 구간", "평균 지연(ms)", "Jain FI"]
-    head    = "<tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-    body    = ""
+        return '<p style="color:var(--muted);font-size:13px">데이터 없음</p>'
+    cols = ["bs_name", "node_type", "load_ratio", "severity",
+            "affected_edge_count", "avg_latency_on_route_ms"]
+    hdrs = ["BS명", "유형", "부하율", "심각도", "영향 구간", "평균 지연(ms)"]
+    head = "<tr>" + "".join(f"<th>{h}</th>" for h in hdrs) + "</tr>"
+    body = ""
     for row in bs_rows:
-        body += "<tr>" + "".join(
-            f"<td>{_html.escape(str(row.get(c, '')))}</td>" for c in cols
-        ) + "</tr>"
-    return f"<table><thead>{head}</thead><tbody>{body}</tbody></table>"
+        cells = []
+        for c in cols:
+            v = row.get(c)
+            raw = "—" if v is None else str(v)
+            if c == "load_ratio" and v is not None:
+                try:
+                    fv = float(v)
+                    cls = "td-good" if fv < 0.7 else ("td-warn" if fv < 0.9 else "td-bad")
+                    cells.append(f'<td class="{cls}">{_html.escape(raw)}</td>')
+                except (ValueError, TypeError):
+                    cells.append(f"<td>{_html.escape(raw)}</td>")
+            elif c == "severity":
+                scls = {"high": "td-bad", "medium": "td-warn",
+                        "low": "td-good"}.get(str(v or "").lower(), "")
+                cells.append(f'<td class="{scls}">{_html.escape(raw)}</td>')
+            else:
+                cells.append(f"<td>{_html.escape(raw)}</td>")
+        body += "<tr>" + "".join(cells) + "</tr>"
+    return (f'<div class="table-wrap"><table class="dt">'
+            f'<thead>{head}</thead><tbody>{body}</tbody></table></div>')
 
 
 def render_report_html(doc: ReportDocument) -> str:
-    """Render ReportDocument to a self-contained HTML string."""
-    parts: list[str] = [
-        "<!DOCTYPE html><html lang='ko'><head>",
-        "<meta charset='UTF-8'>",
-        f"<title>{_html.escape(doc.title)}</title>",
-        _HTML_STYLE,
-        "</head><body>",
-        _h("h1", doc.title),
+    """Render ReportDocument to a visually polished, self-contained HTML report."""
+
+    def _tone_lat(v):   return "neutral" if v is None else ("good" if v < 20 else "warn" if v < 100 else "bad")
+    def _tone_prr(v):   return "neutral" if v is None else ("good" if v >= 0.9 else "warn" if v >= 0.7 else "bad")
+    def _tone_jain(v):  return "neutral" if v is None else ("good" if v >= 0.9 else "warn" if v >= 0.7 else "bad")
+    def _tone_cbr(v):   return "neutral" if v is None else ("good" if v < 0.65 else "warn" if v < 0.8 else "bad")
+    def _tone_cov(v):   return "neutral" if v is None else ("good" if v >= 90 else "warn" if v >= 70 else "bad")
+    def _tone_pir(v):   return "neutral" if v is None else ("good" if v <= 100 else "bad")
+    def _tone_impr(v):
+        try: return "neutral" if v is None else ("good" if float(v) > 0 else "bad")
+        except (ValueError, TypeError): return "neutral"
+
+    avg_lat  = doc.kpis.get("평균 지연 (ms)")
+    prr      = doc.kpis.get("PRR (근사)")
+    handover = doc.kpis.get("핸드오버 횟수")
+    coverage = doc.kpis.get("커버리지율 (%)")
+    cost_impr = doc.improvement.get("비용 개선 (%)")
+
+    kpi_cards = [
+        _kpi_card("평균 지연", avg_lat, "ms",
+                  tone=_tone_lat(avg_lat),
+                  badge=("충족" if avg_lat is not None and avg_lat < 20 else
+                         "초과" if avg_lat is not None else ""),
+                  ref="목표 < 20 ms [8]"),
+        _kpi_card("PRR", prr, "",
+                  tone=_tone_prr(prr),
+                  badge=("충족" if prr is not None and prr >= 0.9 else
+                         "미달" if prr is not None else ""),
+                  ref="> 0.90 [6]"),
+        _kpi_card("Jain 공정성", doc.jain_fairness_index, "",
+                  tone=_tone_jain(doc.jain_fairness_index),
+                  badge=("공정" if doc.jain_fairness_index is not None and doc.jain_fairness_index >= 0.9 else
+                         "보통" if doc.jain_fairness_index is not None and doc.jain_fairness_index >= 0.7 else
+                         "불공정" if doc.jain_fairness_index is not None else ""),
+                  ref=">= 0.90 권장 [9]"),
+        _kpi_card("CBR", doc.cbr_avg, "",
+                  tone=_tone_cbr(doc.cbr_avg),
+                  badge=("정상" if doc.cbr_avg is not None and doc.cbr_avg < 0.65 else
+                         "혼잡" if doc.cbr_avg is not None else ""),
+                  ref="< 0.65 [ETSI 4]"),
+        _kpi_card("핸드오버", handover, "회", tone="neutral"),
+        _kpi_card("커버리지율", coverage, "%",
+                  tone=_tone_cov(coverage),
+                  badge=("우수" if coverage is not None and coverage >= 90 else
+                         "양호" if coverage is not None and coverage >= 70 else
+                         "불량" if coverage is not None else ""),
+                  ref="> 90 % 권장"),
+        _kpi_card("PIR P99", doc.pir_p99_ms, "ms",
+                  tone=_tone_pir(doc.pir_p99_ms),
+                  badge=("충족" if doc.pir_p99_ms is not None and doc.pir_p99_ms <= 100 else
+                         "초과" if doc.pir_p99_ms is not None else ""),
+                  ref="<= 100 ms [1, 7]"),
+        _kpi_card("비용 개선", cost_impr, "%",
+                  tone=_tone_impr(cost_impr),
+                  badge=(f"{doc.selected_algorithm} vs baseline" if doc.selected_algorithm else "")),
     ]
+
+    p: list[str] = []
+    p.append("<!DOCTYPE html><html lang='ko'>")
+    p.append("<head><meta charset='UTF-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>")
+    p.append(f"<title>{_html.escape(doc.title)}</title>")
+    p.append(_HTML_STYLE)
+    p.append("</head><body>")
+
+    # ── Report header ──
+    p.append('<div class="report-header">')
+    p.append(f'<h1>{_html.escape(doc.title)}</h1>')
     if doc.subtitle:
-        parts.append(f"<p class='subtitle'>{_html.escape(doc.subtitle)}</p>")
+        p.append(f'<div class="subtitle">{_html.escape(doc.subtitle)}</div>')
+    meta_items = [
+        (f"Run: {doc.run_id}" if doc.run_id else ""),
+        (doc.generated_at or ""),
+        (f"시나리오: {doc.scenario_name}" if doc.scenario_name else ""),
+        (f"차량 {doc.vehicle_count}대" if doc.vehicle_count else ""),
+    ]
+    p.append('<div class="meta">' +
+             "".join(f'<span>{_html.escape(m)}</span>' for m in meta_items if m) +
+             '</div></div>')
 
-    parts += [_h("h2", "1. 보고서 정보"),
-              _kv_table([("런 ID", doc.run_id), ("생성 시각", doc.generated_at)])]
+    p.append('<div class="content">')
 
+    # ── KPI grid ──
+    p.append('<div class="section">')
+    p.append('<div class="section-title">핵심 성능 지표 (KPI)</div>')
+    p.append('<div class="kpi-grid">' + "".join(kpi_cards) + '</div>')
+    p.append('</div>')
+
+    # ── Algorithm comparison ──
+    if doc.algorithms:
+        p.append('<div class="section">')
+        p.append('<div class="section-title">알고리즘 비교</div>')
+        sel_label = _html.escape(doc.selected_algorithm)
+        base_label = _html.escape(doc.baseline_algorithm)
+        p.append(f'<p style="font-size:13px;color:var(--muted);margin-bottom:14px">'
+                 f'선택: <strong style="color:var(--text)">{sel_label}</strong>'
+                 f'&nbsp;&middot;&nbsp;기준선: {base_label}</p>')
+        p.append(_algo_bar_chart(doc.algorithms, doc.selected_algorithm))
+        p.append('</div>')
+
+    # ── Scenario / Config ──
+    p.append('<div class="section">')
+    p.append('<div class="section-title">시나리오 및 시뮬레이션 설정</div>')
     origin = (f"{doc.origin_lat:.5f}, {doc.origin_lng:.5f}"
               if doc.origin_lat is not None else None)
-    dest   = (f"{doc.dest_lat:.5f}, {doc.dest_lng:.5f}"
-              if doc.dest_lat is not None else None)
-    parts += [
-        _h("h2", "2. 시나리오 설명"),
-        _kv_table([
-            ("시나리오 ID",        doc.scenario_id),
-            ("시나리오 이름",      doc.scenario_name),
-            ("출발지 (위도,경도)", origin),
-            ("목적지 (위도,경도)", dest),
-            ("차량 대수",          doc.vehicle_count),
-            ("네트워크 모드",      doc.network_mode),
-        ]),
-    ]
-
-    parts += [
-        _h("h2", "3. 시뮬레이션 설정"),
-        _kv_table([
-            ("시뮬레이션 모드",     doc.sim_mode),
-            ("시드",               doc.seed),
-            ("경로 알고리즘",      doc.route_algorithm),
-            ("BS 선택 알고리즘",   doc.bs_selection_algorithm),
-            ("자원 할당 알고리즘", doc.resource_allocation_algorithm),
-            ("Look-ahead K",       doc.lookahead_k),
-        ]),
-    ]
+    dest = (f"{doc.dest_lat:.5f}, {doc.dest_lng:.5f}"
+            if doc.dest_lat is not None else None)
+    p.append(_kv_card([
+        ("시나리오 ID", doc.scenario_id),
+        ("출발지", origin), ("목적지", dest),
+        ("네트워크 모드", doc.network_mode),
+        ("시뮬레이션 모드", doc.sim_mode),
+        ("경로 알고리즘", doc.route_algorithm),
+        ("BS 선택 알고리즘", doc.bs_selection_algorithm),
+        ("자원 할당 알고리즘", doc.resource_allocation_algorithm),
+        ("시드", doc.seed), ("Look-ahead K", doc.lookahead_k),
+    ]))
     if doc.cost_weights:
-        parts += [_h("h3", "비용 가중치"), _dict_table(doc.cost_weights)]
-    if doc.norm_scales:
-        parts += [_h("h3", "정규화 스케일"), _dict_table(doc.norm_scales)]
+        p.append('<h3 class="sub">비용 가중치</h3>')
+        p.append(_kv_card(list(doc.cost_weights.items())))
+    p.append('</div>')
 
-    parts += [_h("h2", "4. 핵심 KPI"), _dict_table(doc.kpis)]
-    if any(v is not None for v in doc.improvement.values()):
-        label = f"기준선 대비 개선 ({doc.baseline_algorithm} → {doc.selected_algorithm})"
-        parts += [_h("h3", label), _dict_table(doc.improvement)]
+    # ── Findings ──
+    has_findings = any([doc.bottleneck_sections, doc.overloaded_bs,
+                        doc.high_latency_sections, doc.handover_sections,
+                        doc.future_risk_sections])
+    if has_findings:
+        p.append('<div class="section">')
+        p.append('<div class="section-title">병목 및 위험 발견</div>')
+        for title, items, fields in [
+            ("병목 구간", doc.bottleneck_sections,
+             ["street_name", "severity", "load_ratio", "latency_ms", "connected_bs"]),
+            ("과부하 기지국", doc.overloaded_bs,
+             ["bs_name", "severity", "load_ratio", "affected_edge_count"]),
+            ("고지연 구간", doc.high_latency_sections,
+             ["street_name", "latency_ms", "excess_ms", "connected_bs"]),
+            ("빈번 핸드오버 구간", doc.handover_sections,
+             ["street_name", "from_bs_name", "to_bs_name", "latency_ms"]),
+            ("미래 연결성 위험", doc.future_risk_sections,
+             ["street_name", "severity", "nearest_bs_name"]),
+        ]:
+            if items:
+                p.append(f'<h3 class="sub">{title} ({len(items)}개)</h3>')
+                p.append(_finding_list_html(items, fields))
+        p.append('</div>')
 
-    parts += [
-        _h("h2", "5. 알고리즘 비교"),
-        f"<p>선택: <strong>{_html.escape(doc.selected_algorithm)}</strong> &nbsp; 기준선: {_html.escape(doc.baseline_algorithm)}</p>",
-        _algo_table_html(doc.algorithms),
-    ]
-
-    parts.append(_h("h2", "6. 병목 / 위험 발견"))
-    parts += [
-        _h("h3", "6.1 병목 구간"),
-        _finding_items_html(doc.bottleneck_sections, ["street_name", "severity", "load_ratio", "latency_ms", "connected_bs"]),
-        _h("h3", "6.2 과부하 기지국"),
-        _finding_items_html(doc.overloaded_bs, ["bs_name", "severity", "load_ratio", "affected_edge_count"]),
-        _h("h3", "6.3 고지연 구간"),
-        _finding_items_html(doc.high_latency_sections, ["street_name", "latency_ms", "excess_ms", "connected_bs"]),
-        _h("h3", "6.4 빈번 핸드오버 구간"),
-        _finding_items_html(doc.handover_sections, ["street_name", "from_bs_name", "to_bs_name", "latency_ms"]),
-        _h("h3", "6.5 미래 연결성 위험 구간"),
-        _finding_items_html(doc.future_risk_sections, ["street_name", "severity", "nearest_bs_name"]),
-    ]
-
-    parts.append(_h("h2", "7. 결론"))
+    # ── Conclusion ──
+    p.append('<div class="section">')
+    p.append('<div class="section-title">결론 및 권고사항</div>')
+    p.append('<div class="conclusion-block">')
     if doc.primary_finding:
-        parts.append(f"<blockquote>{_html.escape(doc.primary_finding)}</blockquote>")
+        p.append(f'<blockquote class="finding">{_html.escape(doc.primary_finding)}</blockquote>')
     if doc.trade_offs:
-        parts.append(_h("h3", "트레이드오프"))
-        parts.append("<ul>" + "".join(f"<li>{_html.escape(t)}</li>" for t in doc.trade_offs) + "</ul>")
+        p.append('<h3 class="sub">트레이드오프</h3>')
+        p.append("<ul style='padding-left:20px;font-size:13px;line-height:1.8'>" +
+                 "".join(f"<li>{_html.escape(t)}</li>" for t in doc.trade_offs) + "</ul>")
     if doc.risk_factors:
-        parts.append(_h("h3", "위험 요인"))
-        parts.append("<ul>" + "".join(f"<li>{_html.escape(r)}</li>" for r in doc.risk_factors) + "</ul>")
-    if doc.recommendation_text:
-        parts.append(f"<p style='margin-top:10px'>{_html.escape(doc.recommendation_text)}</p>")
+        p.append('<h3 class="sub" style="margin-top:14px">위험 요인</h3>')
+        p.append("<ul style='padding-left:20px;font-size:13px;line-height:1.8'>" +
+                 "".join(f"<li>{_html.escape(r)}</li>" for r in doc.risk_factors) + "</ul>")
+    if doc.recommendation_text and doc.recommendation_text != "분석 데이터가 충분하지 않습니다.":
+        p.append(f'<p style="font-size:13px;color:var(--muted);margin-top:14px">'
+                 f'{_html.escape(doc.recommendation_text)}</p>')
+    p.append('</div></div>')
 
-    parts += [
-        "<hr>",
-        _h("h2", "부록 A. 구간별 메트릭 (처음 20행)"),
-        _edge_table_html(doc.per_edge_sample),
-        _h("h2", "부록 B. 기지국 요약"),
-        _bs_table_html(doc.per_bs_summary),
-        "<hr>",
-        _h("h2", "참고문헌 / References"),
-        "<ol class='refs'>" + "".join(f"<li>{_html.escape(r)}</li>" for r in REFERENCES) + "</ol>",
-        "<p class='ref' style='margin-top:8px'>† 해석 모델 기반 (analytical model). 실제 MAC 계층 측정과 차이 가능.</p>",
-    ]
+    # ── Appendices ──
+    if doc.per_edge_sample:
+        p.append('<hr class="sep">')
+        p.append('<div class="section">')
+        p.append('<div class="section-title">부록 A. 구간별 메트릭 (처음 20행)</div>')
+        p.append(_edge_table_html(doc.per_edge_sample))
+        p.append('</div>')
+    if doc.per_bs_summary:
+        p.append('<div class="section">')
+        p.append('<div class="section-title">부록 B. 기지국 요약</div>')
+        p.append(_bs_table_html(doc.per_bs_summary))
+        p.append('</div>')
 
-    parts.append("</body></html>")
-    return "\n".join(parts)
+    # ── References ──
+    p.append('<hr class="sep">')
+    p.append('<div class="refs-card">')
+    p.append('<div class="section-title" style="margin-bottom:12px">참고문헌 / References</div>')
+    p.append('<ol class="refs">' +
+             "".join(f"<li>{_html.escape(r)}</li>" for r in REFERENCES) + '</ol>')
+    p.append('<div class="footnote">'
+             '† 해석 모델 기반 (analytical model). '
+             'MAC 계층 측정 없이 검증된 수식을 적용한 추정치이며 실제 측정과 차이 가능.'
+             '</div></div>')
+
+    p.append('</div>')  # .content
+    p.append('</body></html>')
+    return "".join(p)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

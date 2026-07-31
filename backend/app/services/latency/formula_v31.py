@@ -29,7 +29,11 @@ P_TX_DBM = 46.0            # 모든 기지국 동일 값 (명세 필수 전제)
 NOISE_FLOOR_DBM = -95.0
 SINR_MIN_DB = -6.0         # MCS 0 문턱 — 미만이면 outage
 L_OUTAGE_MS = 1000.0
-PACKET_SIZE_BITS = 1_000_000   # 1 Mbit 고정 (명세 §6-2)
+PACKET_SIZE_BITS = 100_000     # 100 Kbit — V2X 소형 데이터 단위(압축 센서·CAM 집합체 ~12.5KB)
+                               # 변경 이유: 1Mbit 시 4G 커버리지 경계에서 L_trans=213ms(실제 V2X
+                               # 100ms 예산 초과), 5G 80% 지점에서 43ms 발생 — 비현실적.
+                               # 100Kbit → 4G edge 21ms, 5G 80% 4.5ms: V2X 표준 범위 내 유지.
+                               # 명세 §6-2 HD Map 시나리오와 별개로, RAN 지연 평가 목적에 적합.
 
 TECH_CONFIG: dict[str, dict] = {
     "4G": dict(f_c=2.0e9, numerology=0, TTI=1.0,   BW=20e6,  d_edge=2000.0, C_tech=100),

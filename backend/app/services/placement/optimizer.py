@@ -19,6 +19,12 @@ from .a_seg_cache import build_a_seg_table
 from .candidates import DEFAULT_K, build_bs_candidates, build_rsu_candidates
 from .sa_engine import PlacementResult, optimize
 from .scoring import DemandPoint
+from .tiled_optimizer import (
+    _MIN_DEMAND_FOR_TILING,
+    _MIN_STATIONS_FOR_TILING,
+    _DEFAULT_TILE_K,
+    tiled_optimize_placement,
+)
 
 # 수요점 하나가 대표하는 도로 조각의 최대 길이(m).
 # RSU 셀 반경(5G 156m)보다 충분히 짧아야 조각 하나가 여러 RSU에 걸치지 않는다.
@@ -102,6 +108,8 @@ def optimize_placement_for_area(
     seed: Optional[int] = None,
     log: Optional[Callable[[str], None]] = None,
     progress: Optional[Callable[[float, str], None]] = None,
+    use_tiled: Optional[bool] = None,
+    tile_k: int = _DEFAULT_TILE_K,
 ) -> PlacementResult:
     """구역 하나에 대해 BS N_BS개 + RSU N_RSU개를 **함께** 최적화한다.
 
@@ -111,15 +119,45 @@ def optimize_placement_for_area(
         개선 0.00%에 389초를 쓰는 것으로 확인됐다. greedy 해가 1-swap 국소최적이라
         단일 swap 이동으로는 이길 수 없기 때문이다(sa_engine.optimize docstring 참조).
         양수를 명시하면 예전처럼 SA가 돈다.
+
+    use_tiled : None(자동), True(강제), False(비활성).
+        자동이면 수요 >= 500점 AND N_BS+N_RSU >= 5 일 때 타일 분할 최적화를 쓴다.
+        타일 분할은 A_seg 계산량을 O(D×C/k²)로 줄여 k=2에서 ~4배 빠르다.
     """
     log = log or _log_noop
+
+    # ── 타일 분할 여부 결정 ───────────────────────────────────────────────────
+    _n_total = len(list(demand))
+    _n_st = (n_bs or 0) + (n_rsu or 0)
+    _should_tile = (
+        _n_total >= _MIN_DEMAND_FOR_TILING and _n_st >= _MIN_STATIONS_FOR_TILING
+    )
+    if use_tiled is True:
+        _should_tile = True
+    elif use_tiled is False:
+        _should_tile = False
+
+    if _should_tile:
+        log(f"[타일 분할] 수요 {_n_total}점 / {_n_st}국소 — {tile_k}×{tile_k} 타일로 분산")
+        res = tiled_optimize_placement(
+            net, buildings_gdf, demand, n_bs, n_rsu,
+            tech=tech, k_cand=k, tile_k=tile_k,
+            cache_dir=cache_dir, routable_edge_ids=routable_edge_ids,
+            sa_iter=sa_iter, n_greedy=n_greedy, n_random=n_random,
+            seed=seed, log=log, progress=progress,
+        )
+        if progress:
+            progress(1.0, "완료")
+        return res
+
+    # ── 단일 최적화 (기존 경로) ───────────────────────────────────────────────
     bs = build_bs_candidates(buildings_gdf, tech, k) if n_bs > 0 else []
     rsu = (build_rsu_candidates(net, tech, k, routable_edge_ids=routable_edge_ids)
            if n_rsu > 0 else [])
     if not bs and not rsu:
         log("후보가 없어 최적화를 건너뜁니다")
         return PlacementResult(tech=tech, n_bs=0, n_rsu=0)
-    log(f"후보 BS {len(bs)}개 / RSU {len(rsu)}개 (K={k:g}), 수요 {len(demand)}점")
+    log(f"후보 BS {len(bs)}개 / RSU {len(rsu)}개 (K={k:g}), 수요 {_n_total}점")
 
     # 진행률은 A_seg가 0~90%를 쓴다 — 전체 시간의 대부분이 거기다. greedy는 반복마다
     # 후보 전수를 훑는 구조라 중간 진행률을 만들 자연스러운 지점이 없어 90%에서 표시만 바꾼다.

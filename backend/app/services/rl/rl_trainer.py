@@ -30,7 +30,16 @@ from typing import Optional
 from app.services.rl.v2x_routing_env import V2XRoutingEnv, StepResult
 
 
-SUPPORTED_POLICIES = ("random", "greedy", "coverage", "ppo", "dqn")
+SUPPORTED_POLICIES = ("random", "greedy", "coverage", "ppo", "dqn", "v4_gnn")
+
+# Module-level V4 adapter — set by policy_comparison or external callers
+_v4_adapter = None
+
+
+def set_v4_adapter(adapter) -> None:
+    """Register a V4RoutingAdapter for use in _select_action(v4_gnn)."""
+    global _v4_adapter
+    _v4_adapter = adapter
 
 
 # ── Result types ──────────────────────────────────────────────────────────────
@@ -111,6 +120,18 @@ def _select_action(env: V2XRoutingEnv, policy: str, rng: random.Random) -> int:
                 best_loss = loss
                 best_action = a
         return best_action
+
+    if policy == "v4_gnn":
+        if _v4_adapter is not None and _v4_adapter.is_ready:
+            s = env._env_state
+            if s is not None:
+                action = _v4_adapter.select_action(
+                    s.current_node_id,
+                    s.candidate_edges,
+                )
+                if action in valid:
+                    return action
+        return rng.choice(valid)
 
     return rng.choice(valid)
 

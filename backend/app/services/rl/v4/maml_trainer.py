@@ -132,8 +132,14 @@ class MAMLTrainer:
 
         # Meta-model (shared θ)
         self._model = UniversalGNNPolicy().to(self._device)
-        if self.cfg.compile_model and hasattr(torch, "compile"):
+        # torch.compile on MPS is an early prototype and currently broken for GATv2Conv
+        _can_compile = self.cfg.compile_model and hasattr(torch, "compile") \
+                       and self._device.type not in ("mps",)
+        if _can_compile:
             self._model = torch.compile(self._model)
+        elif self.cfg.compile_model and self._device.type == "mps":
+            print("[MAML] torch.compile 비활성화 (MPS 미지원 — CUDA 전용)")
+
 
         # Meta-optimizer (outer loop, Adam)
         self._meta_opt = optim.Adam(self._model.parameters(), lr=self.cfg.meta_lr)
@@ -268,7 +274,15 @@ class MAMLTrainer:
                 mask_list = env.action_masks()
                 mask = torch.tensor(mask_list, dtype=torch.bool, device=self._device)
 
+                # 유효 행동이 없는 막다른 노드 → 강제 종료
+                if not mask.any():
+                    break
+
                 logits, value = model(data, action_mask=mask)
+                # NaN 방어 (MPS 수치 불안정 대비)
+                if torch.isnan(logits).any():
+                    break
+
                 dist = torch.distributions.Categorical(logits=logits)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)

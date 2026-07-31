@@ -615,7 +615,7 @@ class V2XRoutingEnv:
         pred_lat = self._estimate_latency(cur_lat, cur_lng, best_bs)
         blockage = self._blockage_score(cur_lat, cur_lng, best_bs)
 
-        candidates = self._get_candidates(node_id)[:MAX_CANDIDATES]
+        candidates = self._get_candidates(node_id)
 
         # Pre-compute edge costs for all candidates in one pass (fix #7)
         self._cached_edge_costs = [
@@ -677,7 +677,8 @@ class V2XRoutingEnv:
                 distance_m=dist_m,
                 speed_mps=speed_mps,
             ))
-        return result
+        result.sort(key=lambda e: e.distance_m)
+        return result[:MAX_CANDIDATES]
 
     def _edge_cost(self, edge: EdgeInfo, prev_best_node_id: Optional[str] = None) -> dict:
         """
