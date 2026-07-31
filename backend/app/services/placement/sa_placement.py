@@ -19,24 +19,30 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.services.geo.spatial_grid import SpatialGrid
+from app.services.latency.formula_v31 import resolve_coverage_radius as _f31_coverage
 
 # ── 기술 파라미터 — SA 최적화 전용 근사 모델의 사본 ────────────────────────────
 # 주의: L_base/P_tx/alpha/beta 등은 formula_v31(설계문서 v3.1)과 다른 구식 근사식
-# (_L_total_sa)의 파라미터다 — SA 반복 성능을 위해 유지. 단 coverage_radius_m은
-# 런타임 규칙(formula_v31.resolve_coverage_radius: BS=d_edge)과 반드시 일치시킨다.
+# (_L_total_sa)의 파라미터다 — SA 반복 성능을 위해 유지. 단 커버리지 반경은 **여기서
+# 값을 갖지 않는다** — `_coverage_radius()`가 formula_v31에 그때그때 물어본다.
 # 여기가 어긋나면 배치 최적화가 실제 시뮬레이션과 다른 커버리지로 계산된다.
+#
+# ⚠️ 2026-07-30 — 사본을 없앤 이유. RSU 반경이 여기만 `{4G:100, 5G:150, 6G:250}`으로
+# 남아 있었다. formula_v31이 2026-07-27에 폐기 선언한 값이고(세대가 올라갈수록 커지는
+# 규약이라 BS와 정반대였다), 유도값은 h_RSU=5m·ΔP=20dB에서 4G 312 / 5G 156 / 6G 62 m다.
+# 즉 배치 최적화는 6G RSU를 실제(62m)보다 4배 넓게 보고 자리를 골랐다.
+# 상수를 옮겨 적는 대신 참조로 바꿔, 다음에 물리 파라미터가 바뀌어도 갈라지지 않게 한다.
 _TECH_PARAMS: dict[str, dict] = {
     "4G": dict(L_base=25.0, P_tx=43.0, alpha=45.0, beta=3.5,
                RSRP_thresh=-85.0, RSRP_range=25.0, N_max=6, T_retx=8.0,
-               C_tech=100, coverage_radius_m=2000.0),
+               C_tech=100),
     "5G": dict(L_base=15.0, P_tx=46.0, alpha=55.0, beta=3.0,
                RSRP_thresh=-90.0, RSRP_range=25.0, N_max=4, T_retx=1.0,
-               C_tech=500, coverage_radius_m=1000.0),
+               C_tech=500),
     "6G": dict(L_base= 1.0, P_tx=48.0, alpha=68.0, beta=2.5,
                RSRP_thresh=-95.0, RSRP_range=25.0, N_max=3, T_retx=0.1,
-               C_tech=2000, coverage_radius_m=500.0),
+               C_tech=2000),
 }
-_RSU_COVERAGE_RADIUS_M = {"4G": 100.0, "5G": 150.0, "6G": 250.0}
 
 # 커버리지 밖 수요점에 부과하는 미커버 패널티 (ms)
 _UNCOVERED_PENALTY_MS = 200.0
@@ -110,9 +116,11 @@ def _L_total_sa(distance_m: float, n_vehicles: float, network_mode: str) -> floa
 
 
 def _coverage_radius(network_mode: str, node_type: str) -> float:
-    if node_type == "rsu":
-        return _RSU_COVERAGE_RADIUS_M.get(network_mode, 150.0)
-    return _TECH_PARAMS.get(network_mode, _TECH_PARAMS["5G"])["coverage_radius_m"]
+    """셀 반경 — **formula_v31이 유일한 출처**다 (BS·RSU 모두 d_edge).
+
+    BS 4G 2000 / 5G 1000 / 6G 500 m, RSU 4G 312 / 5G 156 / 6G 62 m.
+    """
+    return _f31_coverage(network_mode, node_type)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
