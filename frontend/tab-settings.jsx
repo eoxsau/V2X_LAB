@@ -21,8 +21,9 @@ const DEFAULT_SIM_CONFIG = {
   policy_options: {
     lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
     prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
-    traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
-    demand_scale_pct: 100, bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
+    // 백엔드 SimConfigPolicyOptions 기본값과 반드시 같아야 한다(app.jsx 주석 참조).
+    traffic_lambda: 5.0, other_device_lambda: 30.0, network_mode: '5G',
+    demand_scale_pct: 100, bg_reroute_prob: 0, bg_reroute_mode: 'random',
   },
 };
 
@@ -518,21 +519,21 @@ function SettingsTab({ sim, dispatch, api, simConfig, setSimConfig, mode, setApp
                 <td><b style={{ fontWeight: 600 }}>기타 기기 밀도 (λ)</b></td>
                 <td><div className="input-suffix" style={{ width: 130 }}>
                   <input className="input" style={{ height: 32 }} type="number" min="0" max="2000" step="10"
-                    value={cfgDraft.policy_options.other_device_lambda ?? 300.0}
+                    value={cfgDraft.policy_options.other_device_lambda ?? 30.0}
                     onChange={e => setPolicy('other_device_lambda', Math.max(0, Math.min(2000, parseFloat(e.target.value) || 0)))} />
                   <span className="sfx">대/km²</span>
                 </div></td>
-                <td><span className="muted" style={{ fontSize: 11 }}>차량 외 기기(폰·IoT) 밀도 — 같은 기지국 capacity를 나눠 쓰는 비차량 부하 (0–2000)</span></td>
+                <td><span className="muted" style={{ fontSize: 11 }}>차량 외 기기(폰·IoT)의 <b>순간 활성</b> 밀도 — 같은 기지국 capacity를 나눠 쓰는 비차량 부하 (0–2000, 기본 30 = 총 밀도 300/km²의 활성 10%). 반경 1km 기지국 기준 30이면 약 94대, 300이면 약 942대가 깔려 5G 수용량(500)을 혼자 넘긴다</span></td>
               </tr>
               <tr>
                 <td><b style={{ fontWeight: 600 }}>배경 차량 실시간 재경로</b></td>
                 <td><div className="input-suffix" style={{ width: 130 }}>
                   <input className="input" style={{ height: 32 }} type="number" min="0" max="100" step="1"
-                    value={Math.round((cfgDraft.policy_options.bg_reroute_prob ?? 0.02) * 100)}
+                    value={Math.round((cfgDraft.policy_options.bg_reroute_prob ?? 0) * 100)}
                     onChange={e => setPolicy('bg_reroute_prob', Math.max(0, Math.min(100, parseInt(e.target.value, 10) || 0)) / 100)} />
-                  <span className="sfx">%/초</span>
+                  <span className="sfx">%/5초</span>
                 </div></td>
-                <td><span className="muted" style={{ fontSize: 11 }}>SUMO 모드 한정 — 배경 차량이 초당 이 확률로 주행 도중 무작위 목적지로 재경로(고정 경로 대신 동적 행태). 0이면 도착 시에만 새 목적지로 교체</span></td>
+                <td><span className="muted" style={{ fontSize: 11 }}>SUMO 모드 한정 — 배경 차량이 <b>5초마다</b> 이 확률로 주행 도중 무작위 목적지로 재경로. <b>기본 0(끔)</b> — 올리면 차가 도착하기 전에 목적지를 다시 받아 통행을 못 끝내고, 도로 정체가 끝까지 안 풀린다. 0이면 도착 시에만 새 목적지로 교체</span></td>
               </tr>
               <tr>
                 <td><b style={{ fontWeight: 600 }}>재경로 트리거 방식</b></td>

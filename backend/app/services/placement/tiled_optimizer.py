@@ -100,7 +100,8 @@ def tiled_optimize_placement(
                         sa_iter=n_iter, seed=seed)
 
     # ── 타일별 수요 비율에 따라 BS/RSU 개수 배분 ──────────────────────────────
-    total_demand_wt = sum(sum(d.demand for d in td) for _, td, _, _ in tile_data)
+    # DemandPoint의 수요 값은 `vehicle_count`다(scoring.DemandPoint) — `demand`가 아니다.
+    total_demand_wt = sum(sum(d.vehicle_count for d in td) for _, td, _, _ in tile_data)
 
     all_placed: list[dict] = []
     n_evals_total = 0
@@ -112,7 +113,7 @@ def tiled_optimize_placement(
     log(f"[타일] {len(tile_data)}개 타일로 분할 (격자={tile_k}×{tile_k})")
 
     for ti, (tile, tile_d, tile_bs, tile_rsu) in enumerate(tile_data):
-        tile_wt = sum(d.demand for d in tile_d) / max(total_demand_wt, 1e-9)
+        tile_wt = sum(d.vehicle_count for d in tile_d) / max(total_demand_wt, 1e-9)
         tile_n_bs = max(1, round(n_bs * tile_wt)) if n_bs > 0 else 0
         tile_n_rsu = max(1, round(n_rsu * tile_wt)) if n_rsu > 0 else 0
 

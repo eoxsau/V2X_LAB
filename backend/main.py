@@ -559,6 +559,22 @@ _sim_speed_value = 1.0
 # 1e5초(약 28시간)면 어떤 정상 경로보다도 압도적으로 비싸다.
 OUT_OF_AREA_TRAVELTIME_S = 1e5
 
+# 위 벌점은 `traci.edge.adaptTraveltime`으로 **실행 중인 SUMO에** 거는 것이라, SUMO 자체
+# 라우터(`traci.simulation.findRoute` — 기본 Dijkstra)에만 먹는다. 직접 짠 탐색(A*, Yen의
+# K-shortest)은 sumolib의 **정적 엣지 길이**를 읽으므로 그 벌점을 볼 방법이 없었고, 그래서
+# "구역 밖으로 새지 마라"가 A*·K에는 전혀 적용되지 않았다(2026-08-06 확인).
+# 거리 기반 탐색이 쓸 수 있도록 같은 뜻의 **거리** 벌점을 따로 둔다.
+# 값 근거: 구역 대각선이 수 km이므로 1e5m(100km)면 어떤 정상 경로보다 압도적으로 비싸다.
+# 금지가 아니라 벌점인 이유는 위와 같다 — 안쪽만으로 길이 없으면 우회를 허용해야 한다.
+OUT_OF_AREA_PENALTY_M = 1e5
+
+# 탐색용 건물 조회 bbox 패딩(도). load_route_buildings의 기본값(0.0015 ≈ 165m)은 이미
+# 확정된 경로 주변만 덮으면 되지만, 경로탐색 중에는 Dijkstra가 출발–도착 직선 회랑
+# 바깥까지 펼치므로 더 넓게 잡아야 한다. 0.005° ≈ 550m.
+# 건물이 없는 구간은 차폐 0으로 계산되므로, 좁게 잡으면 "건물이 없어서 좋은 길"로
+# 잘못 보여 경로가 그쪽으로 쏠린다.
+SEARCH_BUILDING_PADDING_DEG = 0.005
+
 # 네트워크 텔레메트리 재계산 최소 간격(초, **벽시계**).
 #
 # `update_network_telemetry`는 노드마다 건물 차폐를 ray casting으로 다시 재는데,
@@ -633,7 +649,14 @@ class SimConfigPolicyOptions(BaseModel):
     demand_scale_pct:     float = 100.0 # 기준 교통량(N*) 대비 %. 10~300. 생성 교통의 총 통행 수를 정한다.
                                          # N*는 구역마다 자동 산정(demand/calibration.py, 진행문서 §5-C).
                                          # 100% = 정체가 "생겼다 풀리는" 수준.
-    bg_reroute_prob:      float = 0.02  # 배경 차량이 초당 무작위로 목적지를 바꿀 확률 (0~1) — 고정 경로 대신 동적 재경로
+    bg_reroute_prob:      float = 0.0   # 배경 차량이 무작위로 목적지를 바꿀 확률 (0~1). **기본 끔.**
+                                         # ⚠️ 0.02였을 때: 10스텝(=5 시뮬초)마다 2%씩 걸리므로 한 대가
+                                         # 새 목적지를 받기까지 평균 250초(약 4분)인데, 자유류 통행시간은
+                                         # 150초(2.5분)다 — 도착보다 재배정이 더 자주 온다. 그 결과 배경
+                                         # 차량이 통행을 끝내지 못하고 계속 돌아, 미리 만든 교통에서는
+                                         # 9:30에 완전히 빠지던 도로가 실행 중에는 영영 비지 않았다
+                                         # (2026-08-11 실측: 1,014대 중 666대(66%) 정지, 평균 13.6km/h).
+                                         # 동적 교통 실험이 필요하면 값을 올려서 켠다.
     bg_reroute_mode:      str   = "random"  # "random"(균일 확률) | "congestion"(현재 위치 BS 혼잡도에 비례해 확률 증가) — Pro 전용
     # ── ITS 교통량 환산 파라미터 (민감도 분석용) ────────────────────────────────
     v2x_penetration_rate: float = 0.25  # V2X 단말 보급률 [0.05~1.0], 기본=초기 보급 단계
@@ -2686,17 +2709,79 @@ def yen_k_paths_mock(
     return [p for _, p in A]
 
 
+# 타겟 차량은 DEFAULT_VEHTYPE로 투입된다(traci.vehicle.add) — vClass는 passenger다.
+_ROUTING_VCLASS = "passenger"
+
+
+def _passenger_successors(net, cur_edge) -> list:
+    """`cur_edge`에서 **승용차가 실제로 진입할 수 있는** 다음 엣지들.
+
+    sumolib의 `getOutgoing()`은 "이어져 있는가"만 답한다 — 차종 제한(vClass)을 보지
+    않으므로 보행자·자전거 전용 연결까지 그대로 돌려준다. 그 연결을 지나는 경로를
+    `traci.route.add`로 넘기면 SUMO가 "no valid route"로 **차량 투입 자체를 거부**하고
+    시뮬 스레드가 그 자리에서 죽는다.
+
+    2026-08-06 실측(area-716eb7ba): A*가 낸 46엣지 경로의 -381204595#0 → -789114765
+    구간은 차선 연결이 존재하지만 허용 차종이 보행자·자전거·배달뿐이라 veh0 투입이
+    실패했다. SUMO 자체 라우터(`traci.simulation.findRoute`)는 vClass를 보므로 같은
+    출발·도착에서 멀쩡한 37엣지 경로를 냈다 — 즉 문제는 **직접 짠 탐색 4종**에만 있다.
+
+    차선 단위로 내려가 출발 차선과 도착 차선이 **둘 다** 승용차를 허용하는 연결만 남긴다.
+    """
+    out: list = []
+    seen_ids: set[str] = set()
+    for lane in cur_edge.getLanes():
+        try:
+            if not lane.allows(_ROUTING_VCLASS):
+                continue
+        except Exception:
+            continue
+        for conn in lane.getOutgoing():
+            try:
+                to_lane = conn.getToLane()
+                if not to_lane.allows(_ROUTING_VCLASS):
+                    continue
+                nxt = to_lane.getEdge()
+            except Exception:
+                continue
+            nid = nxt.getID()
+            if nid.startswith(":") or nid in seen_ids:
+                continue
+            seen_ids.add(nid)
+            out.append(nxt)
+    return out
+
+
+def _edges_connected_for_passenger(net, e1_id: str, e2_id: str) -> bool:
+    """e1 → e2 를 승용차가 실제로 지날 수 있는가.
+
+    ⚠️ 예전 검사는 `getOutgoing()`으로 인접 여부만 물었는데, 탐색도 **같은** 관계를
+    썼기 때문에 자기가 낸 답을 자기 기준으로 채점하는 꼴이라 vClass 위반을 영원히
+    잡지 못했다. 판정 기준을 SUMO와 같은 쪽(차선별 통행 허용)으로 맞춘다.
+    """
+    try:
+        return any(e.getID() == e2_id for e in _passenger_successors(net, net.getEdge(e1_id)))
+    except Exception:
+        return False
+
+
 def _dijkstra_blocked_sumo(
     net,
     from_edge: str,
     to_edge: str,
     blocked_nodes: frozenset,
     blocked_edges: frozenset,
+    penalized_edges: Optional[frozenset] = None,
+    penalty_m: float = OUT_OF_AREA_PENALTY_M,
 ) -> tuple[float, list[str]]:
     """
     Distance-only Dijkstra on sumolib edge graph supporting Yen's blocked sets.
     'Nodes' in this graph are sumolib edge IDs.
+
+    penalized_edges : 구역 밖 엣지 집합. 여기 속한 엣지를 지나면 `penalty_m`을 더한다
+        (`_apply_area_penalty` 주석 참조).
     """
+    _pen = penalized_edges or frozenset()
     pq = [(0.0, from_edge)]
     dist: dict[str, float] = {from_edge: 0.0}
     prev: dict[str, Optional[str]] = {from_edge: None}
@@ -2711,15 +2796,13 @@ def _dijkstra_blocked_sumo(
             cur_edge = net.getEdge(cur_id)
         except Exception:
             continue
-        for nxt_edge in cur_edge.getOutgoing().keys():
+        for nxt_edge in _passenger_successors(net, cur_edge):
             nxt_id = nxt_edge.getID()
-            if nxt_id.startswith(":"):
-                continue
             if nxt_id in blocked_nodes:
                 continue
             if (cur_id, nxt_id) in blocked_edges:
                 continue
-            new_cost = cost + nxt_edge.getLength()
+            new_cost = cost + nxt_edge.getLength() + (penalty_m if nxt_id in _pen else 0.0)
             if new_cost < dist.get(nxt_id, float("inf")):
                 dist[nxt_id] = new_cost
                 prev[nxt_id] = cur_id
@@ -2741,12 +2824,20 @@ def yen_k_paths_sumo(
     from_edge: str,
     to_edge: str,
     k: int = 5,
+    penalized_edges: Optional[frozenset] = None,
 ) -> list[list[str]]:
     """
     Yen's K-shortest simple paths on the sumolib edge graph (distance-only).
     'Nodes' are sumolib edge IDs.  Returns up to K paths, shortest first.
+
+    penalized_edges : 구역 밖 엣지 — 후보 생성 단계에서 거리 벌점을 물린다
+        (OUT_OF_AREA_PENALTY_M 주석 참조). 후보를 다 만든 뒤 통신비용으로 고르는
+        `best_of_k_path`는 구역 개념을 모르므로, 여기서 걸러야 구역 밖 경로가
+        애초에 후보에 안 들어온다.
     """
-    cost0, path0 = _dijkstra_blocked_sumo(net, from_edge, to_edge, frozenset(), frozenset())
+    _pen = penalized_edges or frozenset()
+    cost0, path0 = _dijkstra_blocked_sumo(net, from_edge, to_edge, frozenset(), frozenset(),
+                                          penalized_edges=_pen)
     if not path0:
         return []
 
@@ -2763,6 +2854,9 @@ def yen_k_paths_sumo(
             for j in range(len(root_path) - 1):
                 try:
                     root_cost += net.getEdge(root_path[j]).getLength()
+                    # spur 탐색과 같은 잣대로 재야 A/B 비교가 어긋나지 않는다.
+                    if root_path[j + 1] in _pen:
+                        root_cost += OUT_OF_AREA_PENALTY_M
                 except Exception:
                     pass
 
@@ -2776,6 +2870,7 @@ def yen_k_paths_sumo(
             spur_cost, spur_path = _dijkstra_blocked_sumo(
                 net, spur_edge, to_edge,
                 frozenset(blocked_nodes), frozenset(blocked_edges),
+                penalized_edges=_pen,
             )
             if spur_path:
                 total_path = root_path[:-1] + spur_path
@@ -2812,14 +2907,20 @@ def build_mock_k_edge_data(
     return [(path, build_mock_edge_data(graph, path)) for path in paths]
 
 
-def astar_sumo_path(net, from_edge: str, to_edge: str) -> list[str]:
+def astar_sumo_path(net, from_edge: str, to_edge: str,
+                    penalized_edges: Optional[frozenset] = None) -> list[str]:
     """
     A* search on the sumolib edge graph using a Haversine heuristic.
     'Nodes' in this graph are sumolib edge IDs (see _dijkstra_blocked_sumo).
     Cost is distance-only — the same metric as baseline Dijkstra — so this is a
     different *search strategy* reaching an equivalent-or-better distance-shortest
     path, mirroring astar_mock_path's role in the mock-graph mode.
+
+    penalized_edges : 구역 밖 엣지 — 지나면 OUT_OF_AREA_PENALTY_M을 더한다.
+        벌점은 g에만 더하고 휴리스틱 h(직선거리)는 그대로 두므로, h는 여전히 실제
+        잔여비용을 넘지 않는다(admissible) — A*의 최적성이 깨지지 않는다.
     """
+    _pen = penalized_edges or frozenset()
     try:
         end_edge_obj = net.getEdge(to_edge)
         end_shape = end_edge_obj.getShape()
@@ -2862,11 +2963,9 @@ def astar_sumo_path(net, from_edge: str, to_edge: str) -> list[str]:
             cur_edge = net.getEdge(current)
         except Exception:
             continue
-        for nxt_edge in cur_edge.getOutgoing().keys():
+        for nxt_edge in _passenger_successors(net, cur_edge):
             nxt_id = nxt_edge.getID()
-            if nxt_id.startswith(":"):
-                continue
-            ng = g + nxt_edge.getLength()
+            ng = g + nxt_edge.getLength() + (OUT_OF_AREA_PENALTY_M if nxt_id in _pen else 0.0)
             if ng < g_score.get(nxt_id, float("inf")):
                 g_score[nxt_id] = ng
                 prev[nxt_id] = current
@@ -2891,10 +2990,18 @@ def network_weighted_sumo_path(
     nodes: list[dict],
     weights: "CostWeights",
     stop_evt: threading.Event | None = None,
+    buildings_gdf=None,
 ) -> list[str]:
     """
-    Dijkstra on sumolib graph weighted by network cost (skip_buildings=True for speed).
+    Dijkstra on sumolib graph weighted by network cost.
     Returns ordered list of SUMO edge IDs.
+
+    buildings_gdf : 있으면 탐색 중에도 건물 차폐(Blockage_Cost)를 계산한다. None이면
+        예전처럼 skip_buildings=True로 돌아 차폐 항이 0이 된다 — 즉 w_blockage를
+        아무리 올려도 경로 선택에 영향이 없다.
+        건물을 켜도 되는 이유는 building_obstruction_analyzer에 STRtree 사전계산이
+        들어갔기 때문이다(엣지당 약 250ms → 약 40ms). 그 전에는 이 경로에서 켜면
+        경로 하나에 수십 분이 걸렸다.
     """
     edge_cost_cache: dict[str, tuple[float, Optional[str]]] = {}
 
@@ -2920,11 +3027,11 @@ def network_weighted_sumo_path(
                 distance_m=length_m,
                 travel_time_s=length_m / max(speed_mps, 0.1),
                 nodes=nodes,
-                buildings_gdf=None,
+                buildings_gdf=buildings_gdf,
                 prev_best_node_id=None,
                 weights=weights,
                 norm_scales=_norm_scales,
-                skip_buildings=True,
+                skip_buildings=buildings_gdf is None,
             )
             val: tuple[float, Optional[str]] = (r.total_cost, r.best_node_id)
         except Exception:
@@ -2949,10 +3056,8 @@ def network_weighted_sumo_path(
         except Exception:
             continue
         _, cur_bn = _edge_cost(cur_id)
-        for next_edge_obj in cur_edge_obj.getOutgoing().keys():
+        for next_edge_obj in _passenger_successors(net, cur_edge_obj):
             next_id = next_edge_obj.getID()
-            if next_id.startswith(":"):
-                continue
             base_cost, next_bn = _edge_cost(next_id)
             handover_extra = (
                 weights.w_handover
@@ -3051,6 +3156,7 @@ def best_of_k_path(
     k_edge_data: list[tuple[list[str], list[dict]]],
     nodes: list[dict],
     weights: "CostWeights",
+    buildings_gdf=None,
 ) -> Optional[list[str]]:
     """
     Pick the lowest full-network-cost candidate among Yen's K topologically-shortest
@@ -3058,6 +3164,10 @@ def best_of_k_path(
     network-cost-optimal routing that re-scores only the K cheapest-by-distance
     alternatives instead of searching the full cost-weighted graph (compare with
     network_weighted_sumo_path/network_weighted_mock_path, which search exactly).
+
+    buildings_gdf : 후보 재채점 시 건물 차폐를 반영한다. K개 경로만 채점하므로
+        전체 탐색과 달리 원래도 부담이 크지 않았지만, 켜지 않으면 차폐가 후보
+        선택에 반영되지 않아 network_aware와 기준이 어긋난다.
     """
     if not k_edge_data or not ROUTE_COST_AVAILABLE:
         return None
@@ -3067,7 +3177,10 @@ def best_of_k_path(
         if not edge_data:
             continue
         try:
-            result = evaluate_path(edge_data, nodes, weights=weights, norm_scales=_norm_scales)
+            result = evaluate_path(
+                edge_data, nodes, buildings_gdf=buildings_gdf,
+                weights=weights, norm_scales=_norm_scales,
+            )
         except Exception:
             continue
         if result.total_cost < best_cost:
@@ -3153,12 +3266,15 @@ def lookahead_weighted_sumo_path(
     nodes: list[dict],
     weights: "CostWeights",
     lookahead_hops: int = 3,
+    buildings_gdf=None,
 ) -> list[str]:
     """
     Network-cost-weighted Dijkstra (same base cost as network_weighted_sumo_path)
     with an added BFS look-ahead coverage-risk penalty: edges that look_ahead_bs_scan()
     predicts will be uncovered within the next `lookahead_hops` hops cost more, so the
     router prefers paths that route around soon-to-be-uncovered segments.
+
+    buildings_gdf : network_weighted_sumo_path와 같은 의미 — 주면 탐색 중에도 차폐 반영.
     """
     road_nodes, adjacency = _build_sumo_road_graph_view(net)
     try:
@@ -3191,11 +3307,11 @@ def lookahead_weighted_sumo_path(
                 distance_m=length_m,
                 travel_time_s=length_m / max(speed_mps, 0.1),
                 nodes=nodes,
-                buildings_gdf=None,
+                buildings_gdf=buildings_gdf,
                 prev_best_node_id=None,
                 weights=weights,
                 norm_scales=_norm_scales,
-                skip_buildings=True,
+                skip_buildings=buildings_gdf is None,
             )
             base_cost = r.total_cost * (1.0 + LOOKAHEAD_PENALTY * risk_by_edge.get(edge_id, 0.0))
             val: tuple[float, Optional[str]] = (base_cost, r.best_node_id)
@@ -3219,10 +3335,8 @@ def lookahead_weighted_sumo_path(
         except Exception:
             continue
         _, cur_bn = _edge_cost(cur_id)
-        for next_edge_obj in cur_edge_obj.getOutgoing().keys():
+        for next_edge_obj in _passenger_successors(net, cur_edge_obj):
             next_id = next_edge_obj.getID()
-            if next_id.startswith(":"):
-                continue
             base_cost, next_bn = _edge_cost(next_id)
             handover_extra = (
                 weights.w_handover
@@ -4041,15 +4155,10 @@ def simulation_thread(
 
         # Replace baseline Dijkstra with the selected route_algorithm's real path,
         # if implemented. Each candidate is validated for edge-to-edge connectivity
-        # before being trusted; any failure/gap falls back to baseline Dijkstra.
+        # **for the vehicle class we actually inject** (passenger) before being
+        # trusted; any failure/gap falls back to baseline Dijkstra.
         def _edges_connected(e1_id, e2_id):
-            try:
-                return any(
-                    out.getID() == e2_id
-                    for out in net.getEdge(e1_id).getOutgoing().keys()
-                )
-            except Exception:
-                return False
+            return _edges_connected_for_passenger(net, e1_id, e2_id)
 
         def _try_use_candidate(candidate, label: str) -> bool:
             nonlocal edges
@@ -4075,9 +4184,34 @@ def simulation_thread(
         _sumo_routing_mode = "baseline_dijkstra"
         nodes_for_routing = _state.get("network_nodes") or []
 
+        # 탐색용 건물 집합. _state["route_buildings"]는 경로가 정해진 **뒤에** 그 경로
+        # bbox로 불러오므로 여기서는 아직 없다(닭-달걀). 출발·도착과 모든 기지국을 덮는
+        # bbox로 미리 한 번 불러와, 통신비용 기반 탐색이 건물 차폐를 보고 고르게 한다.
+        # 이게 없으면 w_blockage를 아무리 올려도 경로 선택에는 아무 효과가 없다.
+        _search_buildings = None
+        if route_algorithm in ("k_shortest_path", "network_aware", "network_aware_routing",
+                               "lookahead", "look_ahead_routing") and nodes_for_routing:
+            try:
+                _search_buildings, _sb_debug = load_route_buildings(
+                    [[origin["lat"], origin["lng"]], [dest["lat"], dest["lng"]]],
+                    nodes_for_routing,
+                    padding_deg=SEARCH_BUILDING_PADDING_DEG,
+                )
+                if _search_buildings is not None and len(_search_buildings):
+                    print(f"[SIM] 탐색용 건물 {len(_search_buildings)}개 로드 "
+                          f"— 차폐를 반영해 경로를 고릅니다", flush=True)
+                else:
+                    _search_buildings = None
+                    print(f"[SIM] 탐색용 건물 없음 ({_sb_debug.get('warnings')}) "
+                          f"— 차폐 없이 탐색합니다", flush=True)
+            except Exception as _sb_exc:
+                _search_buildings = None
+                print(f"[SIM] 탐색용 건물 로드 실패: {_sb_exc} — 차폐 없이 탐색합니다", flush=True)
+
         if route_algorithm == "astar":
             try:
-                if _try_use_candidate(astar_sumo_path(net, from_edge, to_edge), "A*"):
+                if _try_use_candidate(astar_sumo_path(net, from_edge, to_edge,
+                                                      penalized_edges=frozenset(_out_of_area)), "A*"):
                     _sumo_routing_mode = "astar"
             except Exception as _astar_exc:
                 print(f"[SIM] A* routing failed: {_astar_exc} — using Dijkstra baseline", flush=True)
@@ -4085,9 +4219,11 @@ def simulation_thread(
 
         elif route_algorithm == "k_shortest_path" and ROUTE_COST_AVAILABLE and nodes_for_routing:
             try:
-                _k_paths_pre = yen_k_paths_sumo(net, from_edge, to_edge, k=5)
+                _k_paths_pre = yen_k_paths_sumo(net, from_edge, to_edge, k=5,
+                                                penalized_edges=frozenset(_out_of_area))
                 candidate = best_of_k_path(
                     build_sumo_k_edge_data(net, _k_paths_pre), nodes_for_routing, _route_cost_weights,
+                    buildings_gdf=_search_buildings,
                 ) if _k_paths_pre else None
                 if _try_use_candidate(candidate, "K-shortest-path"):
                     _sumo_routing_mode = "k_shortest_path"
@@ -4099,6 +4235,7 @@ def simulation_thread(
             try:
                 candidate = network_weighted_sumo_path(
                     net, from_edge, to_edge, nodes_for_routing, _route_cost_weights, stop_evt,
+                    buildings_gdf=_search_buildings,
                 )
                 if _try_use_candidate(candidate, "Network-weighted"):
                     _sumo_routing_mode = "network_aware"
@@ -4113,6 +4250,7 @@ def simulation_thread(
                 )
                 candidate = lookahead_weighted_sumo_path(
                     net, from_edge, to_edge, nodes_for_routing, _route_cost_weights, _lookahead_hops,
+                    buildings_gdf=_search_buildings,
                 )
                 if _try_use_candidate(candidate, "Look-ahead"):
                     _sumo_routing_mode = "lookahead"
@@ -4408,7 +4546,10 @@ def simulation_thread(
                 _store_route_cost(_sumo_edge_data, _sumo_routing_mode)
             if ROUTE_COST_AVAILABLE:
                 try:
-                    _k_paths = yen_k_paths_sumo(_sumo_net_ref, _sumo_from_edge, _sumo_to_edge, k=5)
+                    # 대시보드의 경로 후보 비교도 같은 구역 벌점을 써야 한다 —
+                    # 안 그러면 실제로 쓰지 않을 구역 밖 경로가 후보로 올라온다.
+                    _k_paths = yen_k_paths_sumo(_sumo_net_ref, _sumo_from_edge, _sumo_to_edge, k=5,
+                                                penalized_edges=frozenset(_out_of_area))
                     if _k_paths:
                         _k_candidates = build_sumo_k_edge_data(_sumo_net_ref, _k_paths)
                         _store_k_candidates(_k_candidates)
@@ -5331,7 +5472,11 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
     _apply_simulation_config(_sim_cfg)
     _seed_other_device_load(
         _state.get("network_nodes") or [],
-        (_state.get("policy_options") or {}).get("other_device_lambda", 300.0),
+        # ⚠️ 폴백은 반드시 모델 기본값(SimConfigPolicyOptions.other_device_lambda = 30.0)과
+        # 같아야 한다. 예전엔 여기만 300.0이라, 설정이 비면 의도의 10배가 깔렸다.
+        (_state.get("policy_options") or {}).get(
+            "other_device_lambda", SimConfigPolicyOptions.model_fields["other_device_lambda"].default
+        ),
         _rng,
     )
     # ITS 혼잡도를 기지국 부하로 환산하는 경로 — **생성 교통을 쓸 때는 건너뛴다.**
@@ -9007,7 +9152,8 @@ _POLICY_OPTION_DESC = {
     "avoid_disconnection": "true면 커버리지 단절 구간을 적극적으로 회피",
     "traffic_lambda": "배경 차량/트래픽 강도를 나타내는 파라미터 (0~200)",
     "network_mode": "통신 세대 — \"4G\" | \"5G\" | \"6G\"",
-    "bg_reroute_prob": "배경 차량이 초당 무작위로 목적지를 바꿔 실시간 재경로할 확률 (0~1, 기본 0.02)",
+    "bg_reroute_prob": "배경 차량이 무작위로 목적지를 바꿔 실시간 재경로할 확률 (0~1, 기본 0 = 끔). "
+                       "올리면 배경 차량이 통행을 끝내기 전에 목적지가 바뀌므로 도로가 잘 비지 않는다",
     "bg_reroute_mode": "재경로 트리거 방식 — \"random\"(균일 확률) | \"congestion\"(현재 위치 BS 혼잡도에 비례해 확률 증가)",
 }
 

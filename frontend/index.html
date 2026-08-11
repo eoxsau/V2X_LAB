@@ -54,12 +54,15 @@
   <script type="text/babel" src="ui.jsx?v=20260623a"></script>
   <script type="text/babel" src="landing.jsx?v=20260728a"></script>
   <script type="text/babel" src="charts.jsx?v=20260706a"></script>
-  <script type="text/babel" src="tab-dashboard.jsx?v=20260730a"></script>
-  <script type="text/babel" src="tab-simulation.jsx?v=20260730a"></script>
+  <!-- ⚠️ 이 ?v= 는 브라우저 캐시를 깨는 유일한 장치다. jsx를 고쳤으면 **반드시** 해당 줄의
+       값을 올릴 것 — 안 올리면 서버는 새 파일을 주는데 브라우저는 캐시된 옛 파일을 계속
+       실행한다(2026-08-11 확인: 수정 후에도 옛 코드가 돌고 있었다). -->
+  <script type="text/babel" src="tab-dashboard.jsx?v=20260811b"></script>
+  <script type="text/babel" src="tab-simulation.jsx?v=20260811b"></script>
   <script type="text/babel" src="tab-scenario.jsx?v=20260730a"></script>
   <script type="text/babel" src="tab-sim-chat.jsx?v=20260624a"></script>
   <script type="text/babel" src="tab-report.jsx?v=20260730a"></script>
-  <script type="text/babel" src="tab-settings.jsx?v=20260730a"></script>
-  <script type="text/babel" src="app.jsx?v=20260730a"></script>
+  <script type="text/babel" src="tab-settings.jsx?v=20260811a"></script>
+  <script type="text/babel" src="app.jsx?v=20260811a"></script>
 </body>
 </html>

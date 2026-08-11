@@ -1,5 +1,26 @@
 /* ============================================================ Dashboard tab */
 
+/* Latency 판정 기준 — V2X 실시간 요구예산 100ms를 기준으로 잡는다(보고서의 PIR P99 기준과 동일).
+   ⚠️ 예전에는 12ms/20ms 고정값이었다. 그 값은 패킷 1Mbit 시절에 맞춰진 것으로,
+   당시 5G는 셀 70% 지점 16.9ms · 90% 지점 43.0ms라 두 구간이 실제로 갈렸다.
+   패킷이 100Kbit로 바뀐 뒤 같은 지점이 2.0ms · 4.6ms가 되면서 노랑/빨강이 한 번도
+   뜨지 않고 초록에서 곧장 불통(1000ms)으로 떨어졌다 — 경고 역할을 잃었다.
+   지금 모델에서 5G가 거리만으로 나빠지는 폭은 실제로 5ms 미만이다. 없는 중간 구간을
+   억지로 만들지 않고, 대신 (a) 예산 대비 비율로 기준을 잡고 (b) 불통을 별도 상태로 표시한다.
+   측정(2026-08-06): 5G 60%지점 차량 10대 1.9ms · 400대 3.9ms · 800대 이상 51.4ms(큐 포화),
+                     4G 80%지점 22.8ms, 커버리지 밖 1000ms. */
+const V2X_LATENCY_BUDGET_MS = 100;          // 3GPP/ETSI 실시간 V2X 예산
+const LAT_WARN_MS = V2X_LATENCY_BUDGET_MS * 0.10;   // 10ms — 예산의 10%
+const LAT_BAD_MS  = V2X_LATENCY_BUDGET_MS * 0.50;   // 50ms — 예산의 절반
+const LAT_OUTAGE_MS = 1000;                 // formula_v31.L_OUTAGE_MS — 접속 불가
+
+/** 지연값 → 'good' | 'warn' | 'bad'. 불통(1000ms)은 bad에 포함되며 latencyIsOutage로 구분한다. */
+function latencyTone(ms) {
+  if (ms === null || ms === undefined) return 'good';
+  return ms >= LAT_BAD_MS ? 'bad' : ms >= LAT_WARN_MS ? 'warn' : 'good';
+}
+const latencyIsOutage = (ms) => ms !== null && ms !== undefined && ms >= LAT_OUTAGE_MS;
+
 const ALGO_LABELS = {
   tech_latency_v31:          '기술모델 v3.1',
   rsrp_max:                  'RSRP 최대',
@@ -74,7 +95,7 @@ function buildFallbackLookahead(routeEdges, vehiclePos, hops) {
     const latency = edge.latency_ms ?? 0;
     const load = edge.load_ratio ?? 0;
     let coverageFraction = hasCoverage ? 1 : 0;
-    if (hasCoverage && latency > 20) coverageFraction = 0.55;
+    if (hasCoverage && latency >= LAT_BAD_MS) coverageFraction = 0.55;
     else if (hasCoverage && load > 0.7) coverageFraction = 0.72;
     else if (hasCoverage && load > 0.45) coverageFraction = 0.86;
     return {
@@ -112,16 +133,24 @@ function buildFallbackLookahead(routeEdges, vehiclePos, hops) {
 /* ---- Latency breakdown bar --------------------------------- */
 function LatencyBreakdown({ total, lBase, lSignal, lQueue }) {
   if (total === null || lBase === null || lSignal === null || lQueue === null) return null;
+  /* ⚠️ 이름표는 백엔드가 실제로 담아 보내는 값에 맞춘 것이다.
+     백엔드 필드명이 값과 어긋나 있다(building_obstruction_analyzer 주석 참조):
+       l_base_ms   = L_base        = TTI×0.5   → 슬롯을 배정받기까지 기다리는 시간
+       l_signal_ms = L_transmission = 패킷/(SE×BW) → **전송** 지연 (이름만 signal)
+       l_queue_ms  = L_queue       = TTI×ρ/(1−ρ) → 대기열(혼잡) 지연
+     예전 화면은 앞의 둘을 서로 바꿔 달아, 슬롯 대기를 "전송 지연"으로,
+     실제 전송 지연을 "신호 처리"로 보여주고 있었다. */
   const items = [
-    { label: <><i>L</i><sub>tx</sub> — 전송 지연</>,  value: lBase,   color: 'var(--brand-2)' },
-    { label: <><i>L</i><sub>q</sub> — 신호 처리</>,   value: lSignal, color: 'var(--warn)'    },
-    { label: <><i>L</i><sub>comp</sub> — 혼잡 대기</>, value: lQueue,  color: 'var(--bad)'     },
+    { label: <><i>L</i><sub>base</sub> — 슬롯 대기</>, value: lBase,   color: 'var(--brand-2)' },
+    { label: <><i>L</i><sub>tx</sub> — 전송 지연</>,   value: lSignal, color: 'var(--warn)'    },
+    { label: <><i>L</i><sub>q</sub> — 대기열 지연</>,  value: lQueue,  color: 'var(--bad)'     },
   ];
+  const outage = latencyIsOutage(total);
   return (
     <Card
       title="Latency 분해"
       en="Breakdown · ms"
-      right={<Chip tone={total >= 20 ? 'bad' : total >= 12 ? 'warn' : 'good'}>{total.toFixed(1)}ms 합계</Chip>}
+      right={<Chip tone={latencyTone(total)}>{outage ? '불통 (커버리지 밖)' : `${total.toFixed(1)}ms 합계`}</Chip>}
       style={{ marginBottom: 14 }}
     >
       <div className="row gap16" style={{ flexWrap: 'wrap' }}>
@@ -414,6 +443,26 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const [placementResult, setPlacementResult] = useState(null);
   const [placementError, setPlacementError] = useState(null);
 
+  // 교통 준비 상태 — 최적화 배치는 실측 교통을 수요로 쓰므로, 교통이 만들어지기 전에는
+  // 누르지 못하게 막는다(같은 이유의 주석은 tab-simulation.jsx의 최적화 배치 버튼 참조).
+  // `calibrated`가 true여야 교통 시나리오가 실제로 존재한다.
+  const [demandStatus, setDemandStatus] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8001/api/demand/status');
+        if (!res.ok) return;
+        const body = await res.json();
+        if (alive) setDemandStatus(body);
+      } catch { /* 준비 중 네트워크 오류는 무시 — 다음 틱에 다시 본다 */ }
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+  const placementReady = !!demandStatus?.calibrated;
+
   async function runPlacementOptimize() {
     setPlacementRunning(true);
     setPlacementError(null);
@@ -552,7 +601,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const hottestDeficit = deficitEntries[0] || null;
 
   const currentRisks = [];
-  if (latency !== null && latency > 20) currentRisks.push({ tone: 'bad', text: `현재 지연시간 ${latency.toFixed(1)}ms로 임계치에 근접합니다.` });
+  if (latencyIsOutage(latency)) currentRisks.push({ tone: 'bad', text: '현재 위치가 커버리지 밖입니다 — 접속이 끊긴 상태로 계산됩니다.' });
+  else if (latency !== null && latency >= LAT_WARN_MS) currentRisks.push({ tone: latencyTone(latency), text: `현재 지연시간 ${latency.toFixed(1)}ms — V2X 예산 ${V2X_LATENCY_BUDGET_MS}ms의 ${((latency / V2X_LATENCY_BUDGET_MS) * 100).toFixed(0)}%를 쓰고 있습니다.` });
   if (congestion !== null && congestion >= 0.65) currentRisks.push({ tone: 'bad', text: `${currentNodeName} 혼잡도가 ${(congestion * 100).toFixed(0)}%로 높습니다.` });
   if (lossDb !== null && lossDb >= 15) currentRisks.push({ tone: 'warn', text: `건물 차폐 손실 ${lossDb.toFixed(1)}dB로 전파 품질 저하가 큽니다.` });
   if (buildings !== null && buildings >= 3) currentRisks.push({ tone: 'warn', text: `현재 연결선이 건물 ${buildings}개를 가로질러 차폐 민감도가 높습니다.` });
@@ -841,7 +891,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
            이미 위 배너에 쓰인 동일 latency/handover/disconnect 임계값으로 한 줄 요약을 덧붙인다) ── */}
       {mode === 'lite' && arrived && (() => {
         const lat = avgLatency ?? 0;
-        const tone = (lat >= 20 || disconnCount > 0) ? 'bad' : (lat >= 12 || handoverCount > 3) ? 'warn' : 'good';
+        const tone = (latencyTone(lat) === 'bad' || disconnCount > 0) ? 'bad'
+                   : (latencyTone(lat) === 'warn' || handoverCount > 3) ? 'warn' : 'good';
         const text = tone === 'good'
           ? `평균 지연 ${lat.toFixed(1)}ms로 안정적인 연결을 유지하며 목적지에 도착했습니다.`
           : tone === 'warn'
@@ -1396,11 +1447,22 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
           <Seg value={placementConfig.network_mode} onChange={v => setPlacementConfig(c => ({ ...c, network_mode: v }))}
             options={[{ v: '4G', label: '4G' }, { v: '5G', label: '5G' }, { v: '6G', label: '6G' }]} />
           <button className="btn primary sm" onClick={runPlacementOptimize}
-            disabled={placementRunning || (placementConfig.n_bs + placementConfig.n_rsu) === 0}
+            disabled={placementRunning || (placementConfig.n_bs + placementConfig.n_rsu) === 0 || !placementReady}
             style={{ marginLeft: 8 }}>
-            {placementRunning ? <><Icon.reset size={12} className="spin" /> 최적화 중…</> : <><Icon.antenna size={12} /> 최적화 실행</>}
+            {placementRunning
+              ? <><Icon.reset size={12} className="spin" /> 최적화 중…</>
+              : !placementReady
+              ? <><Icon.antenna size={12} /> 교통량 계산 대기 중…</>
+              : <><Icon.antenna size={12} /> 최적화 실행</>}
           </button>
         </div>
+        {!placementReady && (
+          <div className="muted" style={{ fontSize: 11, marginBottom: 10, color: 'var(--warn)' }}>
+            {demandStatus?.preparing
+              ? `교통량 계산이 끝나야 실행할 수 있습니다${demandStatus?.stage ? ` (${demandStatus.stage} 단계)` : ''} — 실측 교통을 수요로 써야 배치가 의미가 있습니다.`
+              : '교통이 아직 준비되지 않았습니다. 구역을 설정하고 교통 준비가 끝날 때까지 기다려 주세요.'}
+          </div>
+        )}
         {placementError && (
           <div style={{ color: 'var(--bad)', fontSize: 12, marginBottom: 10 }}>{placementError}</div>
         )}

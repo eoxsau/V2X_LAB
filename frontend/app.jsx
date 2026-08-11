@@ -80,14 +80,33 @@ function App() {
     policy_options: {
       lookahead_k: 3, lookahead_time: 10.0, max_handover_allowed: 10,
       prefer_low_latency: true, prefer_load_balance: false, avoid_disconnection: true,
-      traffic_lambda: 5.0, other_device_lambda: 300.0, network_mode: '5G',
-      demand_scale_pct: 100, bg_reroute_prob: 0.02, bg_reroute_mode: 'random',
+      // other_device_lambda: 백엔드 SimConfigPolicyOptions 기본값(30)과 맞춘 값.
+      // 300은 "총 기기 밀도"이고 실제로 써야 할 건 그 활성 비율 10%인 30이다.
+      // 300이면 반경 1km 기지국 하나에 기기 942개가 깔려 5G 수용량 500을 혼자 넘겨,
+      // 차가 한 대도 없어도 모든 기지국이 부하 100%가 된다(2026-08-11 실측).
+      traffic_lambda: 5.0, other_device_lambda: 30.0, network_mode: '5G',
+      // bg_reroute_prob: 기본 끔. 켜면 배경 차량이 도착 전에 목적지를 다시 받아
+      // 통행을 끝내지 못하고, 도로 정체가 끝까지 안 풀린다(같은 날 실측).
+      demand_scale_pct: 100, bg_reroute_prob: 0, bg_reroute_mode: 'random',
     },
   };
+  // 설정은 localStorage에 통째로 저장된다 — 기본값만 고치면 **이미 쓰던 사람에게는 반영되지
+  // 않는다.** 옛 기본값을 그대로 들고 있는 저장본만 한 번 올려준다. 사용자가 직접 바꾼 값은
+  // 건드리지 않으려고, 정확히 옛 기본값과 같을 때만 교체한다.
+  const SIM_CONFIG_VERSION = 2;   // 2026-08-11: other_device_lambda 300→30, bg_reroute_prob 0.02→0
   const [simConfig, setSimConfig] = useState(() => {
     try {
       const saved = localStorage.getItem('v2x_sim_config');
-      return saved ? JSON.parse(saved) : DEFAULT_SIM_CONFIG;
+      if (!saved) return DEFAULT_SIM_CONFIG;
+      const cfg = JSON.parse(saved);
+      if ((cfg._version ?? 1) < SIM_CONFIG_VERSION) {
+        const pol = cfg.policy_options || (cfg.policy_options = {});
+        if (pol.other_device_lambda === 300) pol.other_device_lambda = 30.0;
+        if (pol.bg_reroute_prob === 0.02) pol.bg_reroute_prob = 0;
+        cfg._version = SIM_CONFIG_VERSION;
+        try { localStorage.setItem('v2x_sim_config', JSON.stringify(cfg)); } catch {}
+      }
+      return cfg;
     } catch { return DEFAULT_SIM_CONFIG; }
   });
   function saveSimConfig(cfg) {

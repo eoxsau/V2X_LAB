@@ -2512,10 +2512,27 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
                   누르면 기존 배치를 지우고 새로 배치합니다 (번호 1부터).
                 </div>
-                <button className="btn sm block accent" disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0}
+                {/* 교통이 만들어지기 전에는 누르지 못하게 막는다.
+                    `calibrated`는 곧 "교통 시나리오가 실제로 존재한다"는 뜻이다
+                    (백엔드 /api/demand/status — current_traffic_scenario(build=False)가 값을 냈을 때만 true).
+                    최적화가 쓰는 optimize_placement_v2()도 같은 build=False로 교통을 집으므로,
+                    이 값이 false인 동안 누르면 (a) 교통 생성이 끝날 때까지 요청이 수 분~수십 분
+                    매달리거나 (b) 생성이 실패하면 실측 교통 대신 균일 수요로 폴백해
+                    "골고루 뿌리기"에 가까운 배치가 나온다(v2 §8-1). 둘 다 사용자가 알기 어렵다. */}
+                {!demandStatus?.calibrated && area && (
+                  <div className="muted" style={{ fontSize: 10, marginBottom: 8, color: 'var(--warn)' }}>
+                    {demandStatus?.preparing
+                      ? `교통량 계산이 끝나야 누를 수 있습니다${demandStatus?.stage ? ` (${demandStatus.stage} 단계)` : ''} — 실측 교통을 수요로 써야 배치가 의미가 있습니다.`
+                      : '교통이 아직 준비되지 않았습니다. 시뮬레이션을 한 번 시작하거나 교통 준비가 끝날 때까지 기다려 주세요.'}
+                  </div>
+                )}
+                <button className="btn sm block accent"
+                  disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0 || !demandStatus?.calibrated}
                   onClick={() => placeNodes('sa', saN, true, setSaPlacing)}>
                   <Icon.antenna size={13} /> {saPlacing
                     ? (placementProgress ? `최적화 중… ${placementProgress.pct}%` : '최적화 중…')
+                    : !demandStatus?.calibrated && area
+                    ? '교통량 계산 대기 중…'
                     : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
                 </button>
                 {/* 진행률 막대 — 예전엔 콘솔에만 찍혀서 사용자는 수 분 동안 멈춘 건지
