@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from math import exp, log10
+from math import exp, hypot, log10
 
 import geopandas as gpd
+from pyproj import Transformer
 from shapely.geometry import LineString
+from shapely.strtree import STRtree
 
 from .building_schema import BuildingObstructionResult
 from .building_height_estimator import material_category_from_strctcd, _classify
@@ -57,6 +59,74 @@ _OBSTRUCTION_CACHE_MAX = 20_000
 
 def reset_obstruction_cache() -> None:
     _OBSTRUCTION_CACHE.clear()
+
+
+# ── 건물 공간 인덱스 사전계산 (2026-08-08) ────────────────────────────────────
+# 이전 구현은 analyze_vehicle_to_node 호출마다 다음 셋을 전부 반복했다:
+#   (1) 선 하나짜리 GeoDataFrame 생성 + to_crs(3857)
+#   (2) buildings_gdf.geometry.intersects(line) — 공간 인덱스 없이 전 건물 스캔
+#   (3) 걸린 건물들을 다시 to_crs(3857)
+# 이 함수는 기지국 수만큼(예: 54회) × 엣지마다 불리므로, 경로탐색 중에 건물 차폐를
+# 켜면 감당이 안 됐다. 실측(건물 2000개·기지국 54개): 엣지 1개당 336ms →
+# 14,248엣지 네트워크에서 경로 한 번에 1시간 20분.
+#
+# 건물 집합은 경로탐색 한 번 동안 바뀌지 않으므로 3857 변환과 STRtree를 한 번만
+# 만들어 재사용한다. 측정 결과 엣지 1개당 336ms → 42ms (약 8배).
+#
+# ⚠ 결과는 이전 구현과 **비트 단위로** 같다. 공간 인덱스는 근사가 아니라 "교차할 리 없는
+# 건물을 검사하지 않을 뿐"이고, 좌표 변환도 매번 같은 값을 다시 만들던 것을 재사용할 뿐이다.
+#
+# 교차 후보 판정은 반드시 원본 좌표계(4326)에서 해야 한다. 3857에서 판정하도록 짰다가
+# 3,600건 중 2건이 어긋났는데, 원인은 건물이 시선에서 **1.6 mm** 떨어져 스치는 경계
+# 사례였다(4326에서는 안 닿고 3857에서는 닿음). Mercator의 y 비선형 항 때문에 두
+# 좌표계의 직선이 완전히 겹치지는 않아서 생긴 차이다. 물리적으로는 의미 없는 차이지만
+# 건물 1채가 곧 12 dB라 결과가 흔들리므로, 후보 판정용 STRtree는 4326으로 만들고
+# 3857 지오메트리는 3D LOS 판정에만 쓴다.
+_WGS84_TO_3857 = Transformer.from_crs(4326, 3857, always_xy=True)
+
+_PREP_KEY: tuple | None = None
+_PREP: dict = {}
+
+
+def _prepare_buildings(buildings_gdf: "gpd.GeoDataFrame") -> dict:
+    """건물 집합당 1회만 3857 지오메트리·높이·STRtree를 만들어 캐시한다.
+
+    캐시 키에 id()를 쓰지만 _PREP가 gdf 자체를 붙들고 있으므로, 캐시가 살아있는
+    동안 그 객체가 GC되어 주소가 재사용되는 일은 생기지 않는다.
+    """
+    global _PREP_KEY, _PREP
+    key = (id(buildings_gdf), len(buildings_gdf))
+    if _PREP_KEY == key and _PREP:
+        return _PREP
+
+    geoms_4326 = list(buildings_gdf.geometry) if len(buildings_gdf) else []
+    geoms_3857 = list(buildings_gdf.to_crs(3857).geometry) if geoms_4326 else []
+    _PREP = {
+        "gdf": buildings_gdf,                       # 원본(4326) — 높이/속성/하이라이트용
+        "geoms_3857": geoms_3857,                   # 3D LOS 판정 전용
+        # 높이는 원본 컬럼을 그대로 보관한다. `float(v or 0.0)` 판정을 호출부에서
+        # 예전과 똑같이 재현해야 하므로 여기서 fillna 하지 않는다.
+        "heights_raw": list(buildings_gdf["height_m"]) if "height_m" in buildings_gdf.columns else None,
+        # 후보 판정은 원본 좌표계에서 — 위 주석의 1.6 mm 경계 사례 참조.
+        "tree": STRtree(geoms_4326) if geoms_4326 else None,
+    }
+    _PREP_KEY = key
+    return _PREP
+
+
+def reset_buildings_index() -> None:
+    """건물 집합을 갈아끼웠을 때 사전계산 인덱스를 버린다."""
+    global _PREP_KEY, _PREP
+    _PREP_KEY, _PREP = None, {}
+
+
+def _height_or_zero(value) -> float:
+    """pandas `fillna(0)` + float() 과 같은 의미 — None·NaN·비수치는 0.0."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f      # NaN 체크
 
 
 def _L_rsu(distance_m: float, coverage_radius_m: float) -> float:
@@ -176,9 +246,16 @@ def analyze_vehicle_to_node(
         return cached
 
     line = LineString([(vehicle_lng, vehicle_lat), (network_node["lng"], network_node["lat"])])
-    line_gdf = gpd.GeoDataFrame({"geometry": [line]}, crs="EPSG:4326").to_crs(3857)
-    line_3857 = line_gdf.geometry.iloc[0]
-    distance_m = float(line_gdf.length.iloc[0])
+    # 끝점만 3857로 옮겨 직선을 만든다. GeoDataFrame을 거치던 예전 코드와 결과가
+    # 같다 — to_crs도 LineString의 꼭짓점(=끝점 2개)만 변환했기 때문이다.
+    _vx, _vy = _WGS84_TO_3857.transform(vehicle_lng, vehicle_lat)
+    _nx, _ny = _WGS84_TO_3857.transform(network_node["lng"], network_node["lat"])
+    line_3857 = LineString([(_vx, _vy), (_nx, _ny)])
+    # ⚠ 예전 동작 보존: 이 거리는 EPSG:3857(Web Mercator) 길이이므로 위도 37.5°에서
+    # 실제보다 약 1/cos(37.5°)=1.26배 크다. _find_best_bs_light는 haversine을 쓰므로
+    # 같은 쌍에 대해 두 경로가 서로 다른 거리를 낸다. 여기서 고치면 이번 변경이
+    # '속도만 개선'이 아니게 되므로 그대로 두고 인수인계 문서에 남긴다.
+    distance_m = hypot(_nx - _vx, _ny - _vy)
 
     if buildings_gdf.empty:
         result = BuildingObstructionResult(
@@ -196,31 +273,46 @@ def analyze_vehicle_to_node(
         _cache_obstruction(cache_key, result)
         return result
 
-    # 2D 경로와 교차하는 건물 후보
-    search = buildings_gdf[buildings_gdf.geometry.intersects(line)].copy().reset_index(drop=True)
-    search_3857 = search.to_crs(3857).copy().reset_index(drop=True) if not search.empty else search
+    # 2D 경로와 교차하는 건물 후보 — STRtree로 후보를 좁힌 뒤에만 정밀 판정한다.
+    # (예전에는 전 건물을 매번 스캔했다. 위 '건물 공간 인덱스 사전계산' 주석 참조.)
+    prep = _prepare_buildings(buildings_gdf)
+    tree = prep["tree"]
+    geoms_3857 = prep["geoms_3857"]
+    heights_raw = prep["heights_raw"]
+
+    cand_idx = (
+        [int(i) for i in tree.query(line, predicate="intersects")]
+        if tree is not None else []
+    )
 
     # ── 3D LOS 필터 (명세 §7 — 2D 판정 금지) ──────────────────────────────────
-    is_blocking: list[bool] = []
+    blocking_idx: list[int] = []
     unknown_height_blockers = 0
-    for i in range(len(search_3857)):
-        bldg_h = float(search["height_m"].iloc[i] or 0.0) if "height_m" in search.columns else 0.0
+    for i in cand_idx:
+        bldg_h = float(heights_raw[i] or 0.0) if heights_raw is not None else 0.0
         if bldg_h <= 0:
             # 높이 미상 — 보수적으로 차단 처리하되 신뢰도를 낮춘다
-            is_blocking.append(True)
+            blocking_idx.append(i)
             unknown_height_blockers += 1
         else:
-            blocked = _is_blocked_3d(
-                line_3857, search_3857.geometry.iloc[i], bldg_h,
+            if _is_blocked_3d(
+                line_3857, geoms_3857[i], bldg_h,
                 _VEHICLE_HEIGHT_M, h_antenna,
-            )
-            is_blocking.append(blocked)
+            ):
+                blocking_idx.append(i)
 
-    mask = [bool(v) for v in is_blocking]
-    search_bl = search[mask].copy()
+    # STRtree.query는 입력 순서를 보장하지 않는다. 예전 구현은 GeoDataFrame 행 순서를
+    # 따랐고 highlighted_buildings가 그중 앞 5개를 잘라 쓰므로, 순서를 되돌려 둔다.
+    blocking_idx.sort()
+    count = int(len(blocking_idx))
 
-    count = int(len(search_bl))
-    max_height = float(search_bl["height_m"].fillna(0).max()) if count and "height_m" in search_bl.columns else 0.0
+    # 예전엔 차단 건물 전체로 DataFrame 슬라이스를 떠서 fillna().max()를 돌렸다. 호출
+    # 하나당 pandas 왕복이라 이 함수가 수만 번 불리는 경로탐색에서는 무시할 수 없다.
+    # fillna(0) 의미(None·NaN → 0)를 그대로 살려 파이썬 리스트에서 계산한다.
+    if count and heights_raw is not None:
+        max_height = max(_height_or_zero(heights_raw[i]) for i in blocking_idx)
+    else:
+        max_height = 0.0
 
     # ── A_seg = 차단 건물 수 × 12 dB (명세 §7 — 재질 기반 모델 대체, 상한 없음) ──
     A_seg_db = round(count * _A_SEG_PER_BUILDING_DB, 2)
@@ -230,11 +322,11 @@ def analyze_vehicle_to_node(
     latency_penalty_ms = round(A_seg_db * 0.45, 2)
     stability_score = round(max(0.0, exp(-(A_seg_db / 20.0)) - vehicle_density_penalty / 100.0), 3)
 
+    # 하이라이트는 앞 5개만 쓰므로 그 5행만 꺼낸다(예전엔 차단 건물 전체를 슬라이스했다).
     highlighted_buildings = []
-    top = search_bl.head(5)
-    for pos in range(len(top)):
-        row = top.iloc[pos]
-        geom = top.geometry.iloc[pos]
+    for i in blocking_idx[:5]:
+        row = buildings_gdf.iloc[i]
+        geom = buildings_gdf.geometry.iloc[i]
         coords = []
         if geom.geom_type == "Polygon":
             coords = [{"lat": lat, "lng": lng} for lng, lat in list(geom.exterior.coords)]

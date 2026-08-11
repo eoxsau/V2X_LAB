@@ -3,20 +3,18 @@ Route cost function — research-grade V2X network-aware routing.
 
 Component definitions
 ---------------------
-Edge-level (6 independent components):
+Edge-level (7 independent components):
     1. Distance_Cost      d / norm.distance_km
     2. Travel_Time_Cost   t / norm.time_min
     3. Latency_Cost       latency_ms / norm.latency_ms
     4. BS_Load_Cost       load / capacity  (0–1)
     5. Handover_Cost      1.0 if best-BS changes from previous edge, else 0
     6. Blockage_Cost      penetration_loss_db / norm.loss_db
+    7. Coverage_Cost      km driven outside every BS coverage radius
+                          (0 when the best BS is within its coverage radius)
 
-Path-level (1 component, added once per path):
-    7. Coverage_Risk      fraction of edges where no BS is within coverage radius
-                          Geometry-based; independent of Latency_Cost.
-
-Total_Edge_Cost  = Σ w_i * component_i  for i in 1..6
-Total_Path_Cost  = Σ Total_Edge_Cost + w_coverage_risk * Coverage_Risk
+Total_Edge_Cost  = Σ w_i * component_i  for i in 1..7
+Total_Path_Cost  = Σ Total_Edge_Cost
 
 Design rationale
 ----------------
@@ -25,6 +23,19 @@ Design rationale
 * Coverage_Risk replaces Future_Connectivity_Risk: old FCR was latency-threshold
   based → double-counted with Latency_Cost. New CR is purely geometric
   (dist_to_best_bs > coverage_radius_m), orthogonal to latency.
+* Coverage moved from path level to edge level (2026-08-08). It used to be
+  `w_coverage_risk * (uncovered_edges / total_edges)` — a **ratio**, added once
+  per finished path. A ratio is not additive: the denominator depends on the
+  whole path, so a graph search cannot accumulate it edge by edge and Dijkstra
+  simply could not optimise it. Re-expressed as "km driven out of coverage" the
+  term becomes additive, so the search now avoids coverage holes instead of
+  merely scoring them afterwards.
+  Expressing it per-km (not per-edge) also keeps it invariant to how finely the
+  network happens to be split at intersections — a 2 km stretch costs the same
+  whether SUMO cut it into 5 edges or 40.
+  `PathCostResult.coverage_risk` still reports the old ratio as a **metric**
+  (reports/exports consume it); it is no longer added to total_cost, so there
+  is no double counting.
 * NormScales separates "how to normalise a physical quantity" from
   "how much to weight the normalised result". Researchers adjust one
   without touching the other.
@@ -177,6 +188,10 @@ class CostWeights:
       * Prioritise latency  → raise w_latency
       * Penalise hand-offs  → raise w_handover
       * Prefer covered roads → raise w_coverage_risk
+
+    Unit note: w_distance and w_coverage_risk are both "per km" weights, so they
+    are directly comparable — w_coverage_risk=2.5 means 1 km outside coverage
+    costs the same as 3.5 km of ordinary driving (1.0 distance + 2.5 coverage).
     """
     w_distance: float = 1.0
     w_time: float = 2.0
@@ -184,7 +199,7 @@ class CostWeights:
     w_load: float = 1.5
     w_handover: float = 1.0
     w_blockage: float = 1.5
-    w_coverage_risk: float = 2.5      # path-level weight for Coverage_Risk
+    w_coverage_risk: float = 2.5      # edge-level weight, per km driven out of coverage
     w_resource_deficit: float = 1.0   # path-level weight for resource deficit cost
 
 
@@ -482,10 +497,13 @@ def compute_edge_network_cost(
     latency_algorithm_id: Optional[str] = None,
 ) -> EdgeCostResult:
     """
-    Compute 6 independent per-edge cost components.
+    Compute 7 independent per-edge cost components.
 
-    Coverage_Risk (component 7) is a path-level aggregate computed in
-    evaluate_path(); it is NOT included in total_cost here.
+    Coverage_Cost (component 7) is included in total_cost here: it is the number
+    of km driven while the best BS is out of its coverage radius. It used to be a
+    path-level ratio added in evaluate_path(); see the module docstring for why it
+    moved. evaluate_path() no longer adds a coverage term, so there is no double
+    counting.
 
     Args:
         skip_buildings: Use fast light BS selection without building intersection.
@@ -550,6 +568,9 @@ def compute_edge_network_cost(
     c_load     = load_ratio
     c_handover = 1.0 if handover else 0.0
     c_blockage = loss_db / norm_scales.loss_db
+    # Coverage: km driven out of coverage. Per-km (not per-edge) so the term does
+    # not depend on how finely SUMO happened to split the road at intersections.
+    c_coverage = 0.0 if within_cov else c_dist
 
     total = (
         weights.w_distance  * c_dist
@@ -558,6 +579,7 @@ def compute_edge_network_cost(
         + weights.w_load    * c_load
         + weights.w_handover * c_handover
         + weights.w_blockage * c_blockage
+        + weights.w_coverage_risk * c_coverage
     )
 
     return EdgeCostResult(
@@ -581,6 +603,7 @@ def compute_edge_network_cost(
             "load_cost":      round(c_load,     4),
             "handover_cost":  round(c_handover, 4),
             "blockage_cost":  round(c_blockage, 4),
+            "coverage_cost":  round(c_coverage, 4),
             **({"latency_components": _latency_components} if _latency_components else {}),
         },
     )
@@ -656,9 +679,12 @@ def evaluate_path(
         for r in edge_results
     )
 
-    # Coverage_Risk added once at path level (geometry-based, not latency-based)
+    # Coverage is now an edge-level component inside r.total_cost (km out of
+    # coverage × w_coverage_risk) — see module docstring. Adding the old
+    # path-level ratio here as well would be double counting, so it is gone.
+    # `coverage_risk` below is still reported as a metric (reports/exports use it).
     # resource_deficit_cost is injected by evaluate_route_with_resource_allocation
-    total_cost = sum(r.total_cost for r in edge_results) + weights.w_coverage_risk * coverage_risk
+    total_cost = sum(r.total_cost for r in edge_results)
 
     return PathCostResult(
         total_cost=round(total_cost, 4),
