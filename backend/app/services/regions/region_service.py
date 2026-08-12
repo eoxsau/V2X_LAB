@@ -296,45 +296,29 @@ def _extract_with_osmium(osmium_bin: str, pbf_path: Path, out_file: Path,
 
 def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
                              s: float, w: float, n: float, e: float) -> None:
-    """pyosmium으로 bbox 내 노드/웨이/릴레이션 필터링 후 OSM XML 저장"""
+    """전국 PBF에서 bbox 안의 **도로망**을 뽑아 OSM XML로 저장한다.
+
+    ⚡ 왜 두 번 읽나 — 파이썬 콜백을 없애기 위해서다.
+    예전에는 SimpleHandler로 한 번에 훑었는데, 그러면 **전국 노드 1억 개가 하나씩
+    파이썬으로 올라와** 구역 크기와 무관하게 4~5분이 걸렸다(2026-08-12 실측 250초).
+    지금은 걸러내는 일을 전부 C++(osmium 필터)에 맡기고, 파이썬은 실제로 필요한
+    것만 받는다 — 같은 구역이 **44초**로 줄었다(도로 1,259개 / 노드 4,333개).
+
+      패스 1: 도로(highway)만. 노드는 마스크에 넣되 EntityFilter로 걸러 파이썬까지
+              오지 않게 하고, with_locations()로 각 노드 좌표만 C++ 캐시에 담는다.
+              그 좌표로 bbox 판정을 해서 남길 도로와 필요한 노드 id를 모은다.
+      패스 2: 그 노드 id만 IdFilter로 걸러 기록한다.
+
+    도로가 아닌 way(건물·용도지역 등)는 버린다 — 예전 결과 6,930개 중 실제 도로는
+    1,218개뿐이었고, 나머지는 이 앱의 어느 단계도 쓰지 않는다(건물 차폐는 PostGIS/
+    parquet에서 따로 읽는다). 그 덕에 파일이 7.3MB → 0.83MB로 줄어 netconvert도 빨라진다.
+
+    ⚠️ 남긴 도로의 노드만 기록하므로 결과 파일은 **스스로 완결된다**. 예전에는 경계를
+       걸친 도로가 저장하지 않은 노드를 가리켜(38,201개 중 2,431개) osmnx가 읽다 죽었고,
+       구역 설정이 마지막 단계에서 500으로 끝났다.
+    """
     import osmium
-    import osmium.io
-
-    class BboxFilter(osmium.SimpleHandler):
-        def __init__(self, writer, s, w, n, e):
-            super().__init__()
-            self.writer = writer
-            self.s, self.w, self.n, self.e = s, w, n, e
-            self.valid_nodes = set()
-
-        def node(self, nd):
-            if not nd.location.valid():
-                return
-            lat, lon = nd.location.lat, nd.location.lon
-            if self.s <= lat <= self.n and self.w <= lon <= self.e:
-                self.valid_nodes.add(nd.id)
-                self.writer.add_node(nd)
-
-        def way(self, w):
-            node_ids = [n.ref for n in w.nodes]
-            if not any(nid in self.valid_nodes for nid in node_ids):
-                return
-            # ⚠️ 도로를 통째로 쓰면 **파일이 스스로 완결되지 않는다.** 구역 경계를 걸친
-            #    도로는 바깥쪽 노드까지 참조하는데 그 노드는 저장되지 않기 때문이다
-            #    (2026-08-12 실측: 도로가 가리키는 38,201개 중 2,431개가 파일에 없었다).
-            #    인터넷(Overpass) 경로는 참조된 노드를 함께 받아오므로 이 문제가 없어,
-            #    로컬 PBF로 바꾼 뒤에야 드러났다. osmnx가 그 파일을 읽다 통째로 죽고
-            #    (`Some edges missing nodes...`), 구역 설정이 마지막 단계에서 500으로 끝났다.
-            #    저장한 노드만 남기면 파일이 완결된다 — 어차피 netconvert는
-            #    `--keep-edges.in-geo-boundary`로, load_mock_graph는 자체 필터로
-            #    구역 밖을 이미 버리고 있어 결과가 달라지지 않는다.
-            kept = [nid for nid in node_ids if nid in self.valid_nodes]
-            if len(kept) < 2:
-                return
-            if len(kept) == len(node_ids):
-                self.writer.add_way(w)          # 잘린 것이 없으면 원본 그대로
-            else:
-                self.writer.add_way(osmium.osm.mutable.Way(base=w, nodes=kept))
+    import osmium.filter as _F
 
     # 한글 경로 우회 — 읽는 PBF와 쓰는 .osm 둘 다 ASCII 경로여야 한다(위 _ascii_work_dir 설명).
     src = _stage_pbf_for_osmium(Path(pbf_path))
@@ -343,12 +327,42 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
     real_out = out_file
     if stage_out:
         out_file = _ascii_work_dir() / f"_extract_{os.getpid()}.osm"
-        if out_file.exists():
-            out_file.unlink()
+    if out_file.exists():
+        out_file.unlink()
 
+    # ── 패스 1: 남길 도로와 그 도로가 쓰는 노드 id
+    kept_ways: list[tuple[int, list[int], dict]] = []
+    needed: set[int] = set()
+    fp = (osmium.FileProcessor(str(src), osmium.osm.NODE | osmium.osm.WAY)
+          .with_locations()
+          .with_filter(_F.EntityFilter(osmium.osm.WAY))
+          .with_filter(_F.KeyFilter("highway")))
+    for way in fp:
+        refs: list[int] = []
+        inside = False
+        for nd in way.nodes:
+            refs.append(nd.ref)
+            loc = nd.location
+            if loc.valid() and s <= loc.lat <= n and w <= loc.lon <= e:
+                inside = True
+        if inside and len(refs) >= 2:
+            kept_ways.append((way.id, refs, dict(way.tags)))
+            needed.update(refs)
+
+    # ── 패스 2: 필요한 노드만 기록(신호등·횡단보도 태그도 원본 그대로 보존된다)
     writer = osmium.SimpleWriter(str(out_file))
-    flt = BboxFilter(writer, s, w, n, e)
-    flt.apply_file(str(src), locations=True)
+    written: set[int] = set()
+    if needed:
+        fp2 = (osmium.FileProcessor(str(src), osmium.osm.NODE)
+               .with_filter(_F.IdFilter(sorted(needed))))
+        for nd in fp2:
+            writer.add_node(nd)
+            written.add(nd.id)
+
+    for wid, refs, tags in kept_ways:
+        kept = [r for r in refs if r in written]
+        if len(kept) >= 2:
+            writer.add_way(osmium.osm.mutable.Way(id=wid, nodes=kept, tags=tags))
     writer.close()
 
     if stage_out:
