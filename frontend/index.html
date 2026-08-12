@@ -57,12 +57,16 @@
   <!-- ⚠️ 이 ?v= 는 브라우저 캐시를 깨는 유일한 장치다. jsx를 고쳤으면 **반드시** 해당 줄의
        값을 올릴 것 — 안 올리면 서버는 새 파일을 주는데 브라우저는 캐시된 옛 파일을 계속
        실행한다(2026-08-11 확인: 수정 후에도 옛 코드가 돌고 있었다). -->
-  <script type="text/babel" src="tab-dashboard.jsx?v=20260811b"></script>
-  <script type="text/babel" src="tab-simulation.jsx?v=20260811b"></script>
-  <script type="text/babel" src="tab-scenario.jsx?v=20260730a"></script>
+  <!-- ⚠️ 파일 내용을 고쳤으면 이 ?v= 표시도 **반드시** 함께 올릴 것. 안 올리면 브라우저가
+       "같은 주소니까 같은 파일"로 보고 캐시에 있는 옛날 코드를 계속 쓴다. 2026-08-12에
+       실제로 겪었다 — 백엔드만 새 코드고 화면은 며칠 전 코드라, 없앤 줄 알았던 배치 실행이
+       계속 돌아 원인 찾는 데 한참 걸렸다. -->
+  <script type="text/babel" src="tab-dashboard.jsx?v=20260812a"></script>
+  <script type="text/babel" src="tab-simulation.jsx?v=20260812a"></script>
+  <script type="text/babel" src="tab-scenario.jsx?v=20260812a"></script>
   <script type="text/babel" src="tab-sim-chat.jsx?v=20260624a"></script>
-  <script type="text/babel" src="tab-report.jsx?v=20260730a"></script>
+  <script type="text/babel" src="tab-report.jsx?v=20260812a"></script>
   <script type="text/babel" src="tab-settings.jsx?v=20260811a"></script>
-  <script type="text/babel" src="app.jsx?v=20260811a"></script>
+  <script type="text/babel" src="app.jsx?v=20260812a"></script>
 </body>
 </html>

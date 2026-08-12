@@ -5913,6 +5913,15 @@ async def start_simulation(req: SimStartRequest):
         return {"ok": True, "status": "preparing", "stage": _state.get("traffic_stage"),
                 "message": _state.get("traffic_message")}
 
+    # ⚠️ 교통이 준비됐는지 묻기 **전에** 이번 요청의 설정을 먼저 반영해야 한다.
+    # current_traffic_scenario는 `_state["policy_options"]`의 demand_scale_pct로 캐시를
+    # 맞춰보는데, 그 값이 아직 **직전 실행의 것**이면 엉뚱한 배율로 물어보게 된다.
+    # 시트마다 교통량이 다른 지금은 바로 드러난다 — 100%짜리 캐시를 보고 "준비됨"이라
+    # 판단해 곧장 시작해 버리고, 정작 SUMO에는 100% 교통이 실린다(요청은 50%인데).
+    # 아래 _prepare_simulation_run이 같은 설정을 한 번 더 적용하지만 값이 같아 무해하다.
+    if req.simulation_config is not None:
+        _apply_simulation_config(merge_with_default_config(req.simulation_config))
+
     scenario = current_traffic_scenario(build=False)
     if scenario is None:
         _state["pending_start"] = req
