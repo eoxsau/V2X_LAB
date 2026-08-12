@@ -176,6 +176,7 @@ from app.services.regions.region_service import (
     get_sido_list, get_sigungu_list, get_dong_list,
     get_region, get_children, get_region_by_bbox,
     extract_osm_from_pbf, get_area_km2, mark_network_built, db_available,
+    resolve_local_pbf,
 )
 from app.services.export.report_builder import (
     build_run_summary,
@@ -378,8 +379,10 @@ MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 �
 # RSU 안테나 높이 — C-V2X 표준 도로변 폴 높이 고정값. RSU는 교차로 폴 설치라 건물 높이를
 # 쓰지 않고 항상 이 값을 쓴다(옥상 스냅 대상 아님). 수동/자동 배치 모두 이 상수를 참조.
 RSU_ANTENNA_HEIGHT_M      = 6.0
-DEFAULT_LOCAL_PBF = (
-    Path(__file__).parent.parent / "data" / "raw" / "south-korea-260711.osm.pbf"
+# 전국 OSM PBF 경로 — region_service.resolve_local_pbf()가 유일한 출처다.
+# 여기서 한 번 잡아두되, 서버를 켠 뒤 파일을 넣는 경우도 있어 존재 확인은 요청 때마다 한다.
+DEFAULT_LOCAL_PBF = resolve_local_pbf() or (
+    Path(__file__).parent.parent / "south-korea.osm.pbf"
 )
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
@@ -5395,7 +5398,10 @@ async def setup_network_region(req: RegionSetupRequest):
             ),
         )
 
-    pbf_path = _Path(req.pbf_path) if req.pbf_path else (_Path.home() / "Desktop" / "south-korea-260711.osm.pbf")
+    # 경로를 요청으로 넘기면 그걸 쓰고, 아니면 resolve_local_pbf()가 찾아준다
+    # (예전에는 여기에 바탕화면 경로가 따로 박혀 있어, 위 DEFAULT_LOCAL_PBF를 고쳐도
+    #  행정구역 선택 경로만 옛 자리를 계속 봤다).
+    pbf_path = _Path(req.pbf_path) if req.pbf_path else (resolve_local_pbf() or DEFAULT_LOCAL_PBF)
     if not pbf_path.exists():
         raise HTTPException(status_code=400, detail=f"PBF 파일을 찾을 수 없습니다: {pbf_path}")
 

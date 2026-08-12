@@ -7,6 +7,7 @@ region_service.py — 행정구역 DB 조회 + 로컬 PBF에서 OSM 추출
 3. extract_osm_for_region(osm_id)   — PBF에서 해당 구역 OSM 추출 → .osm 파일 반환
 """
 
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -15,8 +16,46 @@ from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path(__file__).parent.parent.parent.parent / "data" / "regions.db"
-DEFAULT_PBF = Path.home() / "Desktop" / "south-korea-260711.osm.pbf"
 NETWORKS_DIR = Path(__file__).parent.parent.parent.parent / "networks"
+
+# 전국 OSM PBF — 구역 드래그·행정구역 선택 때 인터넷 없이 여기서 잘라 쓴다.
+# ⚠️ 파일명에 배포 날짜가 들어간다(south-korea-YYMMDD.osm.pbf). 예전에는 그 날짜를 코드에
+#    박아뒀는데, 새 파일을 받으면 이름이 안 맞아 **조용히 다운로드 모드로 떨어졌다**
+#    (2026-08-12: 코드는 260711을 찾는데 실제 파일은 260811이었다). 게다가 같은 경로가
+#    네 군데에 흩어져 있어 한 곳만 고치면 나머지가 어긋났다. 그래서 이름을 박지 않고
+#    아래 순서로 찾는다 — 이 함수가 PBF 경로의 **유일한 출처**다.
+_PBF_ROOT = Path(__file__).resolve().parents[4]          # v2x_lab/
+_PBF_SEARCH_DIRS = [
+    _PBF_ROOT,                       # 작업폴더 바로 아래 (지금 파일이 여기 있다)
+    _PBF_ROOT / "data" / "raw",      # 예전 코드가 기대하던 자리
+    Path.home() / "Desktop",         # 그보다 더 예전 자리 — 남아 있으면 계속 쓴다
+]
+
+
+def resolve_local_pbf() -> Optional[Path]:
+    """쓸 수 있는 전국 PBF 경로. 없으면 None(호출부가 Overpass 다운로드로 폴백).
+
+    `LOCAL_PBF_PATH` 환경변수가 있으면 그것만 쓴다. 없으면 위 폴더들에서
+    `south-korea-*.osm.pbf`를 찾아 **가장 최근 파일**을 고른다.
+    """
+    env = os.getenv("LOCAL_PBF_PATH")
+    if env:
+        p = Path(env)
+        return p if p.exists() else None
+    newest: Optional[Path] = None
+    for d in _PBF_SEARCH_DIRS:
+        try:
+            for p in d.glob("south-korea-*.osm.pbf"):
+                if newest is None or p.stat().st_mtime > newest.stat().st_mtime:
+                    newest = p
+        except OSError:
+            continue
+    return newest
+
+
+# 예전 이름 유지 — 호출부가 `pbf_path=DEFAULT_PBF` 기본값으로 쓰고 있다.
+# 존재하지 않을 수도 있으므로 호출부는 반드시 .exists()를 확인한다.
+DEFAULT_PBF = resolve_local_pbf() or (_PBF_ROOT / "south-korea.osm.pbf")
 
 # OSM 도로 타입 필터 (V2X 시뮬레이션에 관련된 도로만 유지)
 HIGHWAY_TYPES = (
@@ -185,21 +224,74 @@ def extract_osm_from_pbf(
     return out_file
 
 
+def _is_ascii_path(p: Path) -> bool:
+    try:
+        str(p).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _ascii_work_dir() -> Path:
+    """osmium 작업용 **순수 ASCII 경로** 폴더.
+
+    ⚠️ Windows의 libosmium은 경로에 한글이 섞이면 파일을 열지 못한다 — 읽기·쓰기 모두
+    `Open failed ... unknown error`로 죽는다(2026-08-12 실측). 그런데 이 프로젝트는
+    통째로 `C:\\Users\\<한글 이름>\\` 아래에 있어서, 전국 PBF도 결과 .osm도 전부
+    한글 경로다. 그래서 osmium이 실제로 만지는 파일만 여기로 옮겨 놓고 작업한다.
+    (임시폴더도 %LOCALAPPDATA%\\Temp라 한글이므로 쓸 수 없다.)
+    """
+    d = Path(os.environ.get("SystemDrive", "C:") + "\\") / "v2x_osm_work"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _stage_pbf_for_osmium(pbf_path: Path) -> Path:
+    """PBF를 ASCII 경로에서 볼 수 있게 만든다. 이미 ASCII면 그대로 쓴다.
+
+    같은 드라이브면 하드링크라 **즉시 끝나고 용량도 안 먹는다**(원본 그대로를 가리킨다).
+    드라이브가 다르면 어쩔 수 없이 복사한다(수백 MB — 처음 한 번만).
+    """
+    if _is_ascii_path(pbf_path):
+        return pbf_path
+    dst = _ascii_work_dir() / pbf_path.name
+    try:
+        if dst.exists():
+            if dst.stat().st_size == pbf_path.stat().st_size:
+                return dst          # 이미 준비돼 있음
+            dst.unlink()
+        os.link(pbf_path, dst)      # 하드링크
+    except OSError:
+        if not (dst.exists() and dst.stat().st_size == pbf_path.stat().st_size):
+            shutil.copy2(pbf_path, dst)
+    return dst
+
+
 def _extract_with_osmium(osmium_bin: str, pbf_path: Path, out_file: Path,
                           s: float, w: float, n: float, e: float) -> None:
     """osmium extract --bbox를 사용한 고속 추출"""
+    # CLI도 내부는 같은 libosmium이라 한글 경로에서 같은 문제를 겪는다 — 같은 방식으로 우회.
+    src = _stage_pbf_for_osmium(Path(pbf_path))
+    out_file = Path(out_file)
+    stage_out = not _is_ascii_path(out_file)
+    real_out = out_file
+    if stage_out:
+        out_file = _ascii_work_dir() / f"_extract_{os.getpid()}.osm"
     bbox_str = f"{w:.6f},{s:.6f},{e:.6f},{n:.6f}"
     cmd = [
         osmium_bin, "extract",
         "--bbox", bbox_str,
         "--strategy", "complete_ways",
-        str(pbf_path),
+        str(src),
         "-o", str(out_file),
         "--overwrite",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"osmium extract 실패: {result.stderr}")
+    if stage_out:
+        real_out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(out_file), str(real_out))
 
 
 def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
@@ -228,10 +320,24 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
             if any(nid in self.valid_nodes for nid in node_ids):
                 self.writer.add_way(w)
 
+    # 한글 경로 우회 — 읽는 PBF와 쓰는 .osm 둘 다 ASCII 경로여야 한다(위 _ascii_work_dir 설명).
+    src = _stage_pbf_for_osmium(Path(pbf_path))
+    out_file = Path(out_file)
+    stage_out = not _is_ascii_path(out_file)
+    real_out = out_file
+    if stage_out:
+        out_file = _ascii_work_dir() / f"_extract_{os.getpid()}.osm"
+        if out_file.exists():
+            out_file.unlink()
+
     writer = osmium.SimpleWriter(str(out_file))
     flt = BboxFilter(writer, s, w, n, e)
-    flt.apply_file(str(pbf_path), locations=True)
+    flt.apply_file(str(src), locations=True)
     writer.close()
+
+    if stage_out:
+        real_out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(out_file), str(real_out))
 
 
 def get_area_km2(region: dict) -> float:

@@ -38,7 +38,18 @@ from typing import Optional
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _BASE = Path(__file__).parent.parent.parent.parent.parent  # backend/
 _DB_PATH = _BASE / "data" / "regions.db"
-_PBF_PATH = _BASE.parent / "data" / "raw" / "south-korea-260711.osm.pbf"
+
+# 전국 PBF 경로 — region_service가 유일한 출처(파일명의 날짜가 바뀌어도 따라간다).
+# RL 모듈만 따로 도는 경우가 있어 임포트 실패 시 같은 규칙의 폴백을 둔다.
+try:
+    from app.services.regions.region_service import resolve_local_pbf as _resolve_pbf
+except Exception:  # pragma: no cover
+    def _resolve_pbf():
+        cands = sorted(_BASE.parent.glob("south-korea-*.osm.pbf")) + \
+                sorted((_BASE.parent / "data" / "raw").glob("south-korea-*.osm.pbf"))
+        return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+_PBF_PATH = _resolve_pbf() or (_BASE.parent / "south-korea.osm.pbf")
 _GRAPH_CACHE_DIR = _BASE / "data" / "v4_graph_cache"
 
 # ── OSM highway types kept for V2X routing ────────────────────────────────────

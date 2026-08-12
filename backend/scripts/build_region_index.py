@@ -28,7 +28,21 @@ except ImportError:
     print("ERROR: pyosmium이 설치되어 있지 않습니다. 'pip install osmium'을 실행하세요.")
     sys.exit(1)
 
-DEFAULT_PBF = Path.home() / "Desktop" / "south-korea-260711.osm.pbf"
+# 전국 PBF 경로는 region_service가 찾아준다(파일명의 날짜가 바뀌어도 따라간다).
+# 이 스크립트는 backend/를 sys.path에 넣고 도는 게 아니라서 직접 임포트가 안 될 수 있어,
+# 실패하면 작업폴더에서 같은 규칙으로 찾는 폴백을 둔다.
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from app.services.regions.region_service import resolve_local_pbf as _resolve_pbf
+except Exception:  # pragma: no cover - 임포트 환경이 다를 때만
+    def _resolve_pbf():
+        root = Path(__file__).resolve().parents[2]          # v2x_lab/
+        cands = sorted(root.glob("south-korea-*.osm.pbf")) + \
+                sorted((root / "data" / "raw").glob("south-korea-*.osm.pbf"))
+        return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+DEFAULT_PBF = _resolve_pbf() or (Path(__file__).resolve().parents[2] / "south-korea.osm.pbf")
+
 DB_PATH = Path(__file__).parent.parent / "data" / "regions.db"
 
 DISPLAY_LEVELS = {
