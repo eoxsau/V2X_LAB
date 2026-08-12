@@ -328,7 +328,8 @@ def _extract_with_osmium(osmium_bin: str, pbf_path: Path, out_file: Path,
 
 
 def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
-                             s: float, w: float, n: float, e: float) -> None:
+                             s: float, w: float, n: float, e: float,
+                             low_memory: bool = False) -> None:
     """전국 PBF에서 bbox 안의 **도로망**을 뽑아 OSM XML로 저장한다.
 
     ⚡ 왜 두 번 읽나 — 파이썬 콜백을 없애기 위해서다.
@@ -370,24 +371,35 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
     if out_file.exists():
         out_file.unlink()
 
-    # ── 패스 1: 남길 도로와 그 도로가 쓰는 노드 id
-    kept_ways: list[tuple[int, list[int], dict]] = []
-    needed: set[int] = set()
-    fp = (osmium.FileProcessor(str(src), osmium.osm.NODE | osmium.osm.WAY)
-          .with_locations()
-          .with_filter(_F.EntityFilter(osmium.osm.WAY))
-          .with_filter(_F.KeyFilter("highway")))
-    for way in fp:
-        refs: list[int] = []
-        inside = False
+    def _way_pass():
+        """도로만 올라오는 반복자 — 노드는 C++에서 걸러져 파이썬까지 오지 않는다."""
+        return (osmium.FileProcessor(str(src), osmium.osm.NODE | osmium.osm.WAY)
+                .with_locations()
+                .with_filter(_F.EntityFilter(osmium.osm.WAY))
+                .with_filter(_F.KeyFilter("highway")))
+
+    def _touches(way) -> tuple[bool, list[int]]:
+        refs, inside = [], False
         for nd in way.nodes:
             refs.append(nd.ref)
             loc = nd.location
             if loc.valid() and s <= loc.lat <= n and w <= loc.lon <= e:
                 inside = True
-        if inside and len(refs) >= 2:
+        return inside, refs
+
+    # ── 패스 1: 남길 도로가 쓰는 노드 id
+    # low_memory면 **id만** 모은다. 도(道) 하나처럼 넓은 구역에서는 도로의 좌표·태그까지
+    # 들고 있으면 메모리가 1.7GB를 넘어간다(2026-08-13 실측, 강원도에서 확인). 대신 도로를
+    # 한 번 더 읽는다 — 스캔 1회를 더 쓰는 대신 메모리가 id 집합 하나로 줄어든다.
+    kept_ways: list[tuple[int, list[int], dict]] = []
+    needed: set[int] = set()
+    for way in _way_pass():
+        inside, refs = _touches(way)
+        if not (inside and len(refs) >= 2):
+            continue
+        needed.update(refs)
+        if not low_memory:
             kept_ways.append((way.id, refs, dict(way.tags)))
-            needed.update(refs)
 
     # ── 패스 2: 필요한 노드만 기록(신호등·횡단보도 태그도 원본 그대로 보존된다)
     writer = osmium.SimpleWriter(str(out_file))
@@ -398,11 +410,23 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
         for nd in fp2:
             writer.add_node(nd)
             written.add(nd.id)
+    del needed
 
-    for wid, refs, tags in kept_ways:
-        kept = [r for r in refs if r in written]
-        if len(kept) >= 2:
-            writer.add_way(osmium.osm.mutable.Way(id=wid, nodes=kept, tags=tags))
+    # ── 패스 3(low_memory일 때만): 도로를 다시 읽어 바로 기록
+    if low_memory:
+        for way in _way_pass():
+            inside, refs = _touches(way)
+            if not inside:
+                continue
+            kept = [r for r in refs if r in written]
+            if len(kept) >= 2:
+                writer.add_way(osmium.osm.mutable.Way(id=way.id, nodes=kept,
+                                                      tags=dict(way.tags)))
+    else:
+        for wid, refs, tags in kept_ways:
+            kept = [r for r in refs if r in written]
+            if len(kept) >= 2:
+                writer.add_way(osmium.osm.mutable.Way(id=wid, nodes=kept, tags=tags))
     writer.close()
 
     if stage_out:

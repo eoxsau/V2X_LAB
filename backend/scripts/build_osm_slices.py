@@ -79,7 +79,8 @@ def main() -> int:
         print(f"[{i}/{len(sido)}] {name}: 자르는 중… (lat {s:.3f}~{n:.3f}, lon {w:.3f}~{e:.3f})", flush=True)
         t = time.time()
         try:
-            _extract_with_pyosmium(pbf, out, s, w, n, e)
+            # 도 하나는 구역이 넓어 도로를 통째로 들고 있으면 메모리가 터진다 — 저메모리 모드.
+            _extract_with_pyosmium(pbf, out, s, w, n, e, low_memory=True)
         except Exception as exc:
             print(f"    실패: {exc}")
             continue
