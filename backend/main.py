@@ -728,6 +728,7 @@ _VALID_BS_SELECTION_ALGORITHMS = frozenset({
     "rsrp_max", "nearest_bs", "lowest_latency_bs", "strongest_signal_bs",
     "load_balanced_bs", "look_ahead_bs_selection", "rl_based_bs_selection",
     "look_ahead_bs",  # _bs_score가 받아주는 별칭
+    "v4_gnn",         # GNN-MAML 추론으로 직접 선택(모델 미로드 시 내부에서 폴백)
 })
 
 def validate_simulation_config(raw: dict) -> SimulationConfigModel:
@@ -7971,8 +7972,9 @@ async def replace_user_created_nodes(req: NetworkNodeSetRequest):
     `/network-nodes/auto-place`처럼 새로 계산하지 않고 **좌표를 그대로 되돌려 놓는다** —
     같은 시트로 돌아왔을 때 기지국이 다른 자리에 생기면 비교가 무의미해지기 때문.
     """
-    if not postgis_available():
-        raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 저장할 수 없습니다.")
+    # PostGIS가 꺼져 있어도 막지 않는다 — db.py가 인메모리 저장소로 폴백하므로
+    # delete/insert가 그대로 동작한다(2026-08-12 병합: create_network_node·auto-place도
+    # 같은 이유로 이 검사를 걷어냈다). 여기만 남겨두면 기본 설정에서 시트 전환이 깨진다.
     if _state.get("sim_running"):
         raise HTTPException(status_code=409, detail="시뮬레이션 실행 중에는 기지국을 바꿀 수 없습니다. 먼저 중지하세요.")
 
@@ -9374,6 +9376,7 @@ _BS_SELECTION_DESC = {
     "load_balanced_bs": "부하율(load/capacity)이 가장 낮은 기지국을 우선하고, 거리는 동률일 때만 보조 기준으로 사용",
     "look_ahead_bs_selection": "lowest_latency_bs와 동일하지만, 곧 커버리지를 벗어날 기지국에는 강한 페널티를 추가",
     "rl_based_bs_selection": "강화학습 기반 기지국 선택 — 아직 학습된 에이전트가 없어 미구현 상태, 선택해도 lowest_latency_bs로 동작함",
+    "v4_gnn": "GNN-MAML 학습 모델이 기지국을 직접 고름 — 모델이 안 올라와 있으면 기본 점수 방식으로 폴백",
 }
 _COST_WEIGHT_DESC = {
     "w_distance": "경로 길이(거리)에 대한 가중치 — 클수록 더 짧은 경로를 선호",
