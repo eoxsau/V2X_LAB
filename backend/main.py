@@ -683,6 +683,16 @@ _VALID_ROUTE_ALGORITHMS = frozenset({
     "network_aware_routing", "look_ahead_routing",
 })
 
+# 기지국 선택 알고리즘 — route_cost_function._bs_score가 실제로 분기하는 이름들.
+# ⚠️ 여기가 유일한 정답 목록이다. 예전에는 이 목록이 어디에도 없어서 시나리오
+#    어시스턴트 화면이 자체 목록(3개)을 들고 있었고, 기본값인 rsrp_max조차 빠져 있어
+#    LLM이 옳은 값을 골라도 화면이 "허용되지 않은 값"으로 거절했다(2026-08-12).
+_VALID_BS_SELECTION_ALGORITHMS = frozenset({
+    "rsrp_max", "nearest_bs", "lowest_latency_bs", "strongest_signal_bs",
+    "load_balanced_bs", "look_ahead_bs_selection", "rl_based_bs_selection",
+    "look_ahead_bs",  # _bs_score가 받아주는 별칭
+})
+
 def validate_simulation_config(raw: dict) -> SimulationConfigModel:
     """Parse user config dict; invalid individual fields fall back to per-field defaults."""
     section_map = {
@@ -735,6 +745,13 @@ def sanitize_algorithm_selection(cfg: SimulationConfigModel) -> SimConfigAlgorit
                 algo = algo.model_copy(update={"latency_algorithm": defaults.latency_algorithm})
         except Exception:
             pass
+    if algo.base_station_selection_algorithm not in _VALID_BS_SELECTION_ALGORITHMS:
+        # 예전에는 이 검사가 아예 없어서, 모르는 이름이 들어오면 _bs_score의 "그 외" 분기로
+        # 흘러 조용히 lowest_latency_bs처럼 동작했다 — 화면은 요청한 알고리즘 이름을 그대로
+        # 보여주므로 무엇으로 계산됐는지 알 수 없었다.
+        algo = algo.model_copy(update={
+            "base_station_selection_algorithm": defaults.base_station_selection_algorithm,
+        })
     if RESOURCE_DEMAND_AVAILABLE:
         try:
             valid_alloc = {a["id"] for a in ALLOCATION_REGISTRY.list_algorithms()}
@@ -3579,7 +3596,7 @@ def _traffic_log(m: str) -> None:
     print(f"[DEMAND] {m}", flush=True)
 
 
-def current_traffic_scenario(force: bool = False, build: bool = True):
+def current_traffic_scenario(force: bool = False, build: bool = True, log=None):
     """현재 구역의 생성 교통 한 세트를 준비한다 (없으면 만들고, 있으면 캐시 재사용).
 
     `demand/scenario.build_traffic_scenario`의 앱 측 래퍼. N* 산정·수요 생성·동적 SUMO가
@@ -3589,6 +3606,10 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
     ⚠️ `build=True`면 **최대 10분**(N* 보정 포함)이 걸릴 수 있다. 이벤트 루프를 막으면
     서버 전체가 멈추므로 **async 엔드포인트에서 직접 부르지 말 것** —
     `run_in_executor`로 감싸거나, 이미 만들어진 것만 쓰려면 `build=False`로 부른다.
+
+    `log`를 주면 진행 문구를 그쪽으로 보낸다(기본은 `_traffic_log` — 콘솔 + WS). 배치
+    러너는 같은 줄을 배치 상태에도 실어야 해서(폴링으로만 보는 화면이라 WS를 안 듣는다)
+    양쪽에 흘려보내는 콜백을 넘긴다.
 
     Returns: TrafficScenario | None (net이 없거나 생성 실패 시 None — 호출부가 폴백)
     """
@@ -3629,7 +3650,7 @@ def current_traffic_scenario(force: bool = False, build: bool = True):
                 area_bbox=_demand_bbox(),
                 through_ratio=through,
                 force=force,
-                log=_traffic_log,
+                log=log or _traffic_log,
             )
         except Exception as exc:
             print(f"[DEMAND] 교통 생성 실패 — 기존 폴백을 씁니다: {exc}", flush=True)
@@ -5851,12 +5872,52 @@ async def start_simulation(req: SimStartRequest):
     return _launch_sim_thread(req)
 
 
-def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str) -> dict:
-    """route_metrics 모드: 실시간 스레드 없이 _prepare_simulation_run + _evaluate_mock_route(synchronous=True)로 즉시 평가."""
+def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str,
+                             progress=None) -> dict:
+    """route_metrics 모드: 실시간 스레드 없이 _prepare_simulation_run + _evaluate_mock_route(synchronous=True)로 즉시 평가.
+
+    ⚠️ 교통(생성 수요)이 준비될 때까지 **기다린다.** 예전에는 기다리지 않고 있으면 쓰고
+    없으면 넘어갔는데(`build=False` 한 줄), 그러면 시나리오가 배율을 아무리 다르게 줘도
+    교통이 없어서 `vehicle_count-1`대를 bbox에 무작위로 뿌리는 옛 경로로 조용히 떨어졌다.
+    화면에는 "교통량 100%"라고 뜨는데 실제로는 배경차 10대로 계산된 값이 나왔다
+    (2026-08-12 실측: 45,021통행짜리 구역에서 배치가 17초 만에 "성공"으로 끝났다).
+
+    `progress(stage, message)`를 주면 준비/평가 단계를 그때그때 알려준다 — 배치 화면이
+    폴링으로 이 문구를 그대로 보여준다.
+    """
     if not _state["network_ready"]:
         raise RuntimeError("네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
     if not spec.origin or not spec.dest:
         raise RuntimeError("route_metrics 모드는 origin/dest가 필요합니다.")
+
+    def _note(stage: str, message: str) -> None:
+        if progress:
+            progress(stage, message)
+
+    def _log(m: str) -> None:
+        _traffic_log(m)      # 콘솔 + WS(실시간 화면)는 그대로 두고
+        _note("preparing", m)  # 배치 화면에도 같은 줄을 실어 보낸다
+
+    # 교통은 **배율마다 다른 세트**다. 이 시나리오의 설정(demand_scale_pct 등)을 먼저
+    # 반영해야 올바른 배율로 만들어진다.
+    # ⚠️ 순서를 바꾸지 말 것 — 아래 `_prepare_simulation_run`은 "생성 교통이 없으면"
+    #    ITS 혼잡도를 기지국 부하로 따로 깐다. 교통을 그 뒤에 만들면 같은 혼잡을 두 번
+    #    세게 된다(진행문서 §2-8). 여기서 미리 만들어 두면 그쪽이 "있음"으로 보고 건너뛴다.
+    _apply_simulation_config(merge_with_default_config(spec.simulation_config))
+
+    _note("preparing", "교통 준비를 시작합니다…")
+    _state["traffic_preparing"] = True
+    _state["traffic_stage"] = "calibrating"
+    try:
+        traffic = current_traffic_scenario(log=_log)
+    finally:
+        _state["traffic_preparing"] = False
+        _state["traffic_stage"] = None
+    if traffic is None:
+        raise RuntimeError(
+            "교통 생성에 실패해 평가를 중단했습니다. 교통 없이 계산하면 배경 차량 몇 대짜리 "
+            "결과가 나와 다른 시나리오와 비교할 수 없습니다. 구역 설정을 확인하세요."
+        )
 
     req = SimStartRequest(
         origin=spec.origin,
@@ -5870,6 +5931,8 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
     )
     _state["sim_mode"] = "mock"  # 배치는 항상 mock-graph 즉시평가만 사용(SUMO 실시간 스레드 없음)
     _rng = _prepare_simulation_run(req)
+    _note("evaluating", f"경로·자원 배분을 평가하는 중… "
+                        f"(생성 교통 {traffic.total_trips:,.0f}통행 = 기준 {traffic.n_star:,.0f} × {traffic.demand_scale * 100:.0f}%)")
     _evaluate_mock_route(req, _rng, synchronous=True)
 
     # 대시보드가 실시간으로 보여주는 network_telemetry(L_base/L_signal/L_queue 분해,
@@ -5952,8 +6015,18 @@ def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
     """배치 워커(백그라운드 스레드). _state를 시나리오마다 재사용/덮어쓰므로 반드시 순차 실행."""
     global _active_batch_id
     run = _batch_runs[batch_id]
+
+    def _progress(stage: str, message: str) -> None:
+        """평가기가 알려주는 진행 단계를 배치 상태에 적어둔다 — 배치 화면은 WS가 아니라
+        GET /api/scenarios/batch/{id} 폴링만 보므로, 여기 적어야 사용자에게 보인다."""
+        run["stage"] = stage
+        run["message"] = message
+
     for i, spec in enumerate(scenarios):
         item_id = spec.id or spec.label or str(i)
+        run["current_index"] = i
+        run["current_label"] = spec.label or item_id
+        _progress("preparing", "시나리오를 준비하는 중…")
         # 평가 함수(_evaluate_route_scenario/_evaluate_rl_scenario)는 결과만 반환하므로,
         # 원본 요청 파라미터(vehicle_count/seed/origin 등)는 여기서 같이 기록해야 프런트의
         # 시나리오 비교 카드가 결과만 보고도 "무엇을 입력해서 나온 결과인지" 알 수 있다.
@@ -5965,14 +6038,19 @@ def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
         }
         try:
             if spec.mode == "rl_episode":
+                _progress("evaluating", "RL 정책을 평가하는 중…")  # 이 모드는 교통이 필요 없다
                 result = _evaluate_rl_scenario(spec)
             else:
-                result = _evaluate_route_scenario(spec, scenario_id=item_id, batch_id=batch_id)
+                result = _evaluate_route_scenario(spec, scenario_id=item_id, batch_id=batch_id,
+                                                  progress=_progress)
             run["results"].append({**base_info, "status": "done", **result})
         except Exception as exc:
             run["results"].append({**base_info, "status": "error", "error": str(exc)})
         run["completed"] = i + 1
     run["status"] = "completed"
+    run["stage"] = None
+    run["message"] = None
+    run["current_label"] = None
     run["ended_at"] = datetime.now(timezone.utc).isoformat()
     _active_batch_id = None
 
@@ -5989,6 +6067,11 @@ def start_scenario_batch(req: ScenarioBatchRequest):
 
     즉시 batch_id를 반환하고 백그라운드 스레드에서 순차 실행 — 진행 상황과 결과는
     GET /api/scenarios/batch/{batch_id}로 폴링.
+
+    ⚠️ route_metrics는 시나리오마다 **교통이 준비될 때까지 기다린다**(배율이 다르면 새로
+    만든다 — 최대 10분). 그래서 배치 전체가 수십 분이 될 수 있다. 기다리지 않던 예전
+    동작은 교통 없이 배경차 몇 대로 계산해 놓고 "성공"이라 답했다(_evaluate_route_scenario
+    docstring 참조). 진행 문구는 응답의 stage/message에 실려 나간다.
     """
     global _active_batch_id
     if not req.scenarios:
@@ -6011,6 +6094,12 @@ def start_scenario_batch(req: ScenarioBatchRequest):
         "total": len(req.scenarios),
         "completed": 0,
         "results": [],
+        # 진행 문구 — 교통 준비에 수 분이 걸리므로, 사용자가 "멈춘 건가?" 하지 않도록
+        # 지금 무엇을 하는 중인지 폴링 응답에 계속 실어 보낸다.
+        "stage": "preparing",          # "preparing" | "evaluating" | None(완료)
+        "message": "배치를 시작합니다…",
+        "current_index": 0,
+        "current_label": None,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "ended_at": None,
     }
@@ -6074,32 +6163,45 @@ origin과 dest는 충분히 다양한 위치를 써서 경로가 서로 겹치�
 - origin / dest: lat·lng 좌표 — origin과 dest는 직선거리 최소 300m 이상 떨어져야 합니다
 - vehicle_count: 1~30 (rush_hour=20~30, off_peak=5~10, highway=10~20, emergency=2~5, night=1~5, normal=5~15)
 - demand_scale_pct: 교통량 배율 10~300 (rush_hour=150~250, off_peak=40~70, highway=100~200, emergency=30~60, night=20~40, normal=80~120)
+  ⚠️ 사용자가 "교통량 50%", "배율 200으로" 처럼 **숫자를 직접 말했으면 위 표를 무시하고 그 값을 그대로** 쓰세요.
 - network_mode: "4G" | "5G" | "6G" — highway/emergency는 "5G" 또는 "6G" 권장
+- n_bs / n_rsu: 배치할 기지국·노변장치 개수 (0~50). 사용자가 개수를 말하지 않았으면 두 값 모두 0으로 두세요
+  (0이면 지금 배치된 것을 그대로 씁니다). "기지국 10개" 처럼 말하면 그 숫자를 넣으세요.
+- placement_method: "random"(고르게 흩뿌리기, 빠름) | "sa"(교통량 계산 후 최적 위치 탐색, 수 분 소요)
+  사용자가 "최적화해서 배치", "최적 위치에" 라고 하면 "sa", 그 외에는 "random"
+- algorithms: 아래 후보 중에서 고르세요. 사용자가 지정하지 않은 키는 **넣지 마세요**(기본값이 쓰입니다).
+{_algo_candidate_block()}
 
 === 생성 예시 (few-shot) ===
 
-예시 1 — 퇴근 혼잡 시나리오:
+예시 1 — "퇴근 혼잡 시나리오" (개수·알고리즘 언급 없음 → n_bs/n_rsu는 0, algorithms는 생략):
 {{
   "label": "퇴근 혼잡", "scenario_type": "rush_hour",
   "origin": {{"lat": {bbox_s + lat_span * 1.2:.6f}, "lng": {bbox_w + lng_span * 0.8:.6f}}},
   "dest":   {{"lat": {bbox_n - lat_span * 0.9:.6f}, "lng": {bbox_e - lng_span * 1.1:.6f}}},
-  "vehicle_count": 25, "demand_scale_pct": 200, "network_mode": "5G"
+  "vehicle_count": 25, "demand_scale_pct": 200, "network_mode": "5G",
+  "n_bs": 0, "n_rsu": 0, "placement_method": "random"
 }}
 
-예시 2 — 고속도로 긴급:
+예시 2 — "고속도로 긴급, 기지국 8개 RSU 4개 랜덤 배치, 다익스트라로":
 {{
   "label": "고속도로 긴급", "scenario_type": "emergency",
   "origin": {{"lat": {bbox_s + lat_span * 0.5:.6f}, "lng": {bbox_w + lng_span * 1.5:.6f}}},
   "dest":   {{"lat": {bbox_n - lat_span * 0.3:.6f}, "lng": {bbox_e - lng_span * 0.4:.6f}}},
-  "vehicle_count": 3, "demand_scale_pct": 45, "network_mode": "6G"
+  "vehicle_count": 3, "demand_scale_pct": 45, "network_mode": "6G",
+  "n_bs": 8, "n_rsu": 4, "placement_method": "random",
+  "algorithms": {{"route_algorithm": "dijkstra"}}
 }}
 
-예시 3 — 야간 저밀도:
+예시 3 — "야간 저밀도, 교통량은 25%, 기지국 6개를 최적 위치에, 부하 분산 위주로":
 {{
   "label": "야간 저밀도", "scenario_type": "night",
   "origin": {{"lat": {bbox_s + lat_span * 0.3:.6f}, "lng": {bbox_w + lng_span * 2.0:.6f}}},
   "dest":   {{"lat": {bbox_n - lat_span * 1.4:.6f}, "lng": {bbox_e - lng_span * 0.8:.6f}}},
-  "vehicle_count": 2, "demand_scale_pct": 25, "network_mode": "4G"
+  "vehicle_count": 2, "demand_scale_pct": 25, "network_mode": "4G",
+  "n_bs": 6, "n_rsu": 0, "placement_method": "sa",
+  "algorithms": {{"base_station_selection_algorithm": "load_balanced_bs",
+                 "resource_allocation_algorithm": "load_balancing_allocation"}}
 }}
 
 반드시 아래 JSON 형식으로만 응답하세요. 다른 텍스트는 절대 출력하지 마세요.
@@ -6109,7 +6211,9 @@ origin과 dest는 충분히 다양한 위치를 써서 경로가 서로 겹치�
       "label": "...", "scenario_type": "normal",
       "origin": {{"lat": 0.0, "lng": 0.0}},
       "dest":   {{"lat": 0.0, "lng": 0.0}},
-      "vehicle_count": 10, "demand_scale_pct": 100, "network_mode": "5G"
+      "vehicle_count": 10, "demand_scale_pct": 100, "network_mode": "5G",
+      "n_bs": 0, "n_rsu": 0, "placement_method": "random",
+      "algorithms": {{}}
     }}
   ]
 }}"""
@@ -6182,6 +6286,27 @@ origin과 dest는 충분히 다양한 위치를 써서 경로가 서로 겹치�
             if filtered_cw:
                 sim_cfg["cost_weights"] = filtered_cw
 
+        # 알고리즘 선택 — 모르는 이름은 버린다(LLM이 지어낼 수 있다). 비어 있으면
+        # 키 자체를 넣지 않아 기본값이 그대로 쓰이게 한다.
+        raw_algos = raw.get("algorithms")
+        algo_sel: dict = {}
+        if isinstance(raw_algos, dict):
+            for key, valid in _ALGO_VALID_BY_KEY.items():
+                val = raw_algos.get(key)
+                if isinstance(val, str) and val in valid:
+                    algo_sel[key] = val
+                elif val is not None:
+                    warnings.append(f"'{label}': 알 수 없는 {key} 값 '{val}'을(를) 무시했습니다.")
+        if algo_sel:
+            sim_cfg["algorithm_selection"] = algo_sel
+
+        # 기지국·RSU 배치 요청 — 0이면 "지금 깔린 것을 그대로 쓴다"는 뜻이라 배치하지 않는다.
+        n_bs = max(0, min(int(raw.get("n_bs") or 0), 50))
+        n_rsu = max(0, min(int(raw.get("n_rsu") or 0), 50))
+        placement_method = raw.get("placement_method")
+        if placement_method not in ("random", "sa"):
+            placement_method = "random"
+
         scenarios.append({
             "id": f"gen-{i + 1}",
             "label": label,
@@ -6196,6 +6321,10 @@ origin과 dest는 충분히 다양한 위치를 써서 경로가 서로 겹치�
             "demand_scale_pct": demand_scale_pct,
             "network_mode": network_mode,
             "simulation_config": sim_cfg,
+            "algorithm_selection": algo_sel,       # 화면 표에 그대로 보여주기 위해 따로도 싣는다
+            "n_bs": n_bs,
+            "n_rsu": n_rsu,
+            "placement_method": placement_method,
             "seed": seed_base + i,
         })
 
@@ -7761,6 +7890,54 @@ async def reset_user_created_nodes():
     return {"ok": True, "deleted": deleted}
 
 
+class NetworkNodeSetRequest(BaseModel):
+    nodes: list[dict]
+
+
+@app.post("/network-nodes/replace-user-created")
+async def replace_user_created_nodes(req: NetworkNodeSetRequest):
+    """user_created 기지국을 통째로 **주어진 목록으로 교체**한다.
+
+    시뮬레이션 탭의 시트마다 기지국·RSU 배치가 다를 수 있는데(시나리오 어시스턴트가
+    시트별로 다르게 깔아준다), DB의 user_created 노드는 전역으로 한 벌뿐이다. 시트를
+    전환할 때 그 시트가 기억해 둔 목록으로 갈아끼우는 용도.
+
+    `/network-nodes/auto-place`처럼 새로 계산하지 않고 **좌표를 그대로 되돌려 놓는다** —
+    같은 시트로 돌아왔을 때 기지국이 다른 자리에 생기면 비교가 무의미해지기 때문.
+    """
+    if not postgis_available():
+        raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 저장할 수 없습니다.")
+    if _state.get("sim_running"):
+        raise HTTPException(status_code=409, detail="시뮬레이션 실행 중에는 기지국을 바꿀 수 없습니다. 먼저 중지하세요.")
+
+    delete_user_created_network_nodes()
+    written = 0
+    for n in req.nodes:
+        if n.get("lat") is None or n.get("lng") is None or not n.get("id"):
+            continue
+        # ⚠️ upsert_network_nodes가 아니라 insert_network_node를 쓴다 — 전자는 안테나 높이·
+        #    설치형태를 아예 안 쓴다. 그걸로 되돌리면 옥상 25m로 세운 기지국이 높이 없는
+        #    노드로 되살아나 경로손실이 달라진다(같은 시트인데 결과가 바뀐다).
+        insert_network_node({
+            "id": n["id"],
+            "name": n.get("name") or n["id"],
+            "node_type": n.get("node_type") or n.get("type"),
+            "lat": n["lat"], "lng": n["lng"],
+            "capacity": n.get("capacity", 100.0),
+            "load": n.get("load", 0.0),
+            "congestion_score": n.get("congestion_score", 0.0),
+            "edge_latency_ms": n.get("edge_latency_ms", 5.0),
+            "coverage_radius_m": n.get("coverage_radius_m", 500.0),
+            "source": "user_created",
+            "antenna_height_m": n.get("antenna_height_m"),
+            "antenna_placement": n.get("antenna_placement"),
+        })
+        written += 1
+    _refresh_active_network_nodes()
+    return {"ok": True, "count": written,
+            "nodes": [_network_node_response(r) for r in fetch_network_nodes()]}
+
+
 class AutoPlaceRequest(BaseModel):
     n_bs: int = 0
     n_rsu: int = 0
@@ -9126,8 +9303,9 @@ _ROUTE_ALGO_DESC = {
     "rl_routing": "강화학습 기반 경로 선택 — 아직 학습된 에이전트가 없어 미구현 상태, 선택해도 baseline dijkstra로 동작함",
 }
 _BS_SELECTION_DESC = {
+    "rsrp_max": "경로손실 + 건물 차폐를 최소화하는 기지국 선택 = 수신 신호가 가장 센 곳 (기본값)",
     "nearest_bs": "단순 직선거리(Haversine)가 가장 가까운 기지국 선택",
-    "lowest_latency_bs": "전파 손실 + 혼잡도 + 구간 지연을 합쳐 예상 지연시간이 가장 낮은 기지국 선택 (기본값)",
+    "lowest_latency_bs": "전파 손실 + 혼잡도 + 구간 지연을 합쳐 예상 지연시간이 가장 낮은 기지국 선택",
     "strongest_signal_bs": "거리의 제곱에 반비례하는 자유공간 경로손실 근사값으로 신호가 가장 강한 기지국 선택",
     "load_balanced_bs": "부하율(load/capacity)이 가장 낮은 기지국을 우선하고, 거리는 동률일 때만 보조 기준으로 사용",
     "look_ahead_bs_selection": "lowest_latency_bs와 동일하지만, 곧 커버리지를 벗어날 기지국에는 강한 페널티를 추가",
@@ -9152,6 +9330,11 @@ _POLICY_OPTION_DESC = {
     "avoid_disconnection": "true면 커버리지 단절 구간을 적극적으로 회피",
     "traffic_lambda": "배경 차량/트래픽 강도를 나타내는 파라미터 (0~200)",
     "network_mode": "통신 세대 — \"4G\" | \"5G\" | \"6G\"",
+    # ⚠️ 이 줄이 없던 동안에는 "교통량 50%로 해줘"라고 해도 LLM이 바꿀 키를 몰라 그냥
+    #    무시했다. 교통량을 정하는 **가장 중요한 손잡이**다(2026-08-12).
+    "demand_scale_pct": "교통량 배율(%) — 이 구역의 기준 교통량 N* 대비 몇 %를 흘릴지 (10~300, "
+                        "100=정체가 생겼다 풀리는 수준). 사용자가 \"교통량 50%\"처럼 숫자를 "
+                        "직접 말하면 반드시 그 값을 그대로 쓸 것",
     "bg_reroute_prob": "배경 차량이 무작위로 목적지를 바꿔 실시간 재경로할 확률 (0~1, 기본 0 = 끔). "
                        "올리면 배경 차량이 통행을 끝내기 전에 목적지가 바뀌므로 도로가 잘 비지 않는다",
     "bg_reroute_mode": "재경로 트리거 방식 — \"random\"(균일 확률) | \"congestion\"(현재 위치 BS 혼잡도에 비례해 확률 증가)",
@@ -9198,6 +9381,85 @@ policy_options — 각 필드 의미:
 """
 
 
+def _scenario_option_catalog() -> dict:
+    """시나리오 어시스턴트가 쓸 수 있는 값의 **정답 목록**.
+
+    예전에는 이 목록이 프론트(tab-scenario.jsx)에 손으로 복사돼 있었고, 백엔드가 LLM에게
+    알려주는 후보와 어긋나 있었다 — 기본값인 rsrp_max·tech_latency_v31조차 프론트 목록에
+    없어서, LLM이 옳은 값을 골라도 화면이 빨간 '검증 실패'로 거절했다(2026-08-12).
+    화면은 이제 이걸 받아서 검사하므로 목록이 두 벌로 갈라지지 않는다.
+    """
+    lat_ids = sorted({a["id"] for a in LATENCY_REGISTRY.list_algorithms()}) if LATENCY_AVAILABLE else []
+    alloc_ids = sorted({a["id"] for a in ALLOCATION_REGISTRY.list_algorithms()}) if RESOURCE_DEMAND_AVAILABLE else []
+    defaults = SimConfigAlgorithmSelection()
+    return {
+        "cost_weights": {
+            "keys": sorted(_COST_WEIGHT_DESC.keys()),
+            "min": 0.0, "max": 20.0,
+        },
+        "algorithm_selection": {
+            "route_algorithm": sorted(_ROUTE_ALGO_DESC.keys()),
+            "latency_algorithm": lat_ids,
+            "base_station_selection_algorithm": sorted(_BS_SELECTION_DESC.keys()),
+            "resource_allocation_algorithm": alloc_ids,
+            "defaults": defaults.model_dump(),
+        },
+        # 화면이 그대로 검사에 쓸 수 있게 규칙까지 함께 내려준다.
+        "policy_options": {
+            "lookahead_k":          {"type": "int",   "min": 1,   "max": 10},
+            "lookahead_time":       {"type": "float", "min": 1,   "max": 120},
+            "max_handover_allowed": {"type": "int",   "min": 0,   "max": 50},
+            "prefer_low_latency":   {"type": "bool"},
+            "prefer_load_balance":  {"type": "bool"},
+            "avoid_disconnection":  {"type": "bool"},
+            "traffic_lambda":       {"type": "float", "min": 0,   "max": 200},
+            "other_device_lambda":  {"type": "float", "min": 0,   "max": 2000},
+            "demand_scale_pct":     {"type": "float", "min": 10,  "max": 300},
+            "bg_reroute_prob":      {"type": "float", "min": 0,   "max": 1},
+            "network_mode":         {"type": "enum",  "values": ["4G", "5G", "6G"]},
+            "bg_reroute_mode":      {"type": "enum",  "values": ["random", "congestion"]},
+        },
+        "placement": {
+            "method": ["random", "sa"],
+            "max_bs": 50, "max_rsu": 50,
+        },
+    }
+
+
+@app.get("/api/scenarios/options")
+def get_scenario_options():
+    """시나리오 어시스턴트 화면이 검증에 쓰는 정답 목록 (위 `_scenario_option_catalog` 참조)."""
+    return _scenario_option_catalog()
+
+
+class _AlgoValidLookup(dict):
+    """`_ALGO_VALID_BY_KEY[key]` → 그 키에 허용되는 값 집합. 레지스트리는 런타임에
+    등록되므로 **읽을 때마다** 최신 목록을 만든다(import 시점에 굳히면 안 된다)."""
+
+    def __missing__(self, key):
+        return frozenset(_scenario_option_catalog()["algorithm_selection"].get(key) or ())
+
+    def items(self):  # 생성기가 순회하는 4개 키
+        for k in ("route_algorithm", "latency_algorithm",
+                  "base_station_selection_algorithm", "resource_allocation_algorithm"):
+            yield k, self[k]
+
+
+_ALGO_VALID_BY_KEY = _AlgoValidLookup()
+
+
+def _algo_candidate_block() -> str:
+    """시나리오 생성 프롬프트에 넣을 알고리즘 후보 — 이름만 짧게(설명은 파싱 쪽 스키마 문서에)."""
+    labels = {"route_algorithm": "경로 탐색", "latency_algorithm": "지연 계산",
+              "base_station_selection_algorithm": "기지국 선택",
+              "resource_allocation_algorithm": "자원 배분"}
+    lines = []
+    for key, valid in _ALGO_VALID_BY_KEY.items():
+        if valid:
+            lines.append(f"    {key} ({labels[key]}): {', '.join(sorted(valid))}")
+    return "\n".join(lines)
+
+
 class ScenarioParseRequest(BaseModel):
     input_text: str
     input_type: str = "nl"          # "nl" | "code"
@@ -9235,13 +9497,13 @@ def parse_scenario(req: ScenarioParseRequest):
 {{
   "diff": {{
     "cost_weights": {{"w_load": 5, "w_latency": 8}},
-    "algorithm_selection": {{"route_algorithm": "adaptive_astar"}},
+    "algorithm_selection": {{"route_algorithm": "astar"}},
     "policy_options": {{}}
   }},
   "rationale": {{
     "w_load": "고속도로에서 BS 과부하 회피 중요성이 높아 부하 가중치 상향",
     "w_latency": "고속 이동 환경에서 지연 민감도 상향",
-    "route_algorithm": "adaptive_astar는 간선 도로 구조에서 빠른 최적 경로 탐색"
+    "route_algorithm": "astar는 간선 도로 구조에서 목적지 방향 휴리스틱으로 빠르게 탐색"
   }}
 }}
 
@@ -9267,14 +9529,15 @@ def parse_scenario(req: ScenarioParseRequest):
 {{
   "diff": {{
     "cost_weights": {{"w_load": 12, "w_blockage": 6}},
-    "algorithm_selection": {{"base_station_selection_algorithm": "load_aware",
+    "algorithm_selection": {{"base_station_selection_algorithm": "load_balanced_bs",
                             "resource_allocation_algorithm": "traffic_aware_allocation"}},
-    "policy_options": {{}}
+    "policy_options": {{"demand_scale_pct": 180}}
   }},
   "rationale": {{
     "w_load": "BS 부하 분산 목적으로 부하 가중치 대폭 상향",
     "w_blockage": "도심 밀집 건물 환경에서 신호 차폐 손실 가중치 상향",
-    "base_station_selection_algorithm": "load_aware는 과부하 BS를 피해 균형 있게 선택",
+    "demand_scale_pct": "혼잡 상황을 재현하려면 기준 교통량보다 많이 흘려야 함",
+    "base_station_selection_algorithm": "load_balanced_bs는 과부하 BS를 피해 균형 있게 선택",
     "resource_allocation_algorithm": "traffic_aware_allocation은 실시간 트래픽에 따라 자원 재배분"
   }}
 }}

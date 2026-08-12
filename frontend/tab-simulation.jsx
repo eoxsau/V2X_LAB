@@ -715,13 +715,39 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     : (simLogs || []);
 
   function currentConfigSnapshot() {
-    return { origin, dest, demandScalePct, selectedAlgorithms, networkGen, simConfig };
+    // stations(기지국·RSU)도 함께 기억한다 — DB의 user_created 노드는 전역으로 한 벌뿐이라,
+    // 시트마다 다른 배치를 쓰려면 그 시트가 쓰던 목록을 들고 있다가 되돌려놔야 한다.
+    return { origin, dest, demandScalePct, selectedAlgorithms, networkGen, simConfig, stations };
+  }
+
+  // 시트가 기억한 기지국 목록으로 DB를 갈아끼운다. 목록이 없는(예전에 만든) 시트는
+  // 건드리지 않는다 — 비어 있는 것과 "기억이 없는 것"은 다르기 때문.
+  async function restoreSheetStations(list) {
+    if (!Array.isArray(list)) return;
+    try {
+      const res = await fetch(`${api}/network-nodes/replace-user-created`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes: list }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || '기지국 복원 실패');
+      setStations((body.nodes || []).filter(n => n.source === 'user_created'));
+    } catch (e) {
+      setStationsErr(e.message);
+    }
   }
 
   function loadSheetConfig(sheet) {
     const c = sheet.config || {};
-    // 구역·출발지·도착지·차량 수는 모든 시트 공유 — 시트 전환 시 복원하지 않음.
-    // 알고리즘 설정과 결과만 시트별로 로드한다.
+    // 구역(OSM 도로망)은 모든 시트가 공유하지만, 그 위의 세부 설정 — 출발지·도착지·
+    // 기지국/RSU·알고리즘·교통량 — 은 **시트마다 독립**이다(2026-08-12 사용자 결정).
+    // 시나리오 어시스턴트가 시나리오 1개를 시트 1개로 적용하므로, 시트를 넘길 때
+    // 출발·도착점까지 같이 따라와야 지도에 그 시나리오가 그대로 보인다.
+    if (c.origin !== undefined) { setOrigin(c.origin); setOriginDone(!!c.origin); }
+    if (c.dest !== undefined)   { setDest(c.dest);     setDestDone(!!c.dest); }
+    if (c.demandScalePct != null) setDemandScalePct(c.demandScalePct);
+    restoreSheetStations(c.stations);
     setSelectedAlgorithms(c.selectedAlgorithms || DEFAULT_ALGORITHM_SELECTION);
     setNetworkGen(c.networkGen || '5g');
     if (c.simConfig) setSimConfig(c.simConfig);
@@ -734,8 +760,20 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     prevArrived.current = !!sheet.result?.vehiclePos?.arrived;
   }
 
+  // 시나리오 어시스턴트가 시트를 만들고 activeSheetIdx를 **밖에서** 바꿔놓는 경로가 있다.
+  // 그때는 switchToSheet를 안 거치므로, 여기서 그 시트의 설정을 화면에 실어준다.
+  // (아래 switchToSheet가 스스로 부른 전환은 ref를 미리 맞춰 두어 두 번 불리지 않게 한다.)
+  const loadedSheetIdxRef = useRef(activeSheetIdx);
+  useEffect(() => {
+    if (loadedSheetIdxRef.current === activeSheetIdx) return;
+    loadedSheetIdxRef.current = activeSheetIdx;
+    const sh = sheets[activeSheetIdx];
+    if (sh) loadSheetConfig(sh);
+  }, [activeSheetIdx, sheets]);
+
   async function switchToSheet(idx) {
     if (idx === activeSheetIdx) return;
+    loadedSheetIdxRef.current = idx;   // 아래에서 직접 로드하므로 위 effect는 건너뛰게 한다
     // 이전 시트의 시뮬레이션 스레드가 백그라운드에서 계속 돌고 있으면, 그 위치 업데이트가
     // 웹소켓으로 계속 들어와 방금 비운 vehiclePos를 되돌려놓고, 나중에 도착하면 "지금"
     // 활성화된(전혀 다른) 시트로 잘못 캡처되는 문제가 있었다 — 전환 전에 반드시 멈춘다.

@@ -406,7 +406,17 @@ function App() {
             mode={appMode}
           />
         </div>
-        {tab === 'scenario'   && <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} mode={appMode} />}
+        {/* 시뮬레이션 탭과 같은 이유로 **언마운트하지 않고 숨기기만** 한다. 조건부 렌더링이면
+            탭을 옮길 때 입력·생성한 시나리오 목록이 통째로 날아가고, 무엇보다 배치 진행을
+            묻는 타이머까지 같이 죽어서 **끝난 배치 결과가 저장되지 않는다**(서버는 끝까지
+            계산하는데 받는 쪽이 없어 분석보고서 탭에도 안 뜬다 — 2026-08-12 실측). */}
+        <div style={{ display: tab === 'scenario' ? 'block' : 'none' }}>
+          {/* 시나리오를 "적용"하면 시트를 만들어 시뮬레이션 탭에 띄운다 — 그래서 시트
+              상태와 탭 이동(go)을 여기까지 내려준다. 실행은 사용자가 시뮬레이션 탭에서. */}
+          <ScenarioTab simConfig={simConfig} setSimConfig={saveSimConfig} mode={appMode}
+            sheets={sheets} setSheets={setSheets} setActiveSheetIdx={setActiveSheetIdx}
+            api={API} go={go} />
+        </div>
         {tab === 'report'     && <ReportTab sim={sim} simLogs={simLogs} vehiclePos={vehiclePos} networkTelemetry={networkTelemetry} routeCoords={routeCoords} routeEdges={routeEdges} simHistory={simHistory} simConfig={simConfig} mode={appMode} />}
         {tab === 'settings'   && <SettingsTab sim={sim} dispatch={dispatch} api={API} simConfig={simConfig} setSimConfig={saveSimConfig} mode={appMode} setAppMode={chooseMode} />}
       </main>
