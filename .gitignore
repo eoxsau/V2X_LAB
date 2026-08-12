@@ -30,6 +30,10 @@ data/processed/demo/*.dump
 gcp_key.json
 *_service_account.json
 
+# RL graph cache & logs (runtime-generated, not needed in repo)
+backend/data/v4_graph_cache/
+logs/
+
 # Managed GIS data
 data/raw/*
 data/processed/*

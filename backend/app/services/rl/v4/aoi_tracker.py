@@ -1,11 +1,17 @@
 """
 Age of Information (AoI) tracker for V2X communications.
 
-AoI(t) = t − t_last_received(t)  [ms]
+AoI(t) = t − t_last_received(t)  [simulation ms]
 
 The AoI increases linearly between successful packet receptions and drops
-to zero (or to the one-way delay) on each successful reception — forming
-the characteristic "sawtooth" waveform.
+on each successful reception — the characteristic "sawtooth" waveform.
+
+Simulation time convention:
+  Each environment step represents SIM_STEP_MS (100 ms) of simulated time.
+  Call tick() once per env.step() to advance the sim clock.
+  This avoids BUG-1: wall-clock time is hardware-dependent and collapses
+  within a single Python process (monotonic() advances ~microseconds per
+  step, not the 100ms the agent is supposed to experience).
 
 Peak AoI threshold: 100 ms (ETSI EN 302 637-2 §6.1.2.3 — CAM max interval)
 Average AoI target: ≤ 50 ms (3GPP TR 22.886 §6.3 safety service)
@@ -19,116 +25,129 @@ References:
 """
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 AOI_THRESHOLD_MS: float = 100.0   # ETSI CAM max update interval
 AOI_AVG_TARGET_MS: float = 50.0   # 3GPP TR 22.886 safety service target
-AOI_PENALTY_SCALE: float = 0.5    # reward penalty weight
+SIM_STEP_MS: float = 100.0        # simulated ms per env step
 
 
 @dataclass
 class _LinkState:
-    last_update_ms: float = 0.0
+    last_update_step: int = 0
     n_updates: int = 0
     peak_aoi_ms: float = 0.0
-    sum_aoi_ms: float = 0.0
-    n_samples: int = 0
 
 
 class AoITracker:
     """
-    Per-link AoI tracker.  A "link" is identified by an arbitrary string key
-    (e.g. "veh_123:BS-01" or "BS-01" when tracking a single vehicle).
+    Per-link AoI tracker using sim-step time (not wall-clock).
 
-    Usage inside the RL env reward:
+    Call tick() once per env.step() to advance the internal sim clock.
+    Call update(key) on successful packet reception for a link.
+    Call aoi_normalized(key) to get AoI ∈ [0, 1] for the reward.
+
+    Usage inside the RL env:
         tracker = AoITracker()
         tracker.reset()
         ...
-        tracker.update("BS-01")   # on successful packet reception
-        penalty = tracker.reward_penalty("BS-01")  # in [−1, 0]
+        tracker.tick()                    # called in env.step()
+        tracker.update("BS-01")          # on successful packet reception
+        aoi_n = tracker.aoi_normalized("BS-01")   # ∈ [0, 1]
     """
 
     def __init__(self, threshold_ms: float = AOI_THRESHOLD_MS) -> None:
         self.threshold_ms = threshold_ms
-        self._t0_ms: float = 0.0
+        self._sim_step: int = 0
         self._links: dict[str, _LinkState] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
     def reset(self) -> None:
         """Call at the start of each episode."""
-        self._t0_ms = self._now()
+        self._sim_step = 0
         self._links.clear()
 
-    def _now(self) -> float:
-        return time.monotonic() * 1000.0
+    def tick(self) -> None:
+        """Advance simulation time by one step (SIM_STEP_MS ms). Call once per env.step()."""
+        self._sim_step += 1
 
     def _state(self, key: str) -> _LinkState:
         if key not in self._links:
-            self._links[key] = _LinkState(last_update_ms=self._t0_ms)
+            self._links[key] = _LinkState(last_update_step=self._sim_step)
         return self._links[key]
+
+    def _aoi_ms(self, key: str) -> float:
+        """Current AoI in simulated ms."""
+        s = self._state(key)
+        return (self._sim_step - s.last_update_step) * SIM_STEP_MS
 
     # ── update / query ─────────────────────────────────────────────────────────
     def update(self, key: str) -> float:
         """
         Record a successful packet reception for `key`.
 
-        Returns the inter-reception interval (IRI) in ms, which equals
-        the peak AoI at the moment just before this reception.
+        Returns the inter-reception interval (IRI) in simulated ms, which
+        equals the AoI at the moment just before this reception.
         """
-        now = self._now()
         s = self._state(key)
-        iri = now - s.last_update_ms
-        s.peak_aoi_ms = max(s.peak_aoi_ms, iri)
-        s.last_update_ms = now
+        iri_ms = (self._sim_step - s.last_update_step) * SIM_STEP_MS
+        s.peak_aoi_ms = max(s.peak_aoi_ms, iri_ms)
+        s.last_update_step = self._sim_step
         s.n_updates += 1
-        return iri
+        return iri_ms
 
     def sample_aoi(self, key: str) -> float:
-        """Current AoI in ms (instantaneous, not peak)."""
-        return self._now() - self._state(key).last_update_ms
+        """Current AoI in simulated ms (instantaneous)."""
+        return self._aoi_ms(key)
 
-    def reward_penalty(self, key: str) -> float:
+    def aoi_normalized(self, key: str) -> float:
         """
-        Reward term ∈ [−AOI_PENALTY_SCALE, 0].
+        Normalized AoI ∈ [0, 1].
 
-        Zero when AoI ≤ threshold; linearly negative when AoI > threshold,
-        capped at −AOI_PENALTY_SCALE when AoI ≥ 2 × threshold.
+        0 = AoI at or below threshold (fresh data).
+        1 = AoI ≥ 2× threshold (stale; linear between).
+
+        The env multiplies this by _W_AOI directly — no internal scaling here.
+        Fixes BUG-5: previous reward_penalty() applied 0.5 internally, so the
+        effective weight was _W_AOI × 0.5 = 0.05, not the intended 0.1.
         """
-        aoi = self.sample_aoi(key)
+        aoi = self._aoi_ms(key)
         if aoi <= self.threshold_ms:
             return 0.0
-        excess_ratio = min((aoi - self.threshold_ms) / self.threshold_ms, 1.0)
-        return -excess_ratio * AOI_PENALTY_SCALE
+        return min((aoi - self.threshold_ms) / self.threshold_ms, 1.0)
+
+    def reward_penalty(self, key: str) -> float:
+        """Backward-compatible wrapper. Returns −aoi_normalized(key) ∈ [−1, 0]."""
+        return -self.aoi_normalized(key)
 
     # ── statistics ─────────────────────────────────────────────────────────────
     def episode_stats(self, key: Optional[str] = None) -> dict:
         """
         Per-link or aggregate statistics.
 
-        Returns
-        -------
-        dict with keys:
-          avg_aoi_ms, peak_aoi_ms, n_updates, pct_above_threshold
+        Returns dict with keys: avg_aoi_ms, peak_aoi_ms, n_updates,
+                                current_aoi_ms, sim_step.
         """
         if key is not None:
             s = self._links.get(key)
             if s is None:
-                return {}
-            aoi = self.sample_aoi(key)
+                return {"sim_step": self._sim_step, "n_updates": 0}
+            aoi = self._aoi_ms(key)
             return {
                 "avg_aoi_ms": round(s.peak_aoi_ms / max(s.n_updates, 1), 2),
                 "peak_aoi_ms": round(s.peak_aoi_ms, 2),
                 "n_updates": s.n_updates,
                 "current_aoi_ms": round(aoi, 2),
+                "aoi_normalized": round(self.aoi_normalized(key), 4),
+                "sim_step": self._sim_step,
                 "pct_above_threshold": 100.0 if aoi > self.threshold_ms else 0.0,
             }
 
         if not self._links:
-            return {"n_links": 0}
+            return {"n_links": 0, "sim_step": self._sim_step}
 
-        aois = [self._now() - s.last_update_ms for s in self._links.values()]
+        aois = [self._aoi_ms(k) for k in self._links]
         above = sum(1 for a in aois if a > self.threshold_ms)
         peaks = [s.peak_aoi_ms for s in self._links.values()]
         return {
@@ -136,4 +155,5 @@ class AoITracker:
             "avg_aoi_ms": round(sum(aois) / len(aois), 2),
             "peak_aoi_ms": round(max(peaks), 2),
             "pct_above_threshold": round(above / len(aois) * 100.0, 1),
+            "sim_step": self._sim_step,
         }

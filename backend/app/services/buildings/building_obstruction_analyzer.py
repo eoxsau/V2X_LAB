@@ -47,8 +47,28 @@ from app.services.latency import formula_v31
 # main.py 등 기존 임포트 호환용 별칭
 _RSU_COVERAGE_RADIUS_M = formula_v31.RSU_COVERAGE_RADIUS_M
 
-# A_seg = 3D LOS를 가로막는 건물 수 × 12 dB (명세 §7, 선형 누적·상한 없음)
+# A_seg = 3D LOS를 가로막는 건물 수 × 12 dB (명세 §7)
 _A_SEG_PER_BUILDING_DB = 12.0
+
+# 상한 30 dB — route_cost_function.NormScales.loss_db(콘크리트 벽 최대)와 같은 값으로
+# 맞춘다. 명세 §7 원문은 "선형 누적·상한 없음"이었으나, 조밀한 시가지 격자에서는 3D
+# LOS 판정을 만족하는 건물이 흔히 5~10채(60~120dB)까지 나와 물리적으로 불가능한
+# 값이 된다 — 실제로는 2~3개 건물을 넘어서면 신호가 그 건물들을 "관통"하는 게
+# 아니라 회절·다중경로로 우회하므로, 선형 누적이 물리를 대표하지 못한다.
+#
+# ⚠️ "건물 수 × 12dB" 자체는 여전히 출처를 대지 못한 휴리스틱이다(2026-08-05 재검토).
+# 이 시나리오(고가 기지국—도로변 차량, 건물에 "들어가지" 않고 옆에서 가려지는 경우)에
+# 맞는 정식 모델은 3GPP O2I(옥외→실내 투과손실, 명세상 다른 시나리오 — 벽을 "통과해
+# 들어가는" 손실이라 여기 안 맞음)가 아니라 ITU-R P.1411의 다중 스크린 회절
+# (multiple screen diffraction, Lbf+Lrts+Lmsd) 계열이다 — 다만 이 모델은 거리·건물
+# 배치·도로폭·입사각을 함께 쓰는 다변수 공식이라 "건물당 N dB" 스칼라로 축약되지
+# 않는다. 30dB 상한은 그 공식을 대체한 값이 아니라 — "상한 없음"보다는 나은,
+# 그러나 검증되지 않은 안전장치(c_blockage·대시보드로 값이 새는 것을 막는 것)로만
+# 취급해야 한다. 제대로 하려면 ITU-R P.1411 모델을 별도로 구현해야 한다.
+# outage 판정(SINR<-6dB) 자체는 이미 1~2개
+# 건물만으로도 대부분 걸리므로, 이 상한은 outage 여부보다 근처(비outage) 구간의
+# 수치 스케일을 물리적으로 유의미하게 유지하는 데 의미가 있다.
+_A_SEG_MAX_DB = 30.0
 
 # ── A_seg 사전계산 캐시 (명세 §7 — 매 스텝 재계산 방지) ─────────────────────────
 # 키: (차량 위치 1e-5도≈1m 격자, 노드 id/위치/안테나, 밀도 페널티, 건물셋 버전).
@@ -314,8 +334,8 @@ def analyze_vehicle_to_node(
     else:
         max_height = 0.0
 
-    # ── A_seg = 차단 건물 수 × 12 dB (명세 §7 — 재질 기반 모델 대체, 상한 없음) ──
-    A_seg_db = round(count * _A_SEG_PER_BUILDING_DB, 2)
+    # ── A_seg = 차단 건물 수 × 12 dB, 상한 30dB (명세 §7 — 재질 기반 모델 대체) ──
+    A_seg_db = round(min(count * _A_SEG_PER_BUILDING_DB, _A_SEG_MAX_DB), 2)
     confidence = "high" if unknown_height_blockers == 0 else "medium"
 
     # latency_penalty_ms: building-only contribution shown on dashboard (ms)
@@ -428,7 +448,7 @@ def analyze_candidates(
         rsrp_dbm = round(formula_v31.compute_rsrp_dbm(
             network_mode, obs.distance_m, obs.estimated_penetration_loss_db,
         ), 2)
-        sinr_db = round(rsrp_dbm - formula_v31.NOISE_FLOOR_DBM, 2)
+        sinr_db = round(rsrp_dbm - formula_v31.resolve_unit(network_mode)["noise_floor_dbm"], 2)
         outage = False
 
         if is_rsu:

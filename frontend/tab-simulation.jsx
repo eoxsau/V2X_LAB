@@ -49,7 +49,8 @@ const DEFAULT_ALGORITHM_SELECTION = {
 };
 // rl_routing은 아직 학습된 RL 에이전트가 없어 미구현 — 선택해도 baseline Dijkstra로
 // 동작한다(거짓 표시 방지를 위해 선택 버튼에 "미구현" 칩을 붙임).
-const UNIMPLEMENTED_ROUTE_ALGORITHMS = new Set(['rl_routing']);
+// rl_routing: GNN-MAML 모델 로드 시 V4RoutingAdapter 사용, 미로드 시 Dijkstra 폴백.
+const UNIMPLEMENTED_ROUTE_ALGORITHMS = new Set([]);
 
 function formatAlgorithmName(name) {
   return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
@@ -889,6 +890,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       }));
     if (specs.length === 0) { setBatchError('시트가 없습니다.'); return; }
 
+    // 이전 런의 경로·기록이 새 배치와 겹치지 않도록 먼저 지운다
+    setRouteCoords([]); setVehiclePos(null);
+    if (setSimHistory) setSimHistory([]);
+    if (setRouteEdges) setRouteEdges(null);
+
     setBatchRunning(true); setBatchError(null);
     try {
       const res = await fetch(`${api}/api/scenarios/batch`, {
@@ -905,7 +911,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }
   }
 
-  function pollSheetBatch(batchId) {
+  function pollSheetBatch(batchId, onDone) {
     const timer = setInterval(async () => {
       try {
         const res = await fetch(`${api}/api/scenarios/batch/${batchId}`);
@@ -913,9 +919,60 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         if (data.status === 'completed') {
           clearInterval(timer);
           setBatchRunning(false);
+
+          // 분석보고서용 저장 (storage event로 report 탭이 자동 갱신됨)
           const saved = scbLoadBatches();
           saved.push({ batch_id: batchId, label: data.label, started_at: data.started_at, ended_at: data.ended_at, results: data.results });
           scbSaveBatches(saved);
+
+          // 시트별 결과 역매핑
+          const resultById = {};
+          (data.results || []).forEach(r => { if (r.id) resultById[r.id] = r; });
+
+          const routeEdgesFrom = (r) => r?.route_cost_result ? {
+            per_edge:         r.route_cost_result.per_edge || [],
+            coverage_risk:    r.route_cost_result.coverage_risk ?? null,
+            avg_latency_ms:   r.route_cost_result.avg_latency_ms ?? null,
+            handover_count:   r.route_cost_result.handover_count ?? null,
+            total_cost:       r.route_cost_result.total_cost ?? null,
+            total_distance_m: r.route_cost_result.total_distance_m ?? null,
+            routing_mode:     r.route_cost_result.routing_mode ?? null,
+            edge_names:       r.network_telemetry?.route_edge_names ?? {},
+          } : null;
+
+          setSheets(prev => {
+            const next = prev.map(s => {
+              const r = resultById[s.id];
+              if (!r || r.status !== 'done') return s;
+              return {
+                ...s, status: 'done',
+                result: {
+                  ...(s.result || {}),
+                  routeCoords:        r.route_coords || [],
+                  routeEdges:         routeEdgesFrom(r),
+                  network_telemetry:  r.network_telemetry || null,
+                  route_cost_result:  r.route_cost_result || null,
+                  algorithm_metrics:  r.algorithm_metrics || null,
+                  simulation_summary: r.simulation_summary || null,
+                  allocation_result:  r.allocation_result || null,
+                  simLogs:            s.result?.simLogs || [],
+                  simHistory:         s.result?.simHistory || [],
+                },
+              };
+            });
+            saveSimSheets(next);
+
+            // 현재 활성 시트 즉시 반영
+            const activeR = resultById[next[activeSheetIdx]?.id];
+            if (activeR?.status === 'done') {
+              setRouteCoords(activeR.route_coords || []);
+              setNetworkTelemetry(activeR.network_telemetry || null);
+              if (setRouteEdges) setRouteEdges(routeEdgesFrom(activeR));
+            }
+            return next;
+          });
+
+          if (onDone) onDone(data);
         }
       } catch {}
     }, 1200);
@@ -940,101 +997,55 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }, 1200);
   }
 
-  // ── 파라미터 스윕(민감도 분석) — Pro 전용. 현재 출발/도착/차량수/알고리즘은 고정하고
-  // 비용가중치·정책옵션 중 하나만 N단계로 바꿔가며 배치 평가 → 분석보고서에서 비교.
-  const SWEEP_PARAMS = [
-    { key: 'w_latency',  label: 'Latency 가중치',   section: 'cost_weights',   path: 'w_latency',   defaultFrom: 1,   defaultTo: 5, step: 0.1 },
-    { key: 'w_load',     label: '부하 가중치',       section: 'cost_weights',   path: 'w_load',      defaultFrom: 0.5, defaultTo: 3, step: 0.1 },
-    { key: 'w_handover', label: '핸드오버 가중치',   section: 'cost_weights',   path: 'w_handover',  defaultFrom: 0.5, defaultTo: 3, step: 0.1 },
-    { key: 'lookahead_k', label: 'Lookahead K',     section: 'policy_options', path: 'lookahead_k', defaultFrom: 1,   defaultTo: 8, step: 1, integer: true },
-  ];
-  const [sweepParam, setSweepParam] = useState(SWEEP_PARAMS[0].key);
-  const [sweepFrom, setSweepFrom] = useState(SWEEP_PARAMS[0].defaultFrom);
-  const [sweepTo, setSweepTo] = useState(SWEEP_PARAMS[0].defaultTo);
-  const [sweepSteps, setSweepSteps] = useState(5);
-  const [sweepRunning, setSweepRunning] = useState(false);
-  const [sweepError, setSweepError] = useState(null);
-  const [sweepDone, setSweepDone] = useState(false);
-
-  function selectSweepParam(key) {
-    const def = SWEEP_PARAMS.find(p => p.key === key);
-    setSweepParam(key);
-    setSweepFrom(def.defaultFrom);
-    setSweepTo(def.defaultTo);
-  }
-
-  async function runParamSweep() {
-    if (!ready) { setSweepError('구역·출발지·도착지를 먼저 설정하세요.'); return; }
-    const def = SWEEP_PARAMS.find(p => p.key === sweepParam);
-    const steps = Math.max(2, Math.min(10, sweepSteps || 2));
-    const values = Array.from({ length: steps }, (_, i) => {
-      const raw = sweepFrom + (sweepTo - sweepFrom) * (steps === 1 ? 0 : i / (steps - 1));
-      return def.integer ? Math.round(raw) : Math.round(raw * 100) / 100;
-    });
-    const specs = values.map((v, i) => {
-      const cfgOverride = {
-        ...(simConfig || {}),
-        [def.section]: { ...(simConfig?.[def.section] || {}), [def.path]: v },
-      };
-      cfgOverride.policy_options = { ...(cfgOverride.policy_options || {}), network_mode: (networkGen || '5g').toUpperCase() };
-      return {
-        id: `sweep-${def.key}-${i}-${Date.now()}`,
-        label: `${def.label}=${v}`,
-        mode: 'route_metrics',
-        source: 'param_batch',
-        origin, dest,
-        vehicle_count: 1,   // 타겟 차량만. 배경 차량은 demand_scale_pct가 정한다(백엔드 생성 교통)
-        algorithm_config: selectedAlgorithms,
-        simulation_config: cfgOverride,
-      };
-    });
-    setSweepRunning(true); setSweepError(null); setSweepDone(false);
-    try {
-      const res = await fetch(`${api}/api/scenarios/batch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: `파라미터 스윕 — ${def.label}`, scenarios: specs }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || res.statusText);
-      pollScenarioBatch(data.batch_id, () => { setSweepRunning(false); setSweepDone(true); setTimeout(() => setSweepDone(false), 3500); });
-    } catch (e) {
-      setSweepRunning(false);
-      setSweepError(e.message || '스윕 실행 중 오류가 발생했습니다.');
-    }
-  }
-
-  // ── RL 정책 비교(실험적) — Pro 전용. 동일 출발/도착에 대해 random/greedy/coverage 베이스라인
-  // 정책을 각각 평가해 배치로 비교(/api/rl/episode와 동일 로직, 배치 인프라로 일괄 실행).
-  const RL_POLICIES = ['random', 'greedy', 'coverage'];
+  // ── GNN-MAML vs 기준선 비교 — Pro 전용.
+  // 시트 3개를 자동 생성(GNN-MAML / Nearest BS / RSRP Max)하고 route_metrics 배치로 실행한다.
+  // 결과는 각 시트의 result에 저장되어 지도에 경로가 표시되고, 분석보고서에서도 확인 가능.
   const [rlRunning, setRlRunning] = useState(false);
   const [rlError, setRlError] = useState(null);
   const [rlDone, setRlDone] = useState(false);
+  const [gnnReady, setGnnReady] = useState(false);
+  useEffect(() => {
+    fetch(`${api}/api/rl/v4/status`).then(r => r.json()).then(d => {
+      setGnnReady(!!d.v4_bs_selector_ready);
+    }).catch(() => {});
+  }, []);
 
   async function runRLComparison() {
     if (!ready) { setRlError('구역·출발지·도착지를 먼저 설정하세요.'); return; }
-    const specs = RL_POLICIES.map((policy, i) => ({
-      id: `rl-${policy}-${Date.now()}`,
-      label: `RL ${policy}`,
-      mode: 'rl_episode',
-      source: 'param_batch',
-      origin, dest,
-      policy,
-      n_episodes: 20, // 평균만으로는 정책 간 우열을 통계적으로 말할 수 없어, 표준편차를 같이 보고할 수 있을 만큼 충분히 반복
-      max_steps: 200,
+
+    // 3개 비교 시트 자동 생성 — 기존 시트를 교체한다
+    const now = Date.now();
+    const rlSheets = [
+      { id: `rl-gnn-${now}`,     name: 'GNN-MAML',   config: { selectedAlgorithms: { base_station_selection: 'v4_gnn' },    networkGen: networkGen || '5g' }, result: null, status: 'draft' },
+      { id: `rl-nearest-${now}`, name: 'Nearest BS', config: { selectedAlgorithms: { base_station_selection: 'nearest_bs' }, networkGen: networkGen || '5g' }, result: null, status: 'draft' },
+      { id: `rl-rsrp-${now}`,    name: 'RSRP Max',   config: { selectedAlgorithms: { base_station_selection: 'rsrp_max' },   networkGen: networkGen || '5g' }, result: null, status: 'draft' },
+    ];
+    setSheets(rlSheets); setActiveSheetIdx(0); saveSimSheets(rlSheets);
+
+    // 이전 경로 초기화
+    setRouteCoords([]); setVehiclePos(null); setNetworkTelemetry(null);
+    if (setSimHistory) setSimHistory([]);
+    if (setRouteEdges) setRouteEdges(null);
+
+    const specs = rlSheets.map(s => ({
+      id: s.id, label: s.name,
+      mode: 'route_metrics', origin, dest, vehicle_count: 1,
+      algorithm_config: s.config.selectedAlgorithms || {},
+      simulation_config: { policy_options: { network_mode: (networkGen || '5g').toUpperCase() } },
     }));
-    setRlRunning(true); setRlError(null); setRlDone(false);
+
+    setRlRunning(true); setBatchRunning(true); setRlError(null); setRlDone(false); setBatchError(null);
     try {
       const res = await fetch(`${api}/api/scenarios/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: 'RL 정책 비교', scenarios: specs }),
+        body: JSON.stringify({ label: 'GNN-MAML 비교 (시트)', scenarios: specs }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || res.statusText);
-      pollScenarioBatch(data.batch_id, () => { setRlRunning(false); setRlDone(true); setTimeout(() => setRlDone(false), 3500); });
+      pollSheetBatch(data.batch_id, () => { setRlRunning(false); setRlDone(true); setTimeout(() => setRlDone(false), 3500); });
     } catch (e) {
-      setRlRunning(false);
+      setRlRunning(false); setBatchRunning(false);
       setRlError(e.message || 'RL 비교 실행 중 오류가 발생했습니다.');
     }
   }
@@ -2623,39 +2634,23 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           </div>
           )}
 
-          {/* 파라미터 스윕(민감도 분석) — Pro 전용. 결과는 분석보고서 탭 "시나리오 배치 비교"에서 확인 */}
+          {/* GNN-MAML vs 기준선 비교 — Pro 전용. 시트 3개 자동 생성 후 배치 실행 */}
           {appMode === 'pro' && (
           <div className="field">
-            <label>파라미터 스윕 <span className="en">SENSITIVITY SWEEP</span></label>
+            <label>
+              GNN-MAML 비교 <span className="en">BS SELECTION COMPARE</span>
+              {' '}
+              <span className={'chip sm ' + (gnnReady ? 'good' : 'warn')} style={{ marginLeft: 6 }}>
+                {gnnReady ? 'GNN-MAML 로드됨' : 'GNN 미로드'}
+              </span>
+            </label>
             <div className="col gap8" style={{ opacity: ready ? 1 : 0.5 }}>
-              <select className="input" value={sweepParam} onChange={e => selectSweepParam(e.target.value)} style={{ width: '100%' }}>
-                {SWEEP_PARAMS.map(p => <option key={p.key} value={p.key}>{p.label}</option>)}
-              </select>
-              <div className="row gap8">
-                <input className="input" type="number" step={SWEEP_PARAMS.find(p => p.key === sweepParam)?.step ?? 0.1}
-                  value={sweepFrom} onChange={e => setSweepFrom(parseFloat(e.target.value) || 0)} style={{ flex: 1 }} placeholder="시작값" />
-                <input className="input" type="number" step={SWEEP_PARAMS.find(p => p.key === sweepParam)?.step ?? 0.1}
-                  value={sweepTo} onChange={e => setSweepTo(parseFloat(e.target.value) || 0)} style={{ flex: 1 }} placeholder="끝값" />
-                <input className="input" type="number" min="2" max="10" value={sweepSteps}
-                  onChange={e => setSweepSteps(parseInt(e.target.value, 10) || 2)} style={{ width: 56 }} title="구간 수" />
+              <div className="muted" style={{ fontSize: 10.5 }}>
+                GNN-MAML / Nearest BS / RSRP Max 시트 3개를 자동 생성하고 같은 경로로 비교합니다. 결과는 각 시트 지도 + 분석보고서에서 확인하세요.
+                {!gnnReady && ' (GNN 미로드 시 Lowest Latency로 대체)'}
               </div>
-              <button className={'btn sm ' + (sweepDone ? 'good' : '')} disabled={!ready || sweepRunning} onClick={runParamSweep}>
-                {sweepRunning ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : sweepDone ? <><Icon.check size={13} /> 완료 — 분석보고서에서 확인</> : <><Icon.compare size={13} /> 스윕 실행 ({Math.max(2, Math.min(10, sweepSteps || 2))}개)</>}
-              </button>
-              {!ready && <div className="muted" style={{ fontSize: 10.5 }}>구역·출발지·도착지를 먼저 설정하세요</div>}
-              {sweepError && <div style={{ fontSize: 10.5, color: 'var(--bad)' }}>{sweepError}</div>}
-            </div>
-          </div>
-          )}
-
-          {/* RL 정책 비교(실험적) — Pro 전용. 결과는 분석보고서 탭 "시나리오 배치 비교"에서 확인 */}
-          {appMode === 'pro' && (
-          <div className="field">
-            <label>RL 정책 비교 <span className="en">RL POLICY COMPARE (EXPERIMENTAL)</span></label>
-            <div className="col gap8" style={{ opacity: ready ? 1 : 0.5 }}>
-              <div className="muted" style={{ fontSize: 10.5 }}>random / greedy / coverage 베이스라인 정책을 같은 출발·도착지로 각 20회 평가해 평균±표준편차로 비교합니다.</div>
-              <button className={'btn sm ' + (rlDone ? 'good' : '')} disabled={!ready || rlRunning} onClick={runRLComparison}>
-                {rlRunning ? <><Icon.reset size={13} className="spin" /> 실행 중…</> : rlDone ? <><Icon.check size={13} /> 완료 — 분석보고서에서 확인</> : <><Icon.spark size={13} /> RL 정책 비교 실행</>}
+              <button className={'btn sm ' + (rlDone ? 'good' : '')} disabled={!ready || rlRunning || batchRunning} onClick={runRLComparison}>
+                {rlRunning ? <><Icon.reset size={13} className="spin" /> 비교 실행 중…</> : rlDone ? <><Icon.check size={13} /> 완료 — 시트·보고서에서 확인</> : <><Icon.spark size={13} /> GNN-MAML 비교 실행</>}
               </button>
               {!ready && <div className="muted" style={{ fontSize: 10.5 }}>구역·출발지·도착지를 먼저 설정하세요</div>}
               {rlError && <div style={{ fontSize: 10.5, color: 'var(--bad)' }}>{rlError}</div>}
