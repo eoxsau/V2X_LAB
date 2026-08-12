@@ -7,6 +7,7 @@ region_service.py — 행정구역 DB 조회 + 로컬 PBF에서 OSM 추출
 3. extract_osm_for_region(osm_id)   — PBF에서 해당 구역 OSM 추출 → .osm 파일 반환
 """
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -56,6 +57,38 @@ def resolve_local_pbf() -> Optional[Path]:
 # 예전 이름 유지 — 호출부가 `pbf_path=DEFAULT_PBF` 기본값으로 쓰고 있다.
 # 존재하지 않을 수도 있으므로 호출부는 반드시 .exists()를 확인한다.
 DEFAULT_PBF = resolve_local_pbf() or (_PBF_ROOT / "south-korea.osm.pbf")
+
+# ── 시도별 미리 자른 조각 ─────────────────────────────────────────────────────
+# 전국 PBF에는 위치 색인이 없어서 구역 하나를 뽑아도 272MB를 통째로 훑어야 한다.
+# 시도별로 한 번 잘라두면(scripts/build_osm_slices.py) 그 다음부터는 해당 시도 조각만
+# 읽으면 되므로 훨씬 빠르다 — 거친 색인을 직접 만들어 두는 셈이다.
+SLICE_DIR = Path(__file__).parent.parent.parent.parent / "data" / "osm_slices"
+SLICE_INDEX = SLICE_DIR / "index.json"
+
+
+def resolve_source_pbf(s: float, w: float, n: float, e: float) -> Path:
+    """이 구역을 뽑는 데 **가장 작은** 원본을 고른다.
+
+    구역을 통째로 담고 있는 시도 조각이 있으면 그것을, 없으면(조각을 아직 안 만들었거나
+    구역이 시도 경계를 걸치면) 전국 파일을 돌려준다. 조각은 도로만 담고 있고, 이 앱은
+    도로만 쓰므로 결과는 같다.
+    """
+    best: Optional[Path] = None
+    best_area = float("inf")
+    try:
+        index = json.loads(SLICE_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        return DEFAULT_PBF
+    for meta in index.values():
+        if not (meta["s"] <= s and meta["n"] >= n and meta["w"] <= w and meta["e"] >= e):
+            continue                       # 구역을 다 못 덮으면 쓸 수 없다
+        f = SLICE_DIR / meta["file"]
+        if not f.exists():
+            continue
+        area = (meta["n"] - meta["s"]) * (meta["e"] - meta["w"])
+        if area < best_area:
+            best, best_area = f, area
+    return best or DEFAULT_PBF
 
 # OSM 도로 타입 필터 (V2X 시뮬레이션에 관련된 도로만 유지)
 HIGHWAY_TYPES = (
@@ -320,13 +353,20 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
     import osmium
     import osmium.filter as _F
 
+    # 전국 파일 대신 이 구역을 담고 있는 **시도 조각**이 있으면 그걸 읽는다(훨씬 작다).
+    # 조각을 만드는 중(build_osm_slices)에는 pbf_path가 이미 전국 파일이고 조각이 아직
+    # 없으므로 그대로 전국을 읽는다 — 자기 자신을 원본으로 삼는 일은 생기지 않는다.
+    chosen = Path(pbf_path)
+    if chosen == DEFAULT_PBF:
+        chosen = resolve_source_pbf(s, w, n, e)
+
     # 한글 경로 우회 — 읽는 PBF와 쓰는 .osm 둘 다 ASCII 경로여야 한다(위 _ascii_work_dir 설명).
-    src = _stage_pbf_for_osmium(Path(pbf_path))
+    src = _stage_pbf_for_osmium(chosen)
     out_file = Path(out_file)
     stage_out = not _is_ascii_path(out_file)
     real_out = out_file
     if stage_out:
-        out_file = _ascii_work_dir() / f"_extract_{os.getpid()}.osm"
+        out_file = _ascii_work_dir() / f"_extract_{os.getpid()}{out_file.suffix}"
     if out_file.exists():
         out_file.unlink()
 
