@@ -2,6 +2,7 @@
 V2X AI Routing Lab — FastAPI Backend
 """
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -5192,17 +5193,29 @@ async def setup_network(req: SetupRequest):
             ),
         )
 
-    req_id = uuid4().hex[:8]
+    download_bbox = expand_bbox(bbox)
+    # 파일 이름을 **구역 좌표의 해시**로 짓는다. 예전에는 uuid4라 이름이 매번 달라져,
+    # 같은 구역을 다시 그려도 추출(로컬 PBF 스캔 3~5분)과 netconvert를 처음부터 다시 했다.
+    # 이름이 같아지면 아래에서 이미 만들어둔 파일을 그대로 재사용한다.
+    # 소수점 6자리 ≈ 0.1m — 마우스로 같은 자리를 두 번 그리긴 어렵지만, 초기화 후 복귀나
+    # 프로그램이 같은 좌표로 다시 부르는 경우가 통째로 공짜가 된다.
+    _bbox_key = f"{download_bbox.s:.6f},{download_bbox.w:.6f},{download_bbox.n:.6f},{download_bbox.e:.6f}"
+    req_id = hashlib.sha1(_bbox_key.encode()).hexdigest()[:8]
     osm_file = WORK_DIR / f"area-{req_id}.osm"
     net_file = WORK_DIR / f"area-{req_id}.net.xml"
-    download_bbox = expand_bbox(bbox)
 
     with _network_lock:
         reset_simulation_state()
 
         try:
-            if use_local_pbf:
-                # Step 1 (로컬): PBF에서 bbox 추출 — 인터넷 불필요, 빠름
+            # 같은 구역을 이미 뽑아둔 적이 있으면 그대로 쓴다(파일명이 bbox 해시라 맞출 수 있다).
+            # 로컬 PBF 추출은 전국 파일을 통째로 훑어 3~5분이 걸리므로, 재방문을 공짜로
+            # 만드는 이 한 줄이 속도에 가장 크게 기여한다.
+            _osm_cached = osm_file.exists() and osm_file.stat().st_size > 0
+            if _osm_cached:
+                print(f"[SETUP] 이미 뽑아둔 OSM 재사용: {osm_file.name}", flush=True)
+            elif use_local_pbf:
+                # Step 1 (로컬): PBF에서 bbox 추출 — 인터넷 불필요
                 from app.services.regions.region_service import _extract_with_osmium, _extract_with_pyosmium
                 import shutil as _shutil
                 osmium_bin = _shutil.which("osmium")
@@ -5236,9 +5249,16 @@ async def setup_network(req: SetupRequest):
             # almost always means this specific bbox's OSM data is malformed, and a hard error
             # with the underlying reason is more actionable than a hidden mode switch.
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, netconvert, osm_file, net_file, download_bbox
-                )
+                if net_file.exists() and net_file.stat().st_size > 0:
+                    # 같은 구역의 도로망이 이미 있다 — netconvert를 건너뛴다.
+                    # ⚠️ 이름이 bbox 해시라 내용이 같음이 보장된다(uuid4 시절엔 불가능했다).
+                    #    게다가 net 파일이 그대로면 교통 캐시(net 바이트 해시 키)도 맞아서
+                    #    수요 생성까지 통째로 건너뛴다.
+                    print(f"[SETUP] 이미 변환해둔 도로망 재사용: {net_file.name}", flush=True)
+                else:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, netconvert, osm_file, net_file, download_bbox
+                    )
             except Exception as exc:
                 raise HTTPException(
                     status_code=502,
@@ -5268,11 +5288,19 @@ async def setup_network(req: SetupRequest):
             _state["network_nodes"] = merged_network_nodes()
             _rebuild_v4_graph()
 
-            mapping_stats = TRAFFIC_FUSION_ENGINE.prepare_current_network_mappings(
-                osm_file=Path(_state["osm_file"]),
-                net_file=Path(net_file),
-                bbox=_state["current_bbox"],
-            )
+            # 표준도로 ↔ OSM ↔ SUMO 짝짓기. **실패해도 구역 설정은 성공이다** —
+            # 이건 ITS 실측 교통을 붙일 때 쓰는 부가 정보이고, 지금은 생성 교통을 쓰므로
+            # 주 경로가 아니다. 예전에는 여기서 던진 예외가 그대로 500이 되어, 도로망도
+            # 교통도 다 준비된 구역이 화면에서는 "실패"로 보였다(2026-08-12).
+            try:
+                mapping_stats = TRAFFIC_FUSION_ENGINE.prepare_current_network_mappings(
+                    osm_file=Path(_state["osm_file"]),
+                    net_file=Path(net_file),
+                    bbox=_state["current_bbox"],
+                )
+            except Exception as _map_exc:
+                print(f"[SETUP] 표준도로 짝짓기 건너뜀: {_map_exc}", flush=True)
+                mapping_stats = {"available": False, "reason": str(_map_exc)}
 
             return {
                 "ok": True,

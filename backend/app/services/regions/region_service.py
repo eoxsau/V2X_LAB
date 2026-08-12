@@ -317,8 +317,24 @@ def _extract_with_pyosmium(pbf_path: Path, out_file: Path,
 
         def way(self, w):
             node_ids = [n.ref for n in w.nodes]
-            if any(nid in self.valid_nodes for nid in node_ids):
-                self.writer.add_way(w)
+            if not any(nid in self.valid_nodes for nid in node_ids):
+                return
+            # ⚠️ 도로를 통째로 쓰면 **파일이 스스로 완결되지 않는다.** 구역 경계를 걸친
+            #    도로는 바깥쪽 노드까지 참조하는데 그 노드는 저장되지 않기 때문이다
+            #    (2026-08-12 실측: 도로가 가리키는 38,201개 중 2,431개가 파일에 없었다).
+            #    인터넷(Overpass) 경로는 참조된 노드를 함께 받아오므로 이 문제가 없어,
+            #    로컬 PBF로 바꾼 뒤에야 드러났다. osmnx가 그 파일을 읽다 통째로 죽고
+            #    (`Some edges missing nodes...`), 구역 설정이 마지막 단계에서 500으로 끝났다.
+            #    저장한 노드만 남기면 파일이 완결된다 — 어차피 netconvert는
+            #    `--keep-edges.in-geo-boundary`로, load_mock_graph는 자체 필터로
+            #    구역 밖을 이미 버리고 있어 결과가 달라지지 않는다.
+            kept = [nid for nid in node_ids if nid in self.valid_nodes]
+            if len(kept) < 2:
+                return
+            if len(kept) == len(node_ids):
+                self.writer.add_way(w)          # 잘린 것이 없으면 원본 그대로
+            else:
+                self.writer.add_way(osmium.osm.mutable.Way(base=w, nodes=kept))
 
     # 한글 경로 우회 — 읽는 PBF와 쓰는 .osm 둘 다 ASCII 경로여야 한다(위 _ascii_work_dir 설명).
     src = _stage_pbf_for_osmium(Path(pbf_path))
