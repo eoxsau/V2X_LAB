@@ -34,6 +34,12 @@ gcp_key.json
 backend/data/v4_graph_cache/
 logs/
 
+# 전국 OSM 원본과 시도별 조각 — 합쳐서 500MB 가까이 되는 바이너리라 저장소에 넣지 않는다.
+# 원본은 각자 내려받고(작업폴더에 두면 코드가 알아서 찾는다), 조각은 아래 명령으로 만든다:
+#   backend/.venv/Scripts/python.exe backend/scripts/build_osm_slices.py
+*.osm.pbf
+backend/data/osm_slices/
+
 # Managed GIS data
 data/raw/*
 data/processed/*
