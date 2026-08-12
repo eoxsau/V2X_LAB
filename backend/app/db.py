@@ -45,6 +45,10 @@ def postgis_available() -> bool:
     return postgis_enabled() and bool(database_url())
 
 
+# In-memory fallback store for network nodes when PostGIS is disabled
+_mem_nodes: list[dict] = []
+
+
 def ensure_postgis_schema() -> bool:
     engine = get_engine()
     if engine is None or not postgis_enabled():
@@ -478,7 +482,9 @@ def upsert_network_nodes(rows: list[dict]) -> int:
 
 def fetch_network_nodes(source: str | None = None) -> list[dict]:
     if not postgis_available():
-        return []
+        if source:
+            return [n for n in _mem_nodes if n.get("source") == source]
+        return list(_mem_nodes)
     ensure_postgis_schema()
     sql = """
         SELECT id, name, node_type, lat, lng, capacity, load, congestion_score,
@@ -496,7 +502,8 @@ def fetch_network_nodes(source: str | None = None) -> list[dict]:
 
 def count_network_nodes(node_type: str, source: str) -> int:
     if not postgis_available():
-        return 0
+        return sum(1 for n in _mem_nodes
+                   if n.get("node_type") == node_type and n.get("source") == source)
     ensure_postgis_schema()
     return int(fetch_scalar(
         "SELECT count(*) FROM network_nodes WHERE node_type = :node_type AND source = :source",
@@ -507,7 +514,11 @@ def count_network_nodes(node_type: str, source: str) -> int:
 def max_user_station_number(prefix: str = "기지국") -> int:
     """Return the highest integer suffix used in user-created station names like '기지국 N'."""
     if not postgis_available():
-        return 0
+        import re as _re
+        pat = _re.compile(rf"^{_re.escape(prefix)} (\d+)$")
+        nums = [int(m.group(1)) for n in _mem_nodes
+                if n.get("source") == "user_created" and (m := pat.match(n.get("name", "")))]
+        return max(nums, default=0)
     ensure_postgis_schema()
     result = fetch_scalar(
         "SELECT MAX(CAST(SUBSTRING(name FROM :pattern) AS INTEGER)) "
@@ -519,7 +530,8 @@ def max_user_station_number(prefix: str = "기지국") -> int:
 
 def insert_network_node(node: dict) -> dict | None:
     if not postgis_available():
-        return None
+        _mem_nodes.append(dict(node))
+        return node
     ensure_postgis_schema()
     with get_psycopg_connection() as conn:
         with conn.cursor() as cur:
@@ -561,6 +573,13 @@ def update_network_node_placement(
 ) -> bool:
     """기지국의 좌표와 안테나 높이를 갱신한다."""
     if not postgis_available():
+        for n in _mem_nodes:
+            if n.get("id") == node_id:
+                n["lat"] = lat
+                n["lng"] = lng
+                n["antenna_height_m"] = antenna_height_m
+                n["antenna_placement"] = antenna_placement
+                return True
         return False
     ensure_postgis_schema()
     with get_psycopg_connection() as conn:
@@ -583,7 +602,9 @@ def update_network_node_placement(
 
 def delete_network_node(node_id: str) -> bool:
     if not postgis_available():
-        return False
+        before = len(_mem_nodes)
+        _mem_nodes[:] = [n for n in _mem_nodes if n.get("id") != node_id]
+        return len(_mem_nodes) < before
     ensure_postgis_schema()
     with get_psycopg_connection() as conn:
         with conn.cursor() as cur:
@@ -595,7 +616,9 @@ def delete_network_node(node_id: str) -> bool:
 
 def delete_user_created_network_nodes() -> int:
     if not postgis_available():
-        return 0
+        before = len(_mem_nodes)
+        _mem_nodes[:] = [n for n in _mem_nodes if n.get("source") != "user_created"]
+        return before - len(_mem_nodes)
     ensure_postgis_schema()
     with get_psycopg_connection() as conn:
         with conn.cursor() as cur:

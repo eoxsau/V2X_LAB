@@ -47,6 +47,11 @@ const ALGO_LABELS = {
   latency_minimizing_allocation: 'Latency Minimizing',
   priority_based_allocation: 'Priority Based',
   lookahead_resource_allocation: 'Look-ahead',
+  // GNN-MAML RL
+  rl_routing:              'GNN-MAML 경로',
+  rl_based_bs_selection:   'GNN-MAML BS',
+  v4_gnn:                  'GNN-MAML',
+  rl_bs_placement:         'GNN-MAML 배치',
 };
 function algoLabel(key) {
   if (!key) return null;
@@ -405,22 +410,28 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const hasLiveNet = !!networkTelemetry;
   const connNodeObj = networkTelemetry?.connected_node ?? null;
 
-  const [alloc, setAlloc] = useState(null);
+  const [liveAlloc, setLiveAlloc] = useState(null);
   useEffect(() => {
-    // 백엔드는 시트별로 자원배분 결과를 따로 보관하지 않는다 — "현재 실행 시트"가 아닐 때
-    // 폴링하면 다른(엄밀히는 지금 살아있는) 시트의 데이터가 잘못 표시될 수 있으므로 멈춘다.
-    if (!isLiveSheet) { setAlloc(null); return; }
+    if (!isLiveSheet) { setLiveAlloc(null); return; }
     let dead = false;
     function poll() {
       fetch('http://127.0.0.1:8001/api/resources/allocation-result')
         .then(r => r.json())
-        .then(data => { if (!dead) setAlloc(data); })
+        .then(data => { if (!dead) setLiveAlloc(data); })
         .catch(() => {});
     }
     poll();
     const t = setInterval(poll, 3000);
     return () => { dead = true; clearInterval(t); };
   }, [isLiveSheet]);
+
+  // 비 라이브 시트: 배치 결과에 저장된 allocation_result를 사용
+  const sheetAlloc = !isLiveSheet ? (() => {
+    const ar = viewedSheet?.result?.allocation_result;
+    if (!ar) return null;
+    return { available: true, ...ar };
+  })() : null;
+  const alloc = isLiveSheet ? liveAlloc : sheetAlloc;
 
   // 커버리지 영역(중첩보정) — shapely union은 텔레메트리 tick(약 10Hz)마다 돌리기엔 무겁기 때문에,
   // 'network' 서브탭에 처음 들어올 때 한 번만 불러오고 이후엔 수동 새로고침으로만 갱신한다.
@@ -482,6 +493,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || '최적화 실패');
       setPlacementResult(data);
+      fetchCoverageKpi();
     } catch (e) {
       setPlacementError(e.message);
     } finally {
@@ -682,7 +694,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const [lookaheadError, setLookaheadError] = useState(null);
   const [aiForecast, setAiForecast] = useState({ loading: false, sections: [], error: null, provider: null, revealed: 0 });
 
-  const aheadNodeId = currentEdgeId && currentEdgeId.includes('_') ? currentEdgeId.split('_')[1] : null;
+  const aheadNodeId = vehiclePos?.ahead_node_id
+    ?? (currentEdgeId && currentEdgeId.includes('_') ? currentEdgeId.split('_')[1] : null);
   const fallbackLookahead = useMemo(
     () => buildFallbackLookahead(routeEdges, vehiclePos, hops),
     [routeEdges, vehiclePos, hops]
@@ -1239,10 +1252,15 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
               <div className="stat" style={{ padding: '12px 14px' }}>
                 <div className="label">적용 정책</div>
                 <div style={{ fontSize: 12.5, lineHeight: 1.7 }}>
-                  <div><span className="muted">Route</span> <span className="mono">{routingMode}</span></div>
-                  <div><span className="muted">Select</span> <span className="mono">{activeSelectionAlgo}</span></div>
-                  <div><span className="muted">Latency</span> <span className="mono">{activeLatencyAlgoNet}</span></div>
-                  <div><span className="muted">Alloc</span> <span className="mono">{activeAllocAlgo}</span></div>
+                  <div><span className="muted">Route</span> <span className="mono">{algoLabel(routingMode)}</span></div>
+                  <div>
+                    <span className="muted">BS 선택</span>{' '}
+                    {networkTelemetry?.bs_selector_method === 'v4_gnn'
+                      ? <span className="chip sm good" style={{ marginLeft: 4 }}>GNN-MAML</span>
+                      : <span className="mono">{algoLabel(activeSelectionAlgo)}</span>}
+                  </div>
+                  <div><span className="muted">Latency</span> <span className="mono">{algoLabel(activeLatencyAlgoNet)}</span></div>
+                  <div><span className="muted">Alloc</span> <span className="mono">{algoLabel(activeAllocAlgo)}</span></div>
                 </div>
               </div>
             </div>
@@ -1319,8 +1337,8 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
         </Card>
       )}
 
-      {alloc?.available && (
-        <div className="grid" style={{ gridTemplateColumns: '1.2fr 1fr', marginBottom: 18 }}>
+      <div className="grid" style={{ gridTemplateColumns: '1.2fr 1fr', marginBottom: 18 }}>
+        {alloc?.available ? (
           <Card title="자원배분 현황" en="Resource allocation" right={<Chip tone="brand">{alloc.algorithm_id}</Chip>}>
             {Object.keys(alloc.bs_load_after_allocation || {}).length === 0 ? (
               <div className="muted" style={{ padding: 8, fontSize: 12 }}>할당 결과가 없습니다.</div>
@@ -1364,6 +1382,15 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
             )}
             <div className="muted" style={{ fontSize: 10.5, marginTop: 10, fontFamily: 'var(--mono)' }}>BS별 할당 후 부하율(%) · 괄호는 RB 부족분</div>
           </Card>
+        ) : (
+          <Card title="자원배분 현황" en="Resource allocation">
+            <div className="muted" style={{ padding: '20px 8px', fontSize: 12, textAlign: 'center' }}>
+              {isLiveSheet
+                ? '자원배분 데이터를 불러오는 중입니다.'
+                : '이 시트의 자원배분 현황은 시뮬레이션 실행 중에만 표시됩니다.'}
+            </div>
+          </Card>
+        )}
           <Card title="차폐 / 커버리지" en="Coverage & obstruction">
             <div className="grid" style={{ gridTemplateColumns: 'repeat(2,1fr)', gap: 12 }}>
               <div className="stat" style={{ padding: '12px 14px' }}>
@@ -1387,8 +1414,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
               현재 연결선 기준으로 건물 차폐와 커버리지 상태를 요약합니다. 장기 예측은 아래 미래 위험 예측에서 확인합니다.
             </div>
           </Card>
-        </div>
-      )}
+      </div>
 
       {/* ── 커버리지 영역 추정 KPI — Pro 전용. 비용 데이터가 없으므로 ROI/비용 추정은 만들지 않고,
            면적 추정만 보여준다. "합산 상한"(중첩 미보정, π×반경² 합)과 "중첩보정"(shapely union,

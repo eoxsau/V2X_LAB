@@ -39,6 +39,7 @@ class BaseStation:
     name: str
     lat: float
     lng: float
+    node_type: str = ""                 # "rsu"/"rsu_node"/"roadside_unit" vs. cellular BS
     coverage_radius_m: float = 400.0
     capacity: float = 100.0
     load: float = 0.0
@@ -60,6 +61,7 @@ class BaseStation:
             name=d.get("name") or str(d.get("id", "")),
             lat=float(d.get("lat", 0.0)),
             lng=float(d.get("lng", 0.0)),
+            node_type=str(d.get("type") or d.get("node_type") or ""),
             coverage_radius_m=float(d.get("coverage_radius_m", 400.0)),
             capacity=float(d.get("capacity", 100.0)),
             load=float(d.get("load", d.get("current_load", 0.0))),

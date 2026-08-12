@@ -30,6 +30,12 @@ data/processed/demo/*.dump
 gcp_key.json
 *_service_account.json
 
+# RL model weights & graph cache (large binaries — use Git LFS or external storage)
+backend/app/services/rl/models/*.pt
+backend/app/services/rl/models/v4/
+backend/data/v4_graph_cache/
+logs/
+
 # Managed GIS data
 data/raw/*
 data/processed/*

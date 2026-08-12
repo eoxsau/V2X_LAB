@@ -69,6 +69,7 @@ class FastScorer:
         self.tti = np.where(is_rsu, p_rsu["TTI"], p_bs["TTI"])
         self.c_tech = np.where(is_rsu, p_rsu["C_tech"], p_bs["C_tech"])
         bw = np.where(is_rsu, p_rsu["BW"], p_bs["BW"])
+        noise_floor = np.where(is_rsu, p_rsu["noise_floor_dbm"], p_bs["noise_floor_dbm"])
 
         # ── 경로손실 (formula_v31._pl의 이중 기울기) ─────────────────────────
         dc = np.maximum(dist, 1.0)
@@ -77,7 +78,7 @@ class FastScorer:
         pl = np.where(dc <= d_bp[None, :], near, far)
 
         a = self._dense_a_seg(a_seg, demand, candidates)
-        sinr = (p_tx[None, :] - alpha[None, :] - pl - a) - f31.NOISE_FLOOR_DBM
+        sinr = (p_tx[None, :] - alpha[None, :] - pl - a) - noise_floor[None, :]
 
         self.covered = dist <= cover[None, :]
         self.outage = sinr < f31.SINR_MIN_DB

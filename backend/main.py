@@ -79,7 +79,9 @@ try:
         evaluate_k_candidates,
         _find_best_bs_light,
         set_network_mode as _set_route_network_mode,
+        set_v4_predict_bs as _set_v4_predict_bs_rf,
     )
+    import app.services.routing.route_cost_function as _rcf_module
     _route_cost_weights = CostWeights()
     _norm_scales = NormScales()
     ROUTE_COST_AVAILABLE = True
@@ -307,6 +309,13 @@ async def _load_v4_policy() -> None:
         _v4_policy = _V4InferenceModule(str(model_path))
         print(f"[startup] V4 GNN policy (BS selector) loaded from {model_path}", flush=True)
 
+        # route_cost_function에 GNN BS 선택 콜백 주입 — v4_gnn 알고리즘 사용 가능
+        try:
+            _set_v4_predict_bs_rf(_v4_policy.predict_bs)
+            print("[startup] V4 predict_bs → route_cost_function 연결 완료", flush=True)
+        except Exception as _ce:
+            print(f"[startup] route_cost_function 연결 실패 (무시): {_ce}", flush=True)
+
         # V4RoutingAdapter: 경로 결정 (v4_gnn policy → run_episode)
         gnn_policy = _UniversalGNNPolicy.load(str(model_path))
         gnn_policy.eval()
@@ -318,17 +327,43 @@ async def _load_v4_policy() -> None:
 
 
 def _rebuild_v4_graph() -> None:
-    """Rebuild V4 GNN graph cache when BS/RSU layout changes."""
+    """Rebuild V4 GNN graph cache when BS/RSU layout or road network changes."""
     if _v4_policy is None or not _v4_policy.is_ready:
         return
     nodes = _state.get("network_nodes") or []
     bs_nodes = [n for n in nodes if n.get("type") in ("BS", "bs", "5G", "4G") or not n.get("type")]
     if not bs_nodes:
         return
+
+    # Detect network_mode from first BS type annotation
+    _type_map = {"5G": "5G", "4G": "4G", "6G": "6G", "bs": "5G", "BS": "5G"}
+    network_mode = _type_map.get(bs_nodes[0].get("type", "5G"), "5G")
+
+    # Extract road nodes from OSM graph (mock_graph["nodes"] = {id: {lat, lng, ...}})
+    mock_graph = _state.get("mock_graph") or {}
+    raw_nodes: dict = mock_graph.get("nodes", {})
+    if raw_nodes:
+        # Convert dict to list and cap at 1000 nodes for inference performance
+        _MAX_ROAD_NODES = 1000
+        road_node_list = [
+            {"id": nid, "lat": nd["lat"], "lng": nd["lng"]}
+            for nid, nd in raw_nodes.items()
+        ][:_MAX_ROAD_NODES]
+    else:
+        road_node_list = []
+
+    adjacency = mock_graph.get("adjacency", {})
+
     try:
-        _v4_policy.build_graph(road_nodes=[], bs_nodes=bs_nodes)
+        _v4_policy.build_graph(
+            road_nodes=road_node_list,
+            bs_nodes=bs_nodes,
+            network_mode=network_mode,
+            adjacency=adjacency,
+        )
     except Exception as _e:
-        pass
+        import logging as _log
+        _log.getLogger("main").warning("V4 graph rebuild failed: %s", _e)
 
 from app.services.demand.scenario import (background_vehicles_from_scenario,
                                           build_traffic_scenario, clamp_demand_scale)
@@ -343,7 +378,9 @@ MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 �
 # RSU 안테나 높이 — C-V2X 표준 도로변 폴 높이 고정값. RSU는 교차로 폴 설치라 건물 높이를
 # 쓰지 않고 항상 이 값을 쓴다(옥상 스냅 대상 아님). 수동/자동 배치 모두 이 상수를 참조.
 RSU_ANTENNA_HEIGHT_M      = 6.0
-DEFAULT_LOCAL_PBF = Path.home() / "Desktop" / "south-korea-260711.osm.pbf"
+DEFAULT_LOCAL_PBF = (
+    Path(__file__).parent.parent / "data" / "raw" / "south-korea-260711.osm.pbf"
+)
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
@@ -1139,6 +1176,8 @@ def load_route_buildings(
     }
 
 
+
+
 def _poisson_sample(lam: float, rng: random.Random = random) -> int:
     """Knuth algorithm for Poisson(lam) sampling.
 
@@ -1617,6 +1656,9 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         return round(min(1.0, load / max(cap, 1.0)), 4)
 
     _state["network_telemetry"] = {
+        "bs_selector_method": "v4_gnn" if (_v4_policy and _v4_policy.is_ready) else (
+            _rcf_module._active_bs_selection if ROUTE_COST_AVAILABLE else "rsrp_max"
+        ),
         "connected_node": {
             "id": selected_node["id"],
             "name": selected_name,
@@ -2081,6 +2123,9 @@ def _path_cost_to_dict(result: "PathCostResult", routing_mode: str) -> dict:
         "total_distance_m":    result.total_distance_m,
         "total_travel_time_s": result.total_travel_time_s,
         "avg_latency_ms":      result.avg_latency_ms,
+        "avg_latency_connected_ms": result.avg_latency_connected_ms,
+        "outage_count":        result.outage_count,
+        "outage_rate":         result.outage_rate,
         "max_latency_ms":      result.max_latency_ms,
         "handover_count":      result.handover_count,
         "coverage_risk":       result.coverage_risk,
@@ -2101,6 +2146,7 @@ def _path_cost_to_dict(result: "PathCostResult", routing_mode: str) -> dict:
                 "midpoint_lng":    r.midpoint_lng,
                 "handover":        r.handover_occurred,
                 "within_coverage": r.within_coverage,
+                "outage":          r.outage,
                 "loss_db":         r.loss_db,
                 "total_cost":      r.total_cost,
                 "components":      r.components,
@@ -2287,18 +2333,15 @@ def _run_algorithm_comparison() -> None:
             except Exception as exc:
                 print(f"[CMP] latency algo {algo_id} failed: {exc}", flush=True)
 
-        # RL BS 배치 최적화 (제안 방법) — 학습된 모델이 있으면 그걸 사용,
-        # 없으면 lowest_latency_bs 폴백 (결과에 _rl_trained=False 표시)
-        _rl_bs_trained = False
-        _rl_bs_fallback = "lowest_latency_bs"
+        # RL BS 배치 최적화 (제안 방법) — v4_gnn 모델이 로드되면 실제 GNN 추론 사용,
+        # 미로드 시 lowest_latency_bs 폴백 (결과에 _rl_trained=False 표시)
+        _rl_bs_trained = _v4_policy is not None and _v4_policy.is_ready
+        _rl_bs_algo = "v4_gnn" if _rl_bs_trained else "lowest_latency_bs"
         try:
-            if RL_AVAILABLE:
-                reg = _get_rl_registry()
-                _rl_bs_trained = bool(getattr(reg, "active_model_name", None))
             result = evaluate_path(
                 edge_data, nodes, buildings,
                 _route_cost_weights, _norm_scales,
-                bs_selection_algo=_rl_bs_fallback,
+                bs_selection_algo=_rl_bs_algo,
             )
             _state["algorithm_comparison"]["by_bs_selection"]["rl_bs_placement"] = {
                 "avg_latency_ms": result.avg_latency_ms,
@@ -2307,6 +2350,7 @@ def _run_algorithm_comparison() -> None:
                 "coverage_risk": result.coverage_risk,
                 "_is_proposed": True,
                 "_rl_trained": _rl_bs_trained,
+                "_algo_used": _rl_bs_algo,
             }
         except Exception as exc:
             print(f"[CMP] rl_bs_placement failed: {exc}", flush=True)
@@ -4668,6 +4712,13 @@ def simulation_thread(
             progress = max(0.0, min(1.0, (route_idx + 1) / max(len(edges), 1)))
 
             _spd_kmh = round(speed * 3.6, 1)
+            _cur_edge_id = edges[route_idx] if 0 <= route_idx < len(edges) else None
+            _ahead_nid = None
+            if _cur_edge_id:
+                try:
+                    _ahead_nid = str(net.getEdge(_cur_edge_id).getToNode().getID())
+                except Exception:
+                    pass
             _state["vehicle_pos"] = {
                 "lat": lat,
                 "lng": lon,
@@ -4675,7 +4726,8 @@ def simulation_thread(
                 "progress": round(progress, 3),
                 "step": step,
                 "arrived": False,
-                "current_edge_id": edges[route_idx] if 0 <= route_idx < len(edges) else None,
+                "current_edge_id": _cur_edge_id,
+                "ahead_node_id": _ahead_nid,
             }
 
             # Track per-edge average speed (actual vehicle speed while traversing)
@@ -5882,6 +5934,7 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
     metrics = _state.get("algorithm_metrics") or {}
     route_cost = _state.get("route_cost_result")
     summary = _state.get("simulation_summary")
+    alloc_result = _state.get("last_allocation_result")
     if _state.get("simulation_run_id"):
         finish_simulation_run(_state["simulation_run_id"], {
             "algorithm_metrics": metrics,
@@ -5891,10 +5944,12 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
         })
     return {
         "mode": "route_metrics",
+        "route_coords": _state.get("route_coords") or [],
         "route_cost_result": route_cost,
         "algorithm_metrics": metrics,
         "simulation_summary": summary,
         "network_telemetry": telemetry,
+        "allocation_result": alloc_result,
     }
 
 
@@ -5925,6 +5980,20 @@ def _evaluate_rl_scenario(spec: ScenarioSpec) -> dict:
         raise RuntimeError(f"목적지 노드 '{dest_id}'를 도로 그래프에서 찾을 수 없습니다.")
     if spec.policy not in SUPPORTED_POLICIES:
         raise RuntimeError(f"지원하지 않는 정책입니다. 선택 가능: {SUPPORTED_POLICIES}")
+
+    # v4_gnn policy: V4RoutingAdapter에 그래프+목적지 주입 (episode마다 필요)
+    if spec.policy == "v4_gnn":
+        try:
+            from app.services.rl.rl_trainer import _v4_adapter as _adap
+            if _adap is not None:
+                _type_map = {"5G": "5G", "4G": "4G", "6G": "6G", "bs": "5G", "BS": "5G"}
+                _net_mode = _type_map.get(
+                    next((n.get("type", "5G") for n in bs_nodes if n.get("type")), "5G"), "5G"
+                )
+                _adap.build_graph(graph, bs_nodes, dest_id, network_mode=_net_mode)
+                _adap.set_episode_start(origin_id)
+        except Exception as _ae:
+            pass  # adapter 초기화 실패 시 random 폴백 (rl_trainer 내부 처리)
 
     env = V2XRoutingEnv(
         graph=graph,
@@ -7671,9 +7740,6 @@ def network_nodes_coverage():
 
 @app.post("/network-nodes")
 async def create_network_node(req: NetworkNodeCreateRequest):
-    if not postgis_available():
-        raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 기지국을 저장할 수 없습니다.")
-
     is_rsu = req.node_type.lower() in ("rsu", "rsu_node")
 
     if is_rsu:
@@ -7783,8 +7849,6 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
 
     공통: BS는 건물 옥상 스냅, RSU는 교차로(degree≥3) 노드. 번호는 기존 최대치 뒤로 이어 붙인다.
     """
-    if not postgis_available():
-        raise HTTPException(status_code=400, detail="PostGIS가 활성화되어 있지 않아 저장할 수 없습니다.")
     if _state.get("sim_running"):
         raise HTTPException(status_code=409, detail="시뮬레이션 실행 중에는 자동 배치를 할 수 없습니다. 먼저 중지하세요.")
 

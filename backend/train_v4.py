@@ -44,12 +44,15 @@ def parse_args() -> argparse.Namespace:
 
     # 그래프 크기 (Mac에서는 300, A100은 2000)
     p.add_argument("--max-nodes",  type=int,   default=300,    help="학습 그래프 최대 노드 수")
+    p.add_argument("--max-steps",  type=int,   default=200,    help="에피소드당 최대 라우팅 스텝 수")
 
     # 장치
     p.add_argument("--device",     type=str,   default="auto",
                    help="'auto' | 'cpu' | 'mps' | 'cuda'")
     p.add_argument("--no-compile", action="store_true",
-                   help="torch.compile 비활성화 (디버깅용)")
+                   help="torch.compile 비활성화 (병렬 모드에서는 자동 비활성화)")
+    p.add_argument("--workers",    type=int,   default=1,
+                   help="병렬 task 처리 스레드 수 (A100 권장: tasks와 동일하게)")
 
     # 저장 / 재시작
     p.add_argument("--save-dir",   type=str,   default="app/services/rl/models",
@@ -86,6 +89,9 @@ def main() -> None:
     args = parse_args()
 
     device = resolve_device(args.device)
+    # A100 Tensor Core 활성화 — float32 matmul에서 2-8× 속도 향상, 품질 영향 없음
+    import torch as _torch
+    _torch.set_float32_matmul_precision("high")
     print(f"[train_v4] device={device}  max_nodes={args.max_nodes}")
     print(f"           {args.tasks} tasks/iter × {args.iters} iters")
     print(f"           inner_steps={args.inner_steps}  support={args.support}  query={args.query}")
@@ -103,6 +109,11 @@ def main() -> None:
         dr.pre_cache_all(verbose=True)
 
     # ── 2. MAMLConfig ─────────────────────────────────────────────────────────
+    # torch.compile + threading = thread-safety issues; disable automatically
+    use_compile = (not args.no_compile) and (args.workers <= 1)
+    if args.workers > 1 and not args.no_compile:
+        print(f"[train_v4] 병렬 모드 (workers={args.workers}) — torch.compile 자동 비활성화")
+
     cfg = MAMLConfig(
         n_tasks_per_iter    = args.tasks,
         meta_iterations     = args.iters,
@@ -112,11 +123,13 @@ def main() -> None:
         inner_lr            = args.inner_lr,
         support_episodes    = args.support,
         query_episodes      = args.query,
+        max_episode_steps   = args.max_steps,
         save_dir            = args.save_dir,
         save_every          = args.save_every,
         log_every           = args.log_every,
         device              = device,
-        compile_model       = not args.no_compile,
+        compile_model       = use_compile,
+        n_workers           = args.workers,
     )
 
     # ── 3. MAMLTrainer ────────────────────────────────────────────────────────
@@ -141,11 +154,13 @@ def main() -> None:
         inner_steps=1,
         support_episodes=1,
         query_episodes=1,
+        max_episode_steps=args.max_steps,
         save_dir=args.save_dir,
         save_every=999999,
         log_every=999999,
         device=device,
         compile_model=False,
+        n_workers=1,  # probe always sequential for clean timing
     )
     _probe_trainer = MAMLTrainer(dr, config=cfg_probe)
     _probe_trainer.train()

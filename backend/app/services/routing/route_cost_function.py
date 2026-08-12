@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     from app.services.latency.registry import (
@@ -101,15 +101,18 @@ def _n_vehicles_from_node(node: dict) -> int:
     구성:
       1 (ego)
       + n_background_vehicles (Poisson 배경 차량)
-      + n_other_devices       (보행자 폰·IoT)
+      + n_other_devices × 0.1 (보행자 폰·IoT — V2X 전용 자원을 차량 대비 ~10% 소모)
       + n_its_load            (ITS 교통량 환산 V2X 차량)
 
-    출처: main.py _seed_its_congestion_load; _seed_other_device_load 참고.
+    폰/IoT(n_other_devices)는 V2X Uu 전용 자원을 사용하지 않아 C_tech 기준 용량 소모가
+    V2X 차량 대비 1/10 수준이다. 1:1 합산 시 4G(C_tech=100) 대면적 셀에서 rho→0.99로
+    포화돼 큐 지연이 비현실적으로 폭발한다.
     """
+    n_other = int(node.get("n_other_devices") or 0)
     return (
         1
         + int(node.get("n_background_vehicles") or 0)
-        + int(node.get("n_other_devices") or 0)
+        + max(round(n_other * 0.1), 1 if n_other > 0 else 0)
         + int(node.get("n_its_load") or 0)
     )
 
@@ -211,6 +214,15 @@ DEFAULT_WEIGHTS = CostWeights()
 # 기존 알고리즘들은 실험용 선택지로 그대로 유지된다.
 _active_bs_selection: str = "rsrp_max"
 
+# v4_gnn 콜백: main.py가 _v4_policy 로드 후 set_v4_predict_bs()로 주입.
+# None이면 v4_gnn 알고리즘 선택 시 rsrp_max 폴백.
+_v4_predict_bs_fn: Optional[Callable] = None
+
+def set_v4_predict_bs(fn: Optional[Callable]) -> None:
+    """V4InferenceModule.predict_bs를 BS 선택 파이프라인에 주입한다."""
+    global _v4_predict_bs_fn
+    _v4_predict_bs_fn = fn
+
 def set_bs_selection_algorithm(algo: str) -> None:
     global _active_bs_selection
     _active_bs_selection = algo
@@ -237,6 +249,8 @@ def _bs_score(
     load_balanced_bs:    load ratio dominates; small distance tiebreaker
     look_ahead_bs:       lowest-latency + hard penalty when out of coverage
     rl_based_bs:         falls back to lowest_latency_bs (RL agent not yet trained)
+    v4_gnn:              GNN-MAML 추론 결과 사용 (_find_best_bs_light/full에서 직접 처리,
+                         _bs_score까지 도달하지 않음)
     """
     dist_pen = dist_m / max(cov_r, 1.0) * 15.0
     if algo == "rsrp_max":
@@ -273,6 +287,7 @@ class EdgeCostResult:
     handover_occurred: bool
     loss_db: float
     within_coverage: bool          # dist_to_best_bs ≤ coverage_radius_m
+    outage: bool                   # SINR < 문턱 — latency_ms가 L_OUTAGE 고정값
     total_cost: float              # edge-level (components 1–6)
     components: dict = field(default_factory=dict)
 
@@ -283,13 +298,16 @@ class PathCostResult:
     distance_time_cost: float      # sum of distance + time components only
     total_distance_m: float
     total_travel_time_s: float
-    avg_latency_ms: float
+    avg_latency_ms: float           # 전 엣지 평균 — outage(고정 페널티)도 그대로 섞여 있음
     max_latency_ms: float
     handover_count: int
     coverage_risk: float           # fraction of edges beyond BS coverage (0–1)
     avg_loss_db: float
     covered_pct: float             # fraction of edges within BS coverage (0–1)
     edge_count: int
+    outage_count: int = 0                    # SINR<문턱으로 고정 페널티가 적용된 엣지 수
+    outage_rate: float = 0.0                 # outage_count / edge_count
+    avg_latency_connected_ms: float = 0.0    # outage 엣지를 뺀 평균 — "연결됐을 때" 체감 지연
     edge_results: list[EdgeCostResult] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
     resource_deficit_cost: float = 0.0    # normalized deficit from resource allocation
@@ -316,6 +334,9 @@ class KPathCandidate:
     path_cost_result: Optional[PathCostResult] = None   # full detail if needed
     resource_deficit_cost: float = 0.0    # normalized BS deficit on this path
     expected_latency_impact: float = 0.0  # sum of allocation latency delta ms
+    outage_count: int = 0
+    outage_rate: float = 0.0
+    avg_latency_connected_ms: float = 0.0
 
 
 # ── Internal BS selection ─────────────────────────────────────────────────────
@@ -340,6 +361,35 @@ def _find_best_bs_light(
     best_dist_m = 0.0
 
     algo = bs_selection_algo or _active_bs_selection
+
+    # v4_gnn: GNN-MAML 추론으로 직접 BS 선택 (score 루프 건너뜀)
+    if algo == "v4_gnn" and _v4_predict_bs_fn is not None:
+        try:
+            gnn_node = _v4_predict_bs_fn(mid_lat, mid_lng)
+        except Exception:
+            gnn_node = None
+        if gnn_node is not None:
+            n_lat = float(gnn_node.get("lat") or 0)
+            n_lng = float(gnn_node.get("lng") or 0)
+            dist_m = _haversine_m(mid_lat, mid_lng, n_lat, n_lng)
+            cov_r = float(gnn_node.get("coverage_radius_m") or 400.0)
+            within_cov = dist_m <= cov_r
+            is_rsu = _is_rsu_node(gnn_node)
+            edge_lat = float(gnn_node.get("edge_latency_ms") or (0.5 if is_rsu else 3.0))
+            if _ANALYZER_LATENCY_AVAILABLE:
+                n_veh = _n_vehicles_from_node(gnn_node)
+                if is_rsu:
+                    pred_lat = round(_analyzer_L_rsu(dist_m, cov_r) + edge_lat, 2)
+                else:
+                    l_air, _, _, _ = _analyzer_L_total(dist_m, 0.0, n_veh, _active_network_mode)
+                    pred_lat = round(l_air + edge_lat, 2)
+            else:
+                dist_pen = dist_m / max(cov_r, 1.0) * 15.0
+                pred_lat = round(4.0 + dist_pen + float(gnn_node.get("congestion_penalty") or 0.0) + edge_lat, 2)
+            return gnn_node, dist_m, pred_lat, 0.0, within_cov
+        # GNN 실패 시 rsrp_max로 폴백
+        algo = "rsrp_max"
+
     for node in nodes:
         n_lat = float(node.get("lat") or 0)
         n_lng = float(node.get("lng") or 0)
@@ -401,6 +451,11 @@ def _find_best_bs_full(
 
     bs_selection_algo: per-call override, see _find_best_bs_light.
     """
+    # v4_gnn: 건물 차폐 계산 전에 GNN이 BS를 직접 선택 (_find_best_bs_light와 동일 경로)
+    algo_eff = bs_selection_algo or _active_bs_selection
+    if algo_eff == "v4_gnn":
+        return _find_best_bs_light(mid_lat, mid_lng, nodes, "v4_gnn")
+
     try:
         from app.services.buildings.building_obstruction_analyzer import analyze_vehicle_to_node
         import geopandas as gpd
@@ -561,6 +616,11 @@ def compute_edge_network_cost(
         except Exception:
             pass  # keep legacy latency_ms on any registry error
 
+    # outage: SINR<문턱이라 latency_ms가 알고리즘의 고정 페널티값인 엣지.
+    # 알고리즘 comparison-agnostic — debug_info에 outage 플래그가 없는 알고리즘은
+    # (구현상 outage 개념이 없는 경우) 항상 False로 취급된다.
+    _outage = bool((_latency_components.get("debug_info") or {}).get("outage", False))
+
     # Normalised components
     c_dist     = distance_m / 1000.0 / norm_scales.distance_km
     c_time     = travel_time_s / 60.0 / norm_scales.time_min
@@ -595,6 +655,7 @@ def compute_edge_network_cost(
         handover_occurred=handover,
         loss_db=round(loss_db, 2),
         within_coverage=within_cov,
+        outage=_outage,
         total_cost=round(total, 4),
         components={
             "distance_cost":  round(c_dist,     4),
@@ -672,6 +733,14 @@ def evaluate_path(
     avg_loss = sum(r.loss_db for r in edge_results) / n
     covered_pct = (n - n_uncovered) / n
 
+    # outage 통계 — avg_latency_ms(전체 평균)와 별도로, "연결됐을 때" 체감 지연을 분리
+    # 보고한다. 고정 페널티(outage) 몇 개가 섞이면 blended 평균이 실제 체감과 동떨어진
+    # 값으로 튀는 문제가 있었다 — 둘 다 노출해 호출부가 선택하게 한다.
+    n_outage = sum(1 for r in edge_results if r.outage)
+    outage_rate = n_outage / n
+    connected_lats = [r.latency_ms for r in edge_results if not r.outage]
+    avg_lat_connected = sum(connected_lats) / len(connected_lats) if connected_lats else avg_lat
+
     # distance + time sub-total for comparison with baseline Dijkstra
     dt_cost = sum(
         weights.w_distance * r.distance_m / 1000.0 / norm_scales.distance_km
@@ -698,6 +767,9 @@ def evaluate_path(
         avg_loss_db=round(avg_loss, 2),
         covered_pct=round(covered_pct, 4),
         edge_count=n,
+        outage_count=n_outage,
+        outage_rate=round(outage_rate, 4),
+        avg_latency_connected_ms=round(avg_lat_connected, 2),
         edge_results=edge_results,
         summary={
             "total_edges":       n,
@@ -705,6 +777,9 @@ def evaluate_path(
             "uncovered_edges":   n_uncovered,
             "handovers":         n_handover,
             "avg_latency_ms":    round(avg_lat, 2),
+            "avg_latency_connected_ms": round(avg_lat_connected, 2),
+            "outage_edges":      n_outage,
+            "outage_rate":       round(outage_rate, 4),
             "max_latency_ms":    round(max_lat, 2),
             "total_distance_km": round(total_dist / 1000, 3),
             "total_travel_min":  round(total_time / 60, 2),
@@ -812,6 +887,9 @@ def evaluate_k_candidates(
             path_cost_result=pc,
             resource_deficit_cost=res_deficit,
             expected_latency_impact=lat_impact,
+            outage_count=pc.outage_count,
+            outage_rate=pc.outage_rate,
+            avg_latency_connected_ms=pc.avg_latency_connected_ms,
         ))
 
     results.sort(key=lambda r: r.total_cost)

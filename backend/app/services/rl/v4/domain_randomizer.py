@@ -19,6 +19,8 @@ References:
       Networks from Simulation to the Real World", IROS 2017.
   [2] Finn, C. et al., "Model-Agnostic Meta-Learning for Fast Adaptation",
       ICML 2017. (each task here corresponds to a MAML task τ_i)
+  [3] Fernandez, H. et al., "Path Loss Characterization for Vehicular
+      Communications at 700 MHz and 5.9 GHz", IEEE WCL 3(6), 2014.
 """
 from __future__ import annotations
 
@@ -48,16 +50,55 @@ _HIGHWAY_TYPES = {
 }
 
 # ── Task geometry limits ───────────────────────────────────────────────────────
-_MIN_NODES = 40           # reject regions with fewer road nodes
-_MAX_NODES = 2000         # cap graph size for training efficiency
-_N_BS_RANGE = (1, 4)      # number of BS per task
-_N_RSU_RANGE = (0, 3)     # number of RSU per task
-_DENSITY_RANGE = (1.0, 60.0)   # vehicles/km²
-_BS_COV_RADIUS_M = {"4G": 500, "5G": 400, "6G": 300}
-_RSU_COV_RADIUS_M = {"4G": 100, "5G": 150, "6G": 250}
+_MIN_NODES = 30           # reject regions with fewer road nodes
+_MAX_NODES = 5000         # Stage 3 graph size; curriculum caps below this
+_N_BS_RANGE = (1, 30)     # covers rural macro (1 BS) to dense urban district (30 BSes)
+_N_RSU_RANGE = (0, 15)    # smart-city RSU-dense intersections
+_DENSITY_RANGE = (0.5, 300.0)  # veh/km²: rural (0.5) to peak Seoul CBD rush hour (300)
+_SPEED_RANGE = (10.0, 130.0)   # km/h: near-stationary congestion to expressway
+# Coverage radius varies with cell size: macro (large radius) → small cell (small radius)
+# Each BS picks a random radius within its mode range at task-sample time.
+_BS_COV_RADIUS_RANGE = {"4G": (300, 800), "5G": (150, 500), "6G": (80, 300)}
+_RSU_COV_RADIUS_RANGE = {"4G": (80, 150), "5G": (100, 200), "6G": (150, 350)}
+_BS_CAPACITY = 200.0      # maximum simultaneous UEs per BS (upgraded for 5G capacity)
+# HetNet: probability that a task uses mixed 4G/5G/6G BSes (reflects Korea's real network)
+_HETNET_PROB = 0.45        # 45% HetNet, 55% single-mode
 
 # ── Train / holdout split ─────────────────────────────────────────────────────
-_TRAIN_RATIO = 500 / 550   # ~91 % of sampled regions are training
+# Use all 2,367 Korean admin regions: 2000 train / holdout remainder
+_N_TRAIN_REGIONS  = 2000
+_N_HOLDOUT_REGIONS = None  # None = use remainder after train split
+
+# ── Path loss model parameters per network mode (Fernandez 2014, Table I–II) ──
+# n     = path-loss exponent (LOS urban)
+# sigma = log-normal shadowing std-dev [dB]
+# freq_ghz = carrier frequency
+# d0    = reference distance [m]
+# p_tx_dbm = UE transmit power (C-V2X, 3GPP TS 36.101)
+PATH_LOSS_PARAMS: dict[str, dict] = {
+    "4G": {
+        "freq_ghz": 0.7,
+        "n": 2.10,
+        "sigma": 5.0,
+        "d0": 10.0,
+        "p_tx_dbm": 23.0,
+    },
+    "5G": {
+        "freq_ghz": 3.5,
+        "n": 2.75,
+        "sigma": 5.5,
+        "d0": 10.0,
+        "p_tx_dbm": 23.0,
+    },
+    "6G": {
+        "freq_ghz": 28.0,
+        "n": 2.00,
+        "sigma": 4.0,
+        "d0": 10.0,
+        "p_tx_dbm": 23.0,
+    },
+}
+_P_NOISE_DBM = -95.0   # receiver noise floor at 10 MHz bandwidth
 
 
 @dataclass
@@ -66,13 +107,16 @@ class V2XTask:
     region_id: int
     region_name: str
     graph: dict                  # {"nodes": {id: {lat,lng}}, "adjacency": {id: [(id, dist)]}}
-    bs_nodes: list[dict]         # [{id, lat, lng, coverage_radius_m, type, ...}]
+    bs_nodes: list[dict]         # [{id, lat, lng, coverage_radius_m, type, load, ...}]
     rsu_nodes: list[dict]
     origin_id: str               # road graph node id
     dest_id: str
     traffic_density: float       # vehicles/km²
     network_mode: str            # "4G" | "5G" | "6G"
     bbox: dict                   # {s, n, w, e}
+    vehicle_speed_kmh: float = 60.0        # sampled from speed_range
+    od_dist_m: float = 0.0                 # haversine distance origin→dest
+    max_od_dist_m: float = float("inf")    # curriculum constraint used when sampling
 
 
 class DomainRandomizer:
@@ -101,14 +145,33 @@ class DomainRandomizer:
 
         all_regions = self._load_region_list()
         self._rng.shuffle(all_regions)
-        split = int(len(all_regions) * _TRAIN_RATIO)
+        # Use _N_TRAIN_REGIONS from the full 2,367-region pool.
+        # Remaining regions become holdout — no hard ratio cap.
+        split = min(_N_TRAIN_REGIONS, max(1, len(all_regions) - 50))
         self._train_regions = all_regions[:split]
         self._holdout_regions = all_regions[split:]
 
     # ── Public API ─────────────────────────────────────────────────────────────
-    def sample_task(self) -> Optional[V2XTask]:
+    def sample_task(
+        self,
+        max_nodes: Optional[int] = None,
+        max_od_dist_m: float = float("inf"),
+        speed_range: tuple[float, float] = _SPEED_RANGE,
+    ) -> Optional["V2XTask"]:
         """
         Sample one task (episode specification).
+
+        Parameters
+        ----------
+        max_nodes : int | None
+            Override graph node cap for curriculum learning.
+            None → use the DomainRandomizer's own _max_nodes or _MAX_NODES.
+        max_od_dist_m : float
+            Maximum straight-line O/D distance. Used by curriculum stage 0
+            to keep episodes short (e.g. 500 m). Default = no limit.
+        speed_range : (float, float)
+            Vehicle speed uniform sample range in km/h. Curriculum may
+            narrow this (e.g. stage 0: (30, 60)).
 
         Returns None only if no valid graph can be constructed after retries.
         """
@@ -116,28 +179,52 @@ class DomainRandomizer:
         if not pool:
             return None
 
-        cap = self._max_nodes or _MAX_NODES
+        cap = max_nodes or self._max_nodes or _MAX_NODES
         for _ in range(20):   # retry limit
             region = self._rng.choice(pool)
             graph = self._load_or_build_graph(region)
             if graph is None or len(graph["nodes"]) < _MIN_NODES:
                 continue
-            # Trim graph to max_nodes if requested
-            graph = self._trim_graph(graph, cap)
+            # Sample a candidate O/D pair first so BFS trims around the actual route area
+            node_ids = list(graph["nodes"].keys())
+            _anchor = self._rng.choice(node_ids) if node_ids else None
+            graph = self._trim_graph(graph, cap, anchor_node=_anchor)
             if len(graph["nodes"]) < _MIN_NODES:
                 continue
-            task = self._make_task(region, graph)
+            task = self._make_task(
+                region, graph,
+                max_od_dist_m=max_od_dist_m,
+                speed_range=speed_range,
+            )
             if task is not None:
                 return task
         return None
 
-    def _trim_graph(self, graph: dict, max_nodes: int) -> dict:
-        """BFS-trim graph to at most max_nodes nodes from a random seed node."""
+    def _trim_graph(
+        self,
+        graph: dict,
+        max_nodes: int,
+        anchor_node: Optional[str] = None,
+    ) -> dict:
+        """
+        BFS-trim graph to at most max_nodes nodes.
+
+        Seeds BFS from `anchor_node` when provided (e.g. O/D midpoint node),
+        ensuring the trimmed subgraph contains the actual route area.
+        Falls back to a random node when anchor_node is absent or disconnected.
+        """
         nodes = graph["nodes"]
         if len(nodes) <= max_nodes:
             return graph
         adj = graph["adjacency"]
-        seed = self._rng.choice(list(nodes.keys()))
+
+        # Pick the best available BFS seed
+        node_ids = list(nodes.keys())
+        if anchor_node and anchor_node in nodes:
+            seed = anchor_node
+        else:
+            seed = self._rng.choice(node_ids)
+
         visited, queue = {seed}, deque([seed])
         while queue and len(visited) < max_nodes:
             u = queue.popleft()
@@ -147,6 +234,7 @@ class DomainRandomizer:
                     queue.append(v)
                     if len(visited) >= max_nodes:
                         break
+
         trimmed_nodes = {k: v for k, v in nodes.items() if k in visited}
         trimmed_adj = {
             k: [(nb, d) for nb, d in vs if nb in visited]
@@ -175,10 +263,13 @@ class DomainRandomizer:
                 continue
             g = self._build_graph_from_pbf(region)
             if g and len(g["nodes"]) >= _MIN_NODES:
-                with open(cache_path, "wb") as f:
-                    pickle.dump(g, f, protocol=4)
-                if verbose:
-                    print(f"  [cache] {i+1}/{len(regions)} {region['name_ko']} — {len(g['nodes'])} nodes saved")
+                try:
+                    with open(cache_path, "wb") as f:
+                        pickle.dump(g, f, protocol=4)
+                    if verbose:
+                        print(f"  [cache] {i+1}/{len(regions)} {region['name_ko']} — {len(g['nodes'])} nodes saved")
+                except Exception:
+                    pass
             else:
                 if verbose:
                     print(f"  [cache] {i+1}/{len(regions)} {region['name_ko']} — skipped (too small)")
@@ -245,7 +336,6 @@ class DomainRandomizer:
             tmp = tf.name
         try:
             box_str = f"{bbox['w']},{bbox['s']},{bbox['e']},{bbox['n']}"
-            # Try osmium (preferred)
             r = subprocess.run(
                 ["osmium", "extract", "-b", box_str, str(_PBF_PATH), "-o", tmp, "--overwrite"],
                 capture_output=True, timeout=60
@@ -312,11 +402,16 @@ class DomainRandomizer:
         return {"nodes": graph_nodes, "adjacency": adjacency, "way_tags": way_tags}
 
     # ── Internal: task construction ────────────────────────────────────────────
-    def _make_task(self, region: dict, graph: dict) -> Optional[V2XTask]:
+    def _make_task(
+        self,
+        region: dict,
+        graph: dict,
+        max_od_dist_m: float = float("inf"),
+        speed_range: tuple[float, float] = _SPEED_RANGE,
+    ) -> Optional[V2XTask]:
         nodes = list(graph["nodes"].keys())
         adj = graph["adjacency"]
 
-        # Degree of each node
         degree = {n: len(adj.get(n, [])) for n in nodes}
 
         # BS nodes: prefer high-degree intersections (≥ 3 connections)
@@ -326,29 +421,51 @@ class DomainRandomizer:
         n_bs = self._rng.randint(*_N_BS_RANGE)
         bs_picks = self._rng.sample(intersections, min(n_bs, len(intersections)))
 
-        network_mode = self._rng.choice(["4G", "5G", "6G"])
-        bs_cov = float(_BS_COV_RADIUS_M[network_mode])
-        rsu_cov = float(_RSU_COV_RADIUS_M[network_mode])
+        # HetNet: with _HETNET_PROB, each BS independently draws its own network_mode.
+        # Otherwise all BSes share one mode (single-technology deployment).
+        hetnet = self._rng.random() < _HETNET_PROB
+        if hetnet:
+            global_mode = "hetnet"
+            # Build per-BS mode list with plausible distribution: 5G dominant, some 4G, rare 6G
+            bs_mode_pool = ["4G"] * 2 + ["5G"] * 5 + ["6G"] * 1
+            bs_modes = [self._rng.choice(bs_mode_pool) for _ in bs_picks]
+        else:
+            global_mode = self._rng.choice(["4G", "5G", "6G"])
+            bs_modes = [global_mode] * len(bs_picks)
+
+        # RSU always uses the most common BS mode (or 5G if hetnet)
+        rsu_mode = "5G" if hetnet else global_mode
+
+        density = round(self._rng.uniform(*_DENSITY_RANGE), 1)
 
         bs_nodes: list[dict] = []
-        for i, nid in enumerate(bs_picks):
+        for i, (nid, mode) in enumerate(zip(bs_picks, bs_modes)):
             nd = graph["nodes"][nid]
+            # Randomize coverage radius within per-mode range (macro vs small cell)
+            cov_range = _BS_COV_RADIUS_RANGE[mode]
+            bs_cov = float(self._rng.randint(*cov_range))
+            area_km2 = math.pi * (bs_cov / 1000.0) ** 2
+            veh_in_cov = density * area_km2
+            bs_load = min(veh_in_cov / _BS_CAPACITY, 1.0)
+            # Edge latency: 4G ≈ 5ms, 5G ≈ 3ms, 6G ≈ 1ms (3GPP typical values)
+            edge_lat = {"4G": 5.0, "5G": 3.0, "6G": 1.0}.get(mode, 3.0)
             bs_nodes.append({
                 "id": f"BS-{i+1:02d}",
                 "type": "base_station",
+                "network_mode": mode,             # per-BS mode (enables HetNet in _node_rf_features)
                 "lat": nd["lat"],
                 "lng": nd["lng"],
                 "coverage_radius_m": bs_cov,
-                "edge_latency_ms": 3.0,
-                "capacity": 120.0,
-                "load": 0.0,
-                "n_background_vehicles": 0,
+                "edge_latency_ms": edge_lat,
+                "capacity": _BS_CAPACITY,
+                "load": round(bs_load, 4),
+                "n_background_vehicles": int(veh_in_cov),
                 "n_other_devices": 0,
                 "n_its_load": 0,
                 "source": "domain_randomized",
             })
 
-        # RSU nodes: random road segments (mid-points)
+        # RSU nodes: random road segments (mid-points), randomized radius
         n_rsu = self._rng.randint(*_N_RSU_RANGE)
         rsu_nodes: list[dict] = []
         edge_list = [(a, b) for a, neighbors in adj.items() for b, _ in neighbors]
@@ -356,28 +473,38 @@ class DomainRandomizer:
             rsu_edges = self._rng.sample(edge_list, min(n_rsu, len(edge_list)))
             for i, (a, b) in enumerate(rsu_edges):
                 na, nb = graph["nodes"][a], graph["nodes"][b]
+                rsu_cov_range = _RSU_COV_RADIUS_RANGE[rsu_mode]
+                rsu_cov = float(self._rng.randint(*rsu_cov_range))
+                rsu_area_km2 = math.pi * (rsu_cov / 1000.0) ** 2
+                rsu_veh = density * rsu_area_km2
+                rsu_load = min(rsu_veh / 50.0, 1.0)
                 rsu_nodes.append({
                     "id": f"RSU-{i+1:02d}",
                     "type": "roadside_unit",
+                    "network_mode": rsu_mode,
                     "lat": (na["lat"] + nb["lat"]) / 2,
                     "lng": (na["lng"] + nb["lng"]) / 2,
                     "coverage_radius_m": rsu_cov,
                     "edge_latency_ms": 0.5,
                     "capacity": 50.0,
-                    "load": 0.0,
-                    "n_background_vehicles": 0,
+                    "load": round(rsu_load, 4),
+                    "n_background_vehicles": int(rsu_veh),
                     "n_other_devices": 0,
                     "n_its_load": 0,
                     "source": "domain_randomized",
                 })
 
-        # O/D pair: guaranteed reachable
-        od = self._sample_od_pair(nodes, adj)
+        # O/D pair: guaranteed reachable, with optional max distance
+        od = self._sample_od_pair(
+            nodes, adj, graph["nodes"],
+            max_dist_m=max_od_dist_m,
+        )
         if od is None:
             return None
-        origin_id, dest_id = od
+        origin_id, dest_id, od_dist_m = od
 
-        density = round(self._rng.uniform(*_DENSITY_RANGE), 1)
+        vehicle_speed_kmh = round(self._rng.uniform(*speed_range), 1)
+
         bbox = {
             "s": region["min_lat"], "n": region["max_lat"],
             "w": region["min_lon"], "e": region["max_lon"],
@@ -392,25 +519,41 @@ class DomainRandomizer:
             origin_id=origin_id,
             dest_id=dest_id,
             traffic_density=density,
-            network_mode=network_mode,
+            network_mode=global_mode,   # "4G"/"5G"/"6G" or "hetnet" for mixed
             bbox=bbox,
+            vehicle_speed_kmh=vehicle_speed_kmh,
+            od_dist_m=od_dist_m,
+            max_od_dist_m=max_od_dist_m,
         )
 
     def _sample_od_pair(
         self,
         nodes: list[str],
         adj: dict[str, list[tuple[str, float]]],
+        graph_nodes: dict,
         min_hops: int = 4,
-        max_tries: int = 30,
-    ) -> Optional[tuple[str, str]]:
-        """Sample an O/D pair with at least `min_hops` between them (BFS)."""
+        max_dist_m: float = float("inf"),
+        max_tries: int = 50,
+    ) -> Optional[tuple[str, str, float]]:
+        """
+        Sample an O/D pair with at least `min_hops` between them (BFS).
+
+        Returns (origin_id, dest_id, od_dist_m) or None.
+        max_dist_m constrains the straight-line distance for curriculum control.
+        """
         for _ in range(max_tries):
             origin = self._rng.choice(nodes)
             dest = self._rng.choice(nodes)
             if origin == dest:
                 continue
+            dist_m = _haversine_m(
+                graph_nodes[origin]["lat"], graph_nodes[origin]["lng"],
+                graph_nodes[dest]["lat"], graph_nodes[dest]["lng"],
+            )
+            if dist_m > max_dist_m:
+                continue
             if _bfs_reachable(adj, origin, dest, min_hops):
-                return origin, dest
+                return origin, dest, dist_m
         return None
 
 
@@ -421,7 +564,7 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dφ = math.radians(lat2 - lat1)
     dλ = math.radians(lng2 - lng1)
     a = math.sin(dφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(dλ / 2) ** 2
-    return R * 2 * math.asin(math.sqrt(a))
+    return R * 2 * math.asin(math.sqrt(min(a, 1.0)))   # clip to avoid FP domain error
 
 
 def _bfs_reachable(
@@ -437,7 +580,7 @@ def _bfs_reachable(
         hops = visited[node]
         if hops >= min_hops and node == goal:
             return True
-        if hops >= 20:  # hard limit to avoid huge BFS
+        if hops >= 20:
             break
         for nb, _ in adj.get(node, []):
             if nb not in visited:

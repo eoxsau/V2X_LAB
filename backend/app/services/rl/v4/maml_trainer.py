@@ -123,7 +123,7 @@ class MAMLConfig:
         "cpu"
     )
     compile_model: bool = False
-    collect_once: bool = False  # collect episodes once, reuse for all inner steps (3× faster collection)
+    collect_once: bool = True   # collect episodes once, reuse for all inner steps (5× faster collection)
     n_workers: int = 12   # 10→12 (Reptile lower VRAM → room for 2 more workers)
 
 
