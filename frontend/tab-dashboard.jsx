@@ -296,9 +296,14 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   // props를 쓰고, 다른 시트를 고르면 그 시트가 캡처해둔 result(읽기전용 스냅샷)를 보여준다.
   // 마운트 시점에는 항상 "현재 실행 시트"를 기본으로 보여준다(대시보드는 탭 전환마다 새로 마운트됨).
   const [viewSheetIdx, setViewSheetIdx] = useState(() => activeSheetIdx ?? 0);
+  // 시뮬레이션 탭에서 활성 시트가 바뀔 때(GNN-MAML 비교 실행 등) 대시보드도 따라감
+  useEffect(() => {
+    setViewSheetIdx(activeSheetIdx ?? 0);
+  }, [activeSheetIdx]);
   const sheetList = sheets || [];
   const isLiveSheet = viewSheetIdx === activeSheetIdx;
   const viewedSheet = sheetList[viewSheetIdx];
+  const _rlResult        = viewedSheet?.result?.rl_episode_result || null;
   const vehiclePos       = isLiveSheet ? liveVehiclePos       : (viewedSheet?.result?.vehiclePos || null);
   const networkTelemetry = isLiveSheet ? liveNetworkTelemetry : (viewedSheet?.result?.network_telemetry || null);
   const simHistory       = isLiveSheet ? liveSimHistory       : (viewedSheet?.result?.simHistory || []);
@@ -339,8 +344,10 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
 
   /* simLogs derived */
   const logs_safe      = simLogs ?? [];
-  const handoverCount  = logs_safe.filter(l => l.kind === 'handover').length;
-  const disconnCount   = logs_safe.filter(l => l.kind === 'disconnect').length;
+  const handoverCount  = logs_safe.filter(l => l.kind === 'handover').length
+                         || _rlResult?.handover_count || 0;
+  const disconnCount   = logs_safe.filter(l => l.kind === 'disconnect').length
+                         || (_rlResult ? _rlResult.disconnection_steps : 0);
   const recentLogs     = [...logs_safe].slice(-5).reverse();
 
   /* latency history & stats */
@@ -354,7 +361,7 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const validLats  = simHistory.filter(h => h.latency !== null).map(h => h.latency);
   const avgLatency = validLats.length > 0
     ? validLats.reduce((s, v) => s + v, 0) / validLats.length
-    : null;
+    : (_rlResult?.avg_latency_ms ?? null);  // rl_episode 결과 폴백
   const maxLatency = validLats.length > 0 ? Math.max(...validLats) : null;
 
   // resource_deficit_by_bs / bs_load_after_allocation는 백엔드 자원할당 로직이 내부 식별자(bs_id,
@@ -571,10 +578,19 @@ function Dashboard({ sim, go, vehiclePos: liveVehiclePos, networkTelemetry: live
   const currentNodeType = connNodeObj?.type ?? candidates[0]?.type ?? '—';
   const currentEdgeName = currentEdgeNet?.street_name || currentEdgeNet?.edge_id || '—';
   const egoAllocatedRb = networkTelemetry?.ego_allocated_rb ?? null;
-  const routingMode = networkTelemetry?.routing_mode || routeEdges?.routing_mode || simConfig?.algorithm_selection?.route_algorithm || '—';
-  const activeSelectionAlgo = simConfig?.algorithm_selection?.base_station_selection_algorithm || '—';
-  const activeLatencyAlgoNet = simConfig?.algorithm_selection?.latency_algorithm || '—';
-  const activeAllocAlgo = alloc?.algorithm_id || simConfig?.algorithm_selection?.resource_allocation_algorithm || '—';
+  const routingMode = networkTelemetry?.selected_algorithms?.route
+    || routeEdges?.selected_route_algorithm
+    || networkTelemetry?.routing_mode
+    || routeEdges?.routing_mode
+    || simConfig?.algorithm_selection?.route_algorithm
+    || '—';
+  const activeSelectionAlgo = networkTelemetry?.selected_algorithms?.base_station_selection
+    || simConfig?.algorithm_selection?.base_station_selection_algorithm || '—';
+  const activeLatencyAlgoNet = networkTelemetry?.selected_algorithms?.latency
+    || simConfig?.algorithm_selection?.latency_algorithm || '—';
+  const activeAllocAlgo = alloc?.algorithm_id
+    || networkTelemetry?.selected_algorithms?.resource_allocation
+    || simConfig?.algorithm_selection?.resource_allocation_algorithm || '—';
 
   const latencyValues = candidates.map(c => c.predicted_latency_ms).filter(v => typeof v === 'number');
   const distanceValues = candidates.map(c => c.distance_m).filter(v => typeof v === 'number');

@@ -14,6 +14,60 @@ import sys
 import threading
 import time
 
+
+class BatchStateProxy(dict):
+    """dict 서브클래스 — 배치 평가 스레드가 push_local()로 격리된 복사본을 주입하면
+    그 스레드 안에서만 모든 _state 읽기/쓰기가 로컬 복사본으로 리디렉션된다.
+    라이브 시뮬레이션(메인 스레드)은 base dict를 그대로 사용하므로 충돌이 없다."""
+    _tl: threading.local = threading.local()
+
+    def _ov(self):                  # 스레드-로컬 override dict
+        return getattr(self._tl, 'st', None)
+
+    # ── dict 프로토콜 — 모두 override 우선 ────────────────────────────────────
+    def __getitem__(self, k):
+        ov = self._ov(); return ov[k] if ov is not None else super().__getitem__(k)
+    def __setitem__(self, k, v):
+        ov = self._ov()
+        if ov is not None: ov[k] = v
+        else:               super().__setitem__(k, v)
+    def __contains__(self, k):
+        ov = self._ov(); return k in ov if ov is not None else super().__contains__(k)
+    def __delitem__(self, k):
+        ov = self._ov()
+        if ov is not None: del ov[k]
+        else:               super().__delitem__(k)
+    def __len__(self):
+        ov = self._ov(); return len(ov) if ov is not None else super().__len__()
+    def __iter__(self):
+        ov = self._ov(); return iter(ov) if ov is not None else super().__iter__()
+    def get(self, k, d=None):
+        ov = self._ov(); return ov.get(k, d) if ov is not None else super().get(k, d)
+    def pop(self, k, *a):
+        ov = self._ov(); return ov.pop(k, *a) if ov is not None else super().pop(k, *a)
+    def update(self, *a, **kw):
+        ov = self._ov()
+        if ov is not None: ov.update(*a, **kw)
+        else:               super().update(*a, **kw)
+    def setdefault(self, k, d=None):
+        ov = self._ov(); return ov.setdefault(k, d) if ov is not None else super().setdefault(k, d)
+    def items(self):
+        ov = self._ov(); return ov.items() if ov is not None else super().items()
+    def keys(self):
+        ov = self._ov(); return ov.keys() if ov is not None else super().keys()
+    def values(self):
+        ov = self._ov(); return ov.values() if ov is not None else super().values()
+
+    @classmethod
+    def push_local(cls, snapshot: dict) -> None:
+        """배치 시나리오 평가 시작 — 이 스레드의 _state를 snapshot으로 격리."""
+        cls._tl.st = snapshot
+
+    @classmethod
+    def pop_local(cls) -> None:
+        """배치 시나리오 평가 종료 — 이 스레드의 _state 격리 해제."""
+        cls._tl.st = None
+
 # 로그에 쓰이는 비-ASCII 문자(em dash, 한글 등)가 콘솔 기본 인코딩(한글 Windows=cp949)으로
 # 인코딩되지 않으면 print()가 UnicodeEncodeError를 던지고, 그게 호출 스레드를 통째로 죽인다
 # (시뮬레이션 스레드가 조용히 사라지는 원인이었음). start_backend.bat이 PYTHONUTF8을 설정하지만
@@ -526,7 +580,7 @@ async def _no_cache_html(request, call_next):
     return response
 
 # ── Global state ──────────────────────────────────────────────────────────────
-_state = {
+_state: BatchStateProxy = BatchStateProxy({
     "network_ready": False,
     "net_file": None,      # path to .net.xml
     "traffic_preparing": False,  # 백그라운드 N* 시드 산정 중 여부
@@ -580,7 +634,7 @@ _state = {
     "sim_origin": None,          # {"lat": float, "lng": float}
     "sim_dest": None,            # {"lat": float, "lng": float}
     "sim_vehicle_count": 1,      # total vehicles requested in SimStartRequest
-}
+})
 _ws_clients: list[WebSocket] = []
 _sim_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
@@ -1758,6 +1812,7 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
         "edge_history": list(_state.get("edge_history", [])),
         "custom_policy_debug": dict(_state.get("custom_policy_debug") or {}),
         "routing_mode": (_state.get("route_cost_result") or {}).get("routing_mode", ""),
+        "selected_algorithms": _state.get("selected_algorithms") or {},
         "ego_allocated_rb": _get_ego_allocated_rb(selected_node),
     }
     _state["building_debug"]["sample_links"] = [
@@ -5486,6 +5541,18 @@ def regions_dong(parent_osm_id: Optional[int] = None):
     return {"regions": get_dong_list(parent_osm_id)}
 
 
+@app.get("/api/regions/by-coord")
+def regions_by_coord(lat: float, lon: float, level: int = 8):
+    """좌표(lat/lon)로 행정구역 즉시 반환. level=8(동) 우선, 없으면 6(시군구)으로 fallback.
+    FastAPI 라우팅: 리터럴 경로(/by-coord)를 {osm_id} 파라미터 경로보다 먼저 등록해야 한다."""
+    region = get_region_by_bbox(lat, lon, level)
+    if not region and level == 8:
+        region = get_region_by_bbox(lat, lon, 6)
+    if not region:
+        raise HTTPException(status_code=404, detail=f"좌표 ({lat:.5f}, {lon:.5f})에 해당하는 행정구역을 찾을 수 없습니다.")
+    return {"region": region}
+
+
 @app.get("/api/regions/{osm_id}")
 def regions_detail(osm_id: int):
     """단일 행정구역 상세 정보"""
@@ -5552,40 +5619,52 @@ async def setup_network_region(req: RegionSetupRequest):
         reset_simulation_state()
 
         try:
-            # Step 1: 로컬 PBF에서 OSM 추출
-            osm_file = await asyncio.get_event_loop().run_in_executor(
-                None,
-                extract_osm_from_pbf,
-                req.osm_id,
-                pbf_path,
-                WORK_DIR,
-            )
+            # Fast-path: .osm + .net.xml 모두 캐시돼 있으면 osmium + netconvert를 건너뜀
+            # extract_osm_from_pbf 내부 캐시 경로와 동일한 파일명 규칙을 따른다.
+            safe_name = region["name_ko"].replace("/", "_").replace(" ", "_")
+            _cached_osm = WORK_DIR / f"region_{req.osm_id}_{safe_name}.osm"
+            _cached = _cached_osm.exists() and net_file.exists()
 
-            # Step 2: mock graph 파싱
-            mock_graph = await asyncio.get_event_loop().run_in_executor(
-                None, load_mock_graph, osm_file
-            )
+            if _cached:
+                osm_file = _cached_osm
+                print(f"[REGION] cache hit: {region['name_ko']} — osmium + netconvert 건너뜀", flush=True)
+                mock_graph = await asyncio.get_event_loop().run_in_executor(
+                    None, load_mock_graph, osm_file
+                )
+            else:
+                # Step 1: 로컬 PBF에서 OSM 추출
+                osm_file = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    extract_osm_from_pbf,
+                    req.osm_id,
+                    pbf_path,
+                    WORK_DIR,
+                )
 
-            # Step 3: netconvert로 SUMO 네트워크 변환
-            # 이미 변환해둔 게 있으면 그대로 쓴다(행정구역은 osm_id로 이름이 고정이라 안전).
-            # ⚠️ 속도만의 문제가 아니다 — netconvert는 같은 입력이라도 결과가 미세하게
-            #    달라져서, 새로 만들면 교통 캐시(net 바이트 해시 키)가 통째로 빗나간다.
-            #    미리 만들어둔 교통을 시연에서 쓰려면 net 파일이 그대로여야 한다.
-            try:
-                if net_file.exists() and net_file.stat().st_size > 0:
-                    print(f"[SETUP] 이미 변환해둔 도로망 재사용: {net_file.name}", flush=True)
-                else:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, netconvert, osm_file, net_file, bbox
-                    )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"SUMO netconvert 실패 ({region['name_ko']}): {exc} "
-                        "— 구역을 더 작게 줄여보거나 다른 구역을 선택해주세요."
-                    ),
-                ) from exc
+                # Step 2: mock graph 파싱
+                mock_graph = await asyncio.get_event_loop().run_in_executor(
+                    None, load_mock_graph, osm_file
+                )
+
+                # Step 3: netconvert로 SUMO 네트워크 변환
+                # ⚠️ 이미 변환해둔 게 있으면 그대로 쓴다 — netconvert는 같은 입력이라도
+                #    결과가 미세하게 달라져서, 새로 만들면 교통 캐시(net 바이트 해시 키)가
+                #    통째로 빗나간다. 미리 만들어둔 교통을 시연에서 쓰려면 net이 그대로여야 함.
+                try:
+                    if net_file.exists() and net_file.stat().st_size > 0:
+                        print(f"[SETUP] 이미 변환해둔 도로망 재사용: {net_file.name}", flush=True)
+                    else:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, netconvert, osm_file, net_file, bbox
+                        )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"SUMO netconvert 실패 ({region['name_ko']}): {exc} "
+                            "— 구역을 더 작게 줄여보거나 다른 구역을 선택해주세요."
+                        ),
+                    ) from exc
 
             _state["osm_file"] = str(osm_file)
             _state["mock_graph"] = mock_graph
@@ -5625,6 +5704,7 @@ async def setup_network_region(req: RegionSetupRequest):
 
             return {
                 "ok": True,
+                "cached": _cached,
                 "region": region["name_ko"],
                 "net_file": str(net_file),
                 "area_km2": area_km2,
@@ -5655,10 +5735,11 @@ def _prepare_simulation_run(req: SimStartRequest) -> random.Random:
     self-seeded from OS entropy if req.seed is None) — pass this into
     _evaluate_mock_route() and any other per-run sampling.
     """
-    # Reload network nodes from the DB so any user-created base stations
-    # added since the last setup/run are included as connection candidates.
-    _state["network_nodes"] = merged_network_nodes()
-    _rebuild_v4_graph()
+    # 배치 워커(_run_scenario_batch)가 이미 배치 시작 시 1번 로드했으면 중복 생략 —
+    # 그렇지 않으면(단일 라이브 시뮬레이션 등) 매번 최신 노드를 DB에서 새로 읽는다.
+    if not _state.get("_batch_nodes_preloaded"):
+        _state["network_nodes"] = merged_network_nodes()
+        _rebuild_v4_graph()
 
     _state["sim_running"] = True
     _state["vehicle_pos"] = None
@@ -5891,6 +5972,39 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
             print(f"[SIM] Look-ahead route: {len(path)} nodes", flush=True)
         except Exception as _la_exc:
             print(f"[SIM] Look-ahead routing failed: {_la_exc} — Dijkstra baseline", flush=True)
+
+    elif _route_algo == "rl_routing" and RL_AVAILABLE:
+        try:
+            # V4 GNN adapter — 서버 기동 시 로드된 모델 (PPO/DQN registry가 아님)
+            from app.services.rl.rl_trainer import _v4_adapter as _rl_adap
+            if _rl_adap is not None and _rl_adap.is_ready:
+                _bs_for_rl = _state.get("network_nodes") or []
+                _type_map_rl = {"5G": "5G", "4G": "4G", "6G": "6G", "bs": "5G", "BS": "5G"}
+                _net_mode_rl = _type_map_rl.get(
+                    next((n.get("type", "5G") for n in _bs_for_rl if n.get("type")), "5G"), "5G"
+                )
+                _rl_adap.build_graph(_state["mock_graph"], _bs_for_rl, end_node, network_mode=_net_mode_rl)
+                _rl_adap.set_episode_start(start_node)
+                _rl_env = V2XRoutingEnv(
+                    graph=_state["mock_graph"],
+                    road_nodes=_state["mock_graph"].get("nodes", {}),
+                    bs_nodes=_bs_for_rl,
+                    origin_id=start_node,
+                    dest_id=end_node,
+                )
+                _rl_ep = run_episode(_rl_env, policy="v4_gnn", record_trajectory=True)
+                _rl_path = [step.node_id for step in (_rl_ep.trajectory or [])]
+                if len(_rl_path) >= 2:
+                    _rl_coords = mock_route_coords(_state["mock_graph"], _rl_path)
+                    if _rl_coords:
+                        path = _rl_path
+                        route_coords = _rl_coords
+                        _mock_routing_mode = "rl_routing"
+                        print(f"[SIM] V4 GNN RL route: {len(path)} nodes, arrived={_rl_ep.arrived}", flush=True)
+            else:
+                print("[SIM] RL routing: V4 adapter not ready — Dijkstra baseline", flush=True)
+        except Exception as _rl_exc:
+            print(f"[SIM] RL routing failed: {_rl_exc} — Dijkstra baseline", flush=True)
 
     _state["route_edges"] = path
 
@@ -6162,6 +6276,10 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
             "simulation_summary": summary,
             "network_telemetry": telemetry,
         })
+    _bg_out = [
+        {"id": v["id"], "lat": v["lat"], "lng": v["lng"], "speed": v.get("speed_kmh", v.get("speed", 30))}
+        for v in (_state.get("background_vehicles") or [])
+    ]
     return {
         "mode": "route_metrics",
         "route_coords": _state.get("route_coords") or [],
@@ -6170,6 +6288,7 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
         "simulation_summary": summary,
         "network_telemetry": telemetry,
         "allocation_result": alloc_result,
+        "background_vehicles": _bg_out,
     }
 
 
@@ -6229,16 +6348,55 @@ def _evaluate_rl_scenario(spec: ScenarioSpec) -> dict:
             env, policy=spec.policy, seed=spec.seed, record_trajectory=spec.record_trajectory,
         )
         payload = result.to_dict()
+        # trajectory(node_id 시퀀스) → route_coords([lat, lng] 리스트) 변환
+        # 배치 비교 지도에서 rl_episode 경로도 route_metrics와 동일하게 표시할 수 있도록.
+        route_coords: list = []
+        if spec.origin:
+            route_coords.append([spec.origin.get("lat"), spec.origin.get("lng")])
+        for step in (result.trajectory or []):
+            nd = road_nodes.get(step.node_id)
+            if nd:
+                route_coords.append([float(nd["lat"]), float(nd["lng"])])
     else:
         payload = run_episodes(
             env, n_episodes=spec.n_episodes, policy=spec.policy,
             seed=spec.seed, record_trajectory=spec.record_trajectory,
         )
-    return {"mode": "rl_episode", **payload}
+        route_coords = []
+
+    # 대시보드·시트가 network_telemetry 없이 빈 화면이 되는 문제 방지:
+    # origin 위치 기준으로 1회 telemetry 계산 (route_metrics와 동일한 방식)
+    _rl_telemetry = None
+    try:
+        if spec.origin:
+            update_network_telemetry(spec.origin)
+            _rl_telemetry = _state.get("network_telemetry")
+    except Exception:
+        pass
+
+    # 배경차량 스냅샷 — route_metrics와 동일 포맷으로 포함
+    _rl_bg = [
+        {"id": v["id"], "lat": v["lat"], "lng": v["lng"],
+         "speed": v.get("speed_kmh", v.get("speed", 30))}
+        for v in (_state.get("background_vehicles") or [])
+    ]
+
+    return {
+        "mode": "rl_episode",
+        "route_coords": route_coords,
+        "network_telemetry": _rl_telemetry,
+        "background_vehicles": _rl_bg,
+        **payload,
+    }
 
 
 def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
-    """배치 워커(백그라운드 스레드). _state를 시나리오마다 재사용/덮어쓰므로 반드시 순차 실행."""
+    """배치 워커(백그라운드 스레드).
+
+    각 시나리오는 BatchStateProxy.push_local()로 격리된 자체 _state 복사본을 사용하므로
+    라이브 시뮬레이션의 글로벌 _state를 건드리지 않는다.
+    시나리오 평가는 여전히 순차 실행(한 스레드 안에서 push_local → eval → pop_local 반복).
+    """
     global _active_batch_id
     run = _batch_runs[batch_id]
 
@@ -6248,37 +6406,64 @@ def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
         run["stage"] = stage
         run["message"] = message
 
-    for i, spec in enumerate(scenarios):
-        item_id = spec.id or spec.label or str(i)
-        run["current_index"] = i
-        run["current_label"] = spec.label or item_id
-        _progress("preparing", "시나리오를 준비하는 중…")
-        # 평가 함수(_evaluate_route_scenario/_evaluate_rl_scenario)는 결과만 반환하므로,
-        # 원본 요청 파라미터(vehicle_count/seed/origin 등)는 여기서 같이 기록해야 프런트의
-        # 시나리오 비교 카드가 결과만 보고도 "무엇을 입력해서 나온 결과인지" 알 수 있다.
-        base_info = {
-            "index": i, "id": item_id, "label": spec.label, "mode": spec.mode,
-            "vehicle_count": spec.vehicle_count, "seed": spec.seed,
-            "origin": spec.origin, "dest": spec.dest,
-            "origin_id": spec.origin_id, "dest_id": spec.dest_id,
-        }
-        try:
-            if spec.mode == "rl_episode":
-                _progress("evaluating", "RL 정책을 평가하는 중…")  # 이 모드는 교통이 필요 없다
-                result = _evaluate_rl_scenario(spec)
-            else:
-                result = _evaluate_route_scenario(spec, scenario_id=item_id, batch_id=batch_id,
-                                                  progress=_progress)
-            run["results"].append({**base_info, "status": "done", **result})
-        except Exception as exc:
-            run["results"].append({**base_info, "status": "error", "error": str(exc)})
-        run["completed"] = i + 1
-    run["status"] = "completed"
-    run["stage"] = None
-    run["message"] = None
-    run["current_label"] = None
-    run["ended_at"] = datetime.now(timezone.utc).isoformat()
-    _active_batch_id = None
+    try:
+        # 배치 전체에서 DB 쿼리 + V4 그래프 빌드를 1회만 수행 — 모든 시나리오가 공유한다.
+        batch_nodes = merged_network_nodes()
+        _prev_nodes = dict.__getitem__(_state, "network_nodes")
+        dict.__setitem__(_state, "network_nodes", batch_nodes)
+        _rebuild_v4_graph()
+        dict.__setitem__(_state, "network_nodes", _prev_nodes)
+        shared_mock_graph = dict.__getitem__(_state, "mock_graph")
+
+        for i, spec in enumerate(scenarios):
+            item_id = spec.id or spec.label or str(i)
+            run["current_index"] = i
+            run["current_label"] = spec.label or item_id
+            _progress("preparing", "시나리오를 준비하는 중…")
+            base_info = {
+                "index": i, "id": item_id, "label": spec.label, "mode": spec.mode,
+                "vehicle_count": spec.vehicle_count, "seed": spec.seed,
+                "origin": spec.origin, "dest": spec.dest,
+                "origin_id": spec.origin_id, "dest_id": spec.dest_id,
+                "algorithm_config": spec.algorithm_config or {},
+            }
+
+            # 시나리오별 격리 state — BatchStateProxy로 글로벌 _state와 완전 분리
+            scenario_st: dict = dict(dict.items(_state))
+            scenario_st["mock_graph"]             = shared_mock_graph
+            scenario_st["network_nodes"]          = [dict(n) for n in batch_nodes]
+            scenario_st["_batch_nodes_preloaded"] = True
+            scenario_st["sim_running"]            = True
+            scenario_st["route_coords"]           = []
+            scenario_st["route_edges"]            = []
+            scenario_st["background_vehicles"]    = []
+            scenario_st["error"]                  = None
+            scenario_st["warning"]                = None
+
+            try:
+                BatchStateProxy.push_local(scenario_st)
+                try:
+                    if spec.mode == "rl_episode":
+                        _progress("evaluating", "RL 정책을 평가하는 중…")
+                        result = _evaluate_rl_scenario(spec)
+                    else:
+                        result = _evaluate_route_scenario(spec, scenario_id=item_id,
+                                                         batch_id=batch_id, progress=_progress)
+                finally:
+                    BatchStateProxy.pop_local()
+                run["results"].append({**base_info, "status": "done", **result})
+            except Exception as exc:
+                BatchStateProxy.pop_local()
+                run["results"].append({**base_info, "status": "error", "error": str(exc)})
+            run["completed"] = i + 1
+
+        run["status"] = "completed"
+        run["stage"] = None
+        run["message"] = None
+        run["current_label"] = None
+        run["ended_at"] = datetime.now(timezone.utc).isoformat()
+    finally:
+        _active_batch_id = None
 
 
 @app.post("/api/scenarios/batch")
@@ -6288,8 +6473,8 @@ def start_scenario_batch(req: ScenarioBatchRequest):
     각 시나리오는 mode="route_metrics"(경로/자원할당/기지국선택 비교, lat/lng 기반) 또는
     mode="rl_episode"(RL 베이스라인 정책 평가, 도로그래프 노드ID 기반) 중 하나.
 
-    _state를 공유하는 단일 순차 실행이므로 동시에 배치 하나만 돌 수 있고, 실행 중에는
-    실시간 /api/simulation/start도 막힌다(서로 같은 _state를 덮어써서 충돌하기 때문).
+    BatchStateProxy로 _state를 격리하므로 라이브 시뮬레이션과 동시에 실행 가능.
+    배치끼리의 동시 실행은 여전히 막는다(_active_batch_id 뮤텍스).
 
     즉시 batch_id를 반환하고 백그라운드 스레드에서 순차 실행 — 진행 상황과 결과는
     GET /api/scenarios/batch/{batch_id}로 폴링.
@@ -6306,11 +6491,6 @@ def start_scenario_batch(req: ScenarioBatchRequest):
         raise HTTPException(status_code=400, detail="배치당 최대 100개 시나리오까지 지원합니다.")
     if _active_batch_id is not None:
         raise HTTPException(status_code=409, detail="다른 배치가 이미 실행 중입니다.")
-    if _sim_thread and _sim_thread.is_alive():
-        raise HTTPException(
-            status_code=409,
-            detail="실시간 시뮬레이션이 진행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 먼저 종료하세요.",
-        )
 
     batch_id = str(uuid4())
     _batch_runs[batch_id] = {

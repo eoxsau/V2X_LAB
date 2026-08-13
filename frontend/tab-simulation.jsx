@@ -31,6 +31,7 @@ const BS_SELECTION_ALGORITHMS = [
   'load_balanced_bs',
   'look_ahead_bs_selection',
   'rl_based_bs_selection',
+  'v4_gnn',                  // GNN-MAML 직접 BS 선택
 ];
 const RESOURCE_ALLOCATION_ALGORITHMS = [
   'equal_allocation',
@@ -53,6 +54,7 @@ const DEFAULT_ALGORITHM_SELECTION = {
 const UNIMPLEMENTED_ROUTE_ALGORITHMS = new Set([]);
 
 function formatAlgorithmName(name) {
+  if (!name) return '—';
   return name.replaceAll('_', ' ').replace(/\b\w/g, (ch) => ch.toUpperCase());
 }
 
@@ -79,14 +81,19 @@ function scbSaveBatches(list) {
 }
 
 // 엑셀 시트탭 스트립 — 더블클릭으로 이름 수정, "+"로 새 시트, "전체 비교 실행"으로 일괄 평가.
-function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView, hasEnv }) {
+function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView, hasEnv, activeAlgorithms }) {
   const [editingIdx, setEditingIdx] = useState(null);
   const [editValue, setEditValue] = useState('');
 
-  function sheetAlgoLabel(s) {
-    const algo = s.config?.selectedAlgorithms?.route || s.config?.selectedAlgorithms?.route_algorithm;
+  function sheetAlgoLabel(s, isActive) {
+    // 활성 시트는 저장된 config 대신 현재 UI에서 선택 중인 알고리즘을 우선 표시
+    const algo = (isActive && activeAlgorithms?.route)
+      ? activeAlgorithms.route
+      : (s.config?.selectedAlgorithms?.route || s.config?.selectedAlgorithms?.route_algorithm
+         || s.result?.routeEdges?.selected_route_algorithm
+         || s.result?.routeEdges?.routing_mode);
     if (!algo) return null;
-    const SHORT = { dijkstra: 'Dijkstra', astar: 'A*', k_shortest_path: 'K-Path', network_aware_routing: 'Net-Aware', look_ahead_routing: 'Lookahead', rl_routing: 'RL' };
+    const SHORT = { dijkstra: 'Dijkstra', astar: 'A*', k_shortest_path: 'K-Path', network_aware_routing: 'Net-Aware', look_ahead_routing: 'Lookahead', rl_routing: 'RL', baseline_dijkstra: 'Dijkstra' };
     return SHORT[algo] ?? algo;
   }
 
@@ -109,7 +116,7 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
       {/* 시트 탭 스트립 */}
       <div style={{ height: 40, display: 'flex', alignItems: 'center', padding: '0 8px', gap: 3, overflowX: 'auto' }}>
         {sheets.map((s, i) => {
-          const algoLabel = sheetAlgoLabel(s);
+          const algoLabel = sheetAlgoLabel(s, i === activeIdx);
           return (
             <div
               key={s.id}
@@ -147,7 +154,8 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
                   fontWeight: 500,
                 }}>{algoLabel}</span>
               )}
-              {s.status === 'ran' && <span title="실행 완료" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--good)', flex: '0 0 auto' }} />}
+              {s.status === 'ran'   && <span title="실행 완료" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--good)',  flex: '0 0 auto' }} />}
+              {s.status === 'error' && <span title={s.errorMsg || '평가 실패'} style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--bad)',   flex: '0 0 auto' }} />}
               {sheets.length > 1 && (
                 <button
                   onClick={e => { e.stopPropagation(); onRemove(i); }}
@@ -185,6 +193,56 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
           {batchRunning ? <><Icon.reset size={12} className="spin" /> 비교 실행 중…</> : <><Icon.compare size={12} /> 전체 비교 실행 ({sheets.length})</>}
         </button>
       </div>
+    </div>
+  );
+}
+
+// 시트별 알고리즘 선택 바 — 시트 탭 스트립 아래에 붙는 compact 드롭다운 행.
+// 각 드롭다운은 selectedAlgorithms의 키를 직접 수정 → 시트 전환 시 config에 저장됨.
+function AlgorithmSheetBar({ selectedAlgorithms, onChange }) {
+  const SHORT = {
+    dijkstra: 'Dijkstra', astar: 'A*', k_shortest_path: 'K-Path',
+    network_aware_routing: 'Net-Aware', look_ahead_routing: 'Lookahead', rl_routing: 'RL-Route',
+    rsrp_max: 'RSRP Max', nearest_bs: 'Nearest', lowest_latency_bs: 'Low-Lat',
+    strongest_signal_bs: 'Strong-Sig', load_balanced_bs: 'Load-Bal',
+    look_ahead_bs_selection: 'Lookahead', rl_based_bs_selection: 'RL-BS', v4_gnn: 'GNN-MAML',
+    tech_latency_v31: 'v3.1', distance_based_latency: 'Dist', load_aware_latency: 'Load',
+    blockage_aware_latency: 'Block', mec_aware_latency: 'MEC', full_composite_latency: 'Full',
+    equal_allocation: 'Equal', proportional_allocation: 'Prop', traffic_aware_allocation: 'Traffic',
+    load_balancing_allocation: 'LB', latency_minimizing_allocation: 'Min-Lat',
+    priority_based_allocation: 'Priority', custom_allocation_algorithm: 'Custom',
+  };
+
+  const sel = selectedAlgorithms || DEFAULT_ALGORITHM_SELECTION;
+  const field = (key, label, options) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 3, flex: '0 0 auto' }}>
+      <span style={{ fontSize: 9, color: 'var(--ink-4)', whiteSpace: 'nowrap', letterSpacing: '0.02em' }}>{label}</span>
+      <select
+        value={sel[key] || ''}
+        onChange={e => onChange({ ...sel, [key]: e.target.value })}
+        style={{
+          fontSize: 10, padding: '1px 3px', border: '1px solid var(--border)',
+          borderRadius: 4, background: 'var(--surface)', color: 'var(--ink-2)',
+          maxWidth: 100, cursor: 'pointer', outline: 'none',
+        }}
+      >
+        {options.map(o => <option key={o} value={o}>{SHORT[o] || o}</option>)}
+      </select>
+    </div>
+  );
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 8, padding: '3px 12px',
+      borderBottom: '1px solid var(--border)', background: 'var(--surface-2)',
+      overflowX: 'auto', flexShrink: 0,
+    }}>
+      <span style={{ fontSize: 9, color: 'var(--ink-4)', flex: '0 0 auto', fontWeight: 600, letterSpacing: '0.04em' }}>이 시트 알고리즘</span>
+      <span style={{ width: 1, height: 12, background: 'var(--border)', flex: '0 0 auto' }} />
+      {field('route', '경로', ROUTE_ALGORITHMS)}
+      {field('base_station_selection', '기지국', BS_SELECTION_ALGORITHMS)}
+      {field('latency', '지연', LATENCY_ALGORITHMS)}
+      {field('resource_allocation', '자원', RESOURCE_ALLOCATION_ALGORITHMS)}
     </div>
   );
 }
@@ -697,10 +755,64 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   // ── 시뮬레이션 시트 (Phase 5) ──────────────────────────────────
   // sheets/activeSheetIdx는 App(app.jsx)으로 끌어올려져 props로 내려온다 — 대시보드 탭도
   // "지금 실행 중인 시트가 뭔지" 같은 출처를 봐야 시트별로 분리해서 보여줄 수 있기 때문.
+  //
+  // activeSheetIdxRef: pollSheetBatch 같은 setInterval 클로저에서 항상 최신 activeSheetIdx를
+  // 읽기 위한 ref. prop이라 직접 ref로 못 쓰므로 effect로 동기화.
+  const activeSheetIdxRef = useRef(activeSheetIdx);
+  useEffect(() => { activeSheetIdxRef.current = activeSheetIdx; }, [activeSheetIdx]);
+
   const [batchRunning, setBatchRunning] = useState(false);
   const [gridView, setGridView] = useState(false); // CCTV grid view — all sheets side by side
   const [batchError, setBatchError] = useState(null);
   const prevArrived = useRef(false);
+
+  // ── 시트별 독립 루프 애니메이션 ──────────────────────────────────────
+  // 배치 결과가 있는 모든 시트는 동시에 루프로 돌아간다. 사용자가 시트를 전환하면
+  // 해당 시트의 현재 루프 위치(step)에서 차량 마커가 지도에 표시된다.
+  // 라이브 시뮬레이션 시작 시에는 모든 루프를 일시 중단하고 WebSocket 위치를 우선한다.
+  const sheetAnimRef    = useRef({}); // { [sheetId]: { coords, step, intervalId } }
+  const sheetsRef       = useRef(sheets);
+  const simRunningRef   = useRef(sim.running);
+  useEffect(() => { sheetsRef.current = sheets; }, [sheets]);
+  useEffect(() => { simRunningRef.current = sim.running; }, [sim.running]);
+
+  function stopSheetAnim(sheetId) {
+    const a = sheetAnimRef.current[sheetId];
+    if (a?.intervalId) { clearInterval(a.intervalId); sheetAnimRef.current[sheetId] = { ...a, intervalId: null }; }
+  }
+
+  function stopAllAnims() {
+    Object.keys(sheetAnimRef.current).forEach(stopSheetAnim);
+    sheetAnimRef.current = {};
+  }
+
+  function startSheetAnim(sheetId, coords, fromStep) {
+    stopSheetAnim(sheetId);
+    if (!coords?.length || coords.length < 2) return;
+    const total   = coords.length;
+    const msPerPt = Math.max(60, Math.min(250, 9000 / total)); // 60–250ms/point, 경로 길이에 맞게
+    let step = (fromStep ?? sheetAnimRef.current[sheetId]?.step) || 0;
+
+    const intervalId = setInterval(() => {
+      if (simRunningRef.current) return; // 라이브 시뮬레이션 중엔 WebSocket 위치 우선
+      step = (step + 1) % total;         // 루프: 끝까지 가면 처음으로
+      sheetAnimRef.current[sheetId] = { ...sheetAnimRef.current[sheetId], step };
+
+      // 지금 이 시트가 화면에 표시 중인 시트일 때만 vehiclePos 업데이트
+      const activeIdx = activeSheetIdxRef.current;
+      if (sheetsRef.current[activeIdx]?.id === sheetId) {
+        const [lat, lng] = coords[step];
+        setVehiclePos({ lat, lng, progress: step / (total - 1), arrived: false, speed: 30, current_edge_id: null });
+      }
+    }, msPerPt);
+
+    sheetAnimRef.current[sheetId] = { coords, step, intervalId };
+  }
+
+  function startRouteReplay(coords) { /* 하위 호환 — 현재 활성 시트에 대해 startSheetAnim 호출 */ }
+
+  // 라이브 시뮬레이션 시작 시 재생 중이던 모든 애니메이션 중단
+  useEffect(() => { if (sim.running) stopAllAnims(); }, [sim.running]);
   const currentRunIdRef = useRef(null); // /api/simulation/start가 돌려준 DB simulation_runs.id — 도착 시 시트 데이터를 같은 행에 영구 저장하는 데 씀
 
   // 교통 준비 후 **자동 시작**된 런은 시작 응답이 "preparing"이라 run_id가 없었다.
@@ -742,23 +854,35 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   function loadSheetConfig(sheet) {
     const c = sheet.config || {};
     // 구역(OSM 도로망)은 모든 시트가 공유하지만, 그 위의 세부 설정 — 출발지·도착지·
-    // 기지국/RSU·알고리즘·교통량 — 은 **시트마다 독립**이다(2026-08-12 사용자 결정).
-    // 시나리오 어시스턴트가 시나리오 1개를 시트 1개로 적용하므로, 시트를 넘길 때
-    // 출발·도착점까지 같이 따라와야 지도에 그 시나리오가 그대로 보인다.
+    // 기지국/RSU·알고리즘·교통량 — 은 시트마다 독립이다(2026-08-12).
     if (c.origin !== undefined) { setOrigin(c.origin); setOriginDone(!!c.origin); }
     if (c.dest !== undefined)   { setDest(c.dest);     setDestDone(!!c.dest); }
     if (c.demandScalePct != null) setDemandScalePct(c.demandScalePct);
     restoreSheetStations(c.stations);
-    setSelectedAlgorithms(c.selectedAlgorithms || DEFAULT_ALGORITHM_SELECTION);
+    setSelectedAlgorithms({ ...DEFAULT_ALGORITHM_SELECTION, ...(c.selectedAlgorithms || {}) });
     setNetworkGen(c.networkGen || '5g');
     if (c.simConfig) setSimConfig(c.simConfig);
     setNetworkTelemetry(sheet.result?.network_telemetry || null);
     setRouteCoords(sheet.result?.routeCoords || []);
-    setVehiclePos(sheet.result?.vehiclePos || null);
-    if (setRouteEdges)  setRouteEdges(sheet.result?.routeEdges ?? null);
-    if (setSimLogs)     setSimLogs(sheet.result?.simLogs ?? []);
-    if (setSimHistory)  setSimHistory(sheet.result?.simHistory ?? []);
+    if (setRouteEdges)         setRouteEdges(sheet.result?.routeEdges ?? null);
+    if (setSimLogs)            setSimLogs(sheet.result?.simLogs ?? []);
+    if (setSimHistory)         setSimHistory(sheet.result?.simHistory ?? []);
+    if (setBackgroundVehicles) setBackgroundVehicles(sheet.result?.backgroundVehicles || []);
     prevArrived.current = !!sheet.result?.vehiclePos?.arrived;
+
+    // 배치 결과 시트 전환: 이미 루프 중인 애니메이션의 현재 위치를 vehiclePos에 즉시 반영
+    const isBatchResult = sheet.result?.routeCoords?.length >= 2 && !sheet.result?.simHistory?.length;
+    if (isBatchResult) {
+      const anim = sheetAnimRef.current[sheet.id];
+      const coords = sheet.result.routeCoords;
+      const step   = anim?.step || 0;
+      const [lat, lng] = coords[step];
+      setVehiclePos({ lat, lng, progress: step / (coords.length - 1), arrived: false, speed: 30, current_edge_id: null });
+      // 아직 루프가 없으면 새로 시작 (결과 도착 후 최초 전환)
+      if (!anim?.intervalId) startSheetAnim(sheet.id, coords);
+    } else {
+      setVehiclePos(sheet.result?.vehiclePos || null);
+    }
   }
 
   // 시나리오 어시스턴트가 시트를 만들고 activeSheetIdx를 **밖에서** 바꿔놓는 경로가 있다.
@@ -779,9 +903,17 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     // 웹소켓으로 계속 들어와 방금 비운 vehiclePos를 되돌려놓고, 나중에 도착하면 "지금"
     // 활성화된(전혀 다른) 시트로 잘못 캡처되는 문제가 있었다 — 전환 전에 반드시 멈춘다.
     if (sim.running) { try { await fetch(`${api}/api/simulation/stop`, { method: 'POST' }); } catch (_) {} }
-    const next = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
-    setSheets(next); saveSimSheets(next);
-    loadSheetConfig(next[idx]);
+
+    // Bug-fix: functional update를 써서 pollSheetBatch가 동시에 기록한 결과를 덮어쓰지 않는다.
+    // sheets.map(...)을 직접 쓰면 stale closure의 sheets를 setSheets에 넣어
+    // poll이 업데이트한 result를 지울 수 있다. functional update(prev)는 항상 최신 state를 받는다.
+    // loadSheetConfig도 stale closure가 아닌 sheetsRef.current(항상 최신)를 사용한다.
+    setSheets(prev => {
+      const next = prev.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
+      saveSimSheets(next);
+      return next;
+    });
+    loadSheetConfig(sheetsRef.current[idx]);
     setActiveSheetIdx(idx);
     dispatch({ type: 'pause' });
   }
@@ -874,20 +1006,29 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const allSheets = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
     setSheets(allSheets); saveSimSheets(allSheets);
 
-    // 모든 시트에 공유 출발지·도착지·차량 수 적용 — 알고리즘만 시트별로 달라짐
-    const specs = allSheets.map(s => ({
-        id: s.id,
-        label: s.name,
+    // 시트별 mode를 존중: rl_episode 시트(GNN-MAML)는 RL 라우팅, 나머지는 route_metrics
+    const specs = allSheets.map(s => {
+      if (s.config?.mode === 'rl_episode') {
+        return {
+          id: s.id, label: s.name,
+          mode: 'rl_episode',
+          policy: s.config.policy || 'v4_gnn',
+          origin, dest,
+          record_trajectory: true,
+        };
+      }
+      return {
+        id: s.id, label: s.name,
         mode: 'route_metrics',
-        origin: origin,
-        dest: dest,
-        vehicle_count: 1,   // 타겟 차량만. 배경 차량은 demand_scale_pct가 정한다(백엔드 생성 교통)
+        origin, dest,
+        vehicle_count: 1,
         algorithm_config: s.config.selectedAlgorithms || {},
         simulation_config: {
           ...(s.config.simConfig || {}),
           policy_options: { ...(s.config.simConfig?.policy_options || {}), network_mode: (s.config.networkGen || '5g').toUpperCase() },
         },
-      }));
+      };
+    });
     if (specs.length === 0) { setBatchError('시트가 없습니다.'); return; }
 
     // 이전 런의 경로·기록이 새 배치와 겹치지 않도록 먼저 지운다
@@ -912,66 +1053,124 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   }
 
   function pollSheetBatch(batchId, onDone) {
+    let prevProcessed = 0;
+
+    const routeEdgesFrom = (r) => {
+      // rl_episode 결과: route_cost_result 없음 → rl_episode 필드로 합성
+      if (!r?.route_cost_result && r?.mode === 'rl_episode') {
+        return {
+          per_edge:               [],
+          coverage_risk:          null,
+          avg_latency_ms:         r.avg_latency_ms ?? null,
+          handover_count:         r.handover_count ?? null,
+          total_cost:             null,
+          total_distance_m:       r.final_dist_m ?? null,
+          routing_mode:           'rl_routing',
+          selected_route_algorithm: r.policy || 'v4_gnn',
+        };
+      }
+      return r?.route_cost_result ? {
+      per_edge:                  r.route_cost_result.per_edge || [],
+      coverage_risk:             r.route_cost_result.coverage_risk ?? null,
+      avg_latency_ms:            r.route_cost_result.avg_latency_ms ?? null,
+      handover_count:            r.route_cost_result.handover_count ?? null,
+      total_cost:                r.route_cost_result.total_cost ?? null,
+      total_distance_m:          r.route_cost_result.total_distance_m ?? null,
+      routing_mode:              r.route_cost_result.routing_mode ?? null,
+      // 실제로 실행된 알고리즘(routing_mode)과 별개로 사용자가 선택한 알고리즘 기록
+      selected_route_algorithm:  r.algorithm_config?.route || r.algorithm_config?.route_algorithm || null,
+      edge_names:                r.network_telemetry?.route_edge_names ?? {},
+    } : null;
+    };
+
+    // 신규 결과들을 시트에 즉시 반영 — scenario 하나씩 완료될 때마다 해당 시트 업데이트
+    const applyResults = (newResults) => {
+      if (!newResults.length) return;
+      const resultById = {};
+      newResults.forEach(r => { if (r.id) resultById[r.id] = r; });
+
+      // 1) sheets state 갱신 — updater는 순수 계산만 (setState/side-effect 금지)
+      setSheets(prev => {
+        const next = prev.map(s => {
+          const r = resultById[s.id];
+          if (!r) return s;
+          if (r.status === 'error') return { ...s, status: 'error', errorMsg: r.error || '평가 실패' };
+          if (r.status !== 'done') return s;
+          return {
+            ...s, status: 'ran',
+            result: {
+              ...(s.result || {}),
+              routeCoords:         r.route_coords || [],
+              routeEdges:          routeEdgesFrom(r),
+              network_telemetry:   r.network_telemetry  || null,
+              route_cost_result:   r.route_cost_result  || null,
+              algorithm_metrics:   r.algorithm_metrics  || null,
+              simulation_summary:  r.simulation_summary || null,
+              allocation_result:   r.allocation_result  || null,
+              backgroundVehicles:  r.background_vehicles || [],
+              vehiclePos: (() => {
+                const coords = r.route_coords;
+                if (!coords?.length) return null;
+                const end = coords[coords.length - 1];
+                return { lat: end[0], lng: end[1], progress: 1, arrived: true, speed: 0, current_edge_id: null };
+              })(),
+              rl_episode_result:   r.mode === 'rl_episode' ? {
+                total_reward:        r.total_reward,
+                steps:               r.steps,
+                arrived:             r.arrived,
+                avg_latency_ms:      r.avg_latency_ms,
+                handover_count:      r.handover_count,
+                disconnection_steps: r.disconnection_steps,
+              } : null,
+              simLogs:             s.result?.simLogs    || [],
+              simHistory:          s.result?.simHistory || [],
+            },
+          };
+        });
+        saveSimSheets(next);
+        return next;
+      });
+
+      // 2) side-effects: setState updater 밖에서 실행 (React 규칙)
+      // 완료된 모든 시트 애니메이션 루프 시작 (병렬 — 시트마다 독립 setInterval)
+      newResults.forEach(r => {
+        if (r.status === 'done' && r.route_coords?.length >= 2) {
+          startSheetAnim(r.id, r.route_coords);
+        }
+      });
+
+      // 현재 활성 시트 지도/텔레메트리 즉시 반영
+      const currentActiveIdx = activeSheetIdxRef.current;
+      const activeSId = sheetsRef.current[currentActiveIdx]?.id;
+      const activeR = activeSId ? resultById[activeSId] : null;
+      if (activeR?.status === 'done') {
+        const coords = activeR.route_coords || [];
+        setRouteCoords(coords);
+        setNetworkTelemetry(activeR.network_telemetry || null);
+        if (setRouteEdges) setRouteEdges(routeEdgesFrom(activeR));
+        if (setBackgroundVehicles) setBackgroundVehicles(activeR.background_vehicles || []);
+      }
+    };
+
     const timer = setInterval(async () => {
       try {
         const res = await fetch(`${api}/api/scenarios/batch/${batchId}`);
         const data = await res.json();
+
+        // Progressive: scenario 완료될 때마다 해당 시트 즉시 반영
+        const allResults = data.results || [];
+        if (allResults.length > prevProcessed) {
+          applyResults(allResults.slice(prevProcessed));
+          prevProcessed = allResults.length;
+        }
+
         if (data.status === 'completed') {
           clearInterval(timer);
           setBatchRunning(false);
-
           // 분석보고서용 저장 (storage event로 report 탭이 자동 갱신됨)
           const saved = scbLoadBatches();
           saved.push({ batch_id: batchId, label: data.label, started_at: data.started_at, ended_at: data.ended_at, results: data.results });
           scbSaveBatches(saved);
-
-          // 시트별 결과 역매핑
-          const resultById = {};
-          (data.results || []).forEach(r => { if (r.id) resultById[r.id] = r; });
-
-          const routeEdgesFrom = (r) => r?.route_cost_result ? {
-            per_edge:         r.route_cost_result.per_edge || [],
-            coverage_risk:    r.route_cost_result.coverage_risk ?? null,
-            avg_latency_ms:   r.route_cost_result.avg_latency_ms ?? null,
-            handover_count:   r.route_cost_result.handover_count ?? null,
-            total_cost:       r.route_cost_result.total_cost ?? null,
-            total_distance_m: r.route_cost_result.total_distance_m ?? null,
-            routing_mode:     r.route_cost_result.routing_mode ?? null,
-            edge_names:       r.network_telemetry?.route_edge_names ?? {},
-          } : null;
-
-          setSheets(prev => {
-            const next = prev.map(s => {
-              const r = resultById[s.id];
-              if (!r || r.status !== 'done') return s;
-              return {
-                ...s, status: 'done',
-                result: {
-                  ...(s.result || {}),
-                  routeCoords:        r.route_coords || [],
-                  routeEdges:         routeEdgesFrom(r),
-                  network_telemetry:  r.network_telemetry || null,
-                  route_cost_result:  r.route_cost_result || null,
-                  algorithm_metrics:  r.algorithm_metrics || null,
-                  simulation_summary: r.simulation_summary || null,
-                  allocation_result:  r.allocation_result || null,
-                  simLogs:            s.result?.simLogs || [],
-                  simHistory:         s.result?.simHistory || [],
-                },
-              };
-            });
-            saveSimSheets(next);
-
-            // 현재 활성 시트 즉시 반영
-            const activeR = resultById[next[activeSheetIdx]?.id];
-            if (activeR?.status === 'done') {
-              setRouteCoords(activeR.route_coords || []);
-              setNetworkTelemetry(activeR.network_telemetry || null);
-              if (setRouteEdges) setRouteEdges(routeEdgesFrom(activeR));
-            }
-            return next;
-          });
-
           if (onDone) onDone(data);
         }
       } catch {}
@@ -997,9 +1196,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     }, 1200);
   }
 
-  // ── GNN-MAML vs 기준선 비교 — Pro 전용.
-  // 시트 3개를 자동 생성(GNN-MAML / Nearest BS / RSRP Max)하고 route_metrics 배치로 실행한다.
-  // 결과는 각 시트의 result에 저장되어 지도에 경로가 표시되고, 분석보고서에서도 확인 가능.
+  // ── GNN-MAML 단독 실행 — Pro 전용.
+  // GNN-MAML 시트 1개를 자동 생성하고 배치로 실행한다.
+  // rl_episode + policy:v4_gnn → 경로 선택 + 기지국 선택 모두 RL 정책이 결정한다.
+  // 결과는 시트에 즉시 반영되며 분석보고서 탭에서도 비교 가능하다.
   const [rlRunning, setRlRunning] = useState(false);
   const [rlError, setRlError] = useState(null);
   const [rlDone, setRlDone] = useState(false);
@@ -1013,40 +1213,49 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   async function runRLComparison() {
     if (!ready) { setRlError('구역·출발지·도착지를 먼저 설정하세요.'); return; }
 
-    // 3개 비교 시트 자동 생성 — 기존 시트를 교체한다
     const now = Date.now();
-    const rlSheets = [
-      { id: `rl-gnn-${now}`,     name: 'GNN-MAML',   config: { selectedAlgorithms: { base_station_selection: 'v4_gnn' },    networkGen: networkGen || '5g' }, result: null, status: 'draft' },
-      { id: `rl-nearest-${now}`, name: 'Nearest BS', config: { selectedAlgorithms: { base_station_selection: 'nearest_bs' }, networkGen: networkGen || '5g' }, result: null, status: 'draft' },
-      { id: `rl-rsrp-${now}`,    name: 'RSRP Max',   config: { selectedAlgorithms: { base_station_selection: 'rsrp_max' },   networkGen: networkGen || '5g' }, result: null, status: 'draft' },
-    ];
-    setSheets(rlSheets); setActiveSheetIdx(0); saveSimSheets(rlSheets);
+    const gnnSheet = {
+      id: `rl-gnn-${now}`,
+      name: 'GNN-MAML',
+      config: {
+        mode: 'rl_episode',
+        policy: 'v4_gnn',
+        networkGen: networkGen || '5g',
+        selectedAlgorithms: { route: 'rl_routing', base_station_selection: 'v4_gnn' },
+      },
+      result: null,
+      status: 'draft',
+    };
 
-    // 이전 경로 초기화
+    // 현재 시트 config 저장 후 GNN-MAML 시트를 뒤에 추가
+    const savedSheets = sheets.map((s, i) => i === activeSheetIdx ? { ...s, config: currentConfigSnapshot() } : s);
+    const allSheets = [...savedSheets, gnnSheet];
+    setSheets(allSheets);
+    setActiveSheetIdx(savedSheets.length); // GNN-MAML 시트로 전환
+    saveSimSheets(allSheets);
+
     setRouteCoords([]); setVehiclePos(null); setNetworkTelemetry(null);
     if (setSimHistory) setSimHistory([]);
     if (setRouteEdges) setRouteEdges(null);
 
-    const specs = rlSheets.map(s => ({
-      id: s.id, label: s.name,
-      mode: 'route_metrics', origin, dest, vehicle_count: 1,
-      algorithm_config: s.config.selectedAlgorithms || {},
-      simulation_config: { policy_options: { network_mode: (networkGen || '5g').toUpperCase() } },
-    }));
-
+    const spec = {
+      id: gnnSheet.id, label: gnnSheet.name,
+      mode: 'rl_episode', policy: 'v4_gnn',
+      origin, dest, record_trajectory: true,
+    };
     setRlRunning(true); setBatchRunning(true); setRlError(null); setRlDone(false); setBatchError(null);
     try {
       const res = await fetch(`${api}/api/scenarios/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: 'GNN-MAML 비교 (시트)', scenarios: specs }),
+        body: JSON.stringify({ label: 'GNN-MAML 실행', scenarios: [spec] }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || res.statusText);
       pollSheetBatch(data.batch_id, () => { setRlRunning(false); setRlDone(true); setTimeout(() => setRlDone(false), 3500); });
     } catch (e) {
       setRlRunning(false); setBatchRunning(false);
-      setRlError(e.message || 'RL 비교 실행 중 오류가 발생했습니다.');
+      setRlError(e.message || 'GNN-MAML 실행 중 오류가 발생했습니다.');
     }
   }
 
@@ -1588,7 +1797,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       setBusy(false);
     }
   }
-  /* ── finalizeArea — real OSM + netconvert via backend ────────── */
+  /* ── finalizeArea — 중심 좌표로 행정구역 조회 후 로컬 캐시 경로 우선, fallback은 setup-network ── */
   async function finalizeArea(bounds) {
     setArea({ s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() });
     setMode(null);
@@ -1596,28 +1805,54 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     setOsmWarning(null);
     setSimNotice(null);
     setOsmSource(null);
-    setOsmStage(1); // downloading
+    setOsmStage(1); // 구역 찾는 중
 
     try {
-      const res = await fetch(`${api}/api/setup-network`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bbox: { s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() }
-        }),
-      });
+      // 1) 중심 좌표로 행정구역 즉시 조회 (로컬 SQLite — 네트워크 없음)
+      const centerLat = (bounds.getSouth() + bounds.getNorth()) / 2;
+      const centerLon = (bounds.getWest()  + bounds.getEast())  / 2;
+      const byCoordRes = await fetch(`${api}/api/regions/by-coord?lat=${centerLat}&lon=${centerLon}`);
 
-      setOsmStage(2); // converting
-
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.detail || 'Network setup failed');
+      let usedRegionPath = false;
+      if (byCoordRes.ok) {
+        // 행정구역 찾음 → setup-network-region 시도 (로컬 PBF + 캐시 활용)
+        const { region } = await byCoordRes.json();
+        setOsmStage(2);
+        const res = await fetch(`${api}/api/setup-network-region`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ osm_id: region.osm_id }),
+        });
+        const body = await res.json();
+        if (res.ok) {
+          usedRegionPath = true;
+          setOsmSource(body.cached ? 'cache' : 'local_pbf');
+          if (body.warning) setOsmWarning(body.warning);
+          const rb = body.bbox;
+          if (mapObj.current && rb) mapObj.current.fitBounds([[rb.s, rb.w], [rb.n, rb.e]], { padding: [50, 50] });
+          else if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
+        }
+        // res not ok → fall through to setup-network below
       }
 
-      setOsmSource(body.source || 'overpass'); // 'local_pbf' or 'overpass' — from backend
-      if (body.warning) setOsmWarning(body.warning);
-      setOsmStage(3); // ready
-      if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
+      if (!usedRegionPath) {
+        // 행정구역 DB 없거나 매칭 실패, 또는 local PBF 없음 → setup-network fallback
+        setOsmStage(2);
+        const res = await fetch(`${api}/api/setup-network`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bbox: { s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() }
+          }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || 'Network setup failed');
+        setOsmSource(body.source || 'overpass');
+        if (body.warning) setOsmWarning(body.warning);
+        if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
+      }
+
+      setOsmStage(3); // 완료
       setTimeout(() => setOsmStage(0), 1200);
 
     } catch (e) {
@@ -2634,11 +2869,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           </div>
           )}
 
-          {/* GNN-MAML vs 기준선 비교 — Pro 전용. 시트 3개 자동 생성 후 배치 실행 */}
+          </fieldset>
+          {/* ── 잠금 영역 끝 — 아래는 읽기 전용 표시 ───────────────────────── */}
+
+          {/* GNN-MAML 실행 — Pro 전용. 잠금 영역 밖: 시뮬레이션 완료 후에도 실행 가능 */}
           {appMode === 'pro' && (
           <div className="field">
             <label>
-              GNN-MAML 비교 <span className="en">BS SELECTION COMPARE</span>
+              GNN-MAML 실행 <span className="en">RL ROUTING + BS SELECTION</span>
               {' '}
               <span className={'chip sm ' + (gnnReady ? 'good' : 'warn')} style={{ marginLeft: 6 }}>
                 {gnnReady ? 'GNN-MAML 로드됨' : 'GNN 미로드'}
@@ -2646,20 +2884,17 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
             </label>
             <div className="col gap8" style={{ opacity: ready ? 1 : 0.5 }}>
               <div className="muted" style={{ fontSize: 10.5 }}>
-                GNN-MAML / Nearest BS / RSRP Max 시트 3개를 자동 생성하고 같은 경로로 비교합니다. 결과는 각 시트 지도 + 분석보고서에서 확인하세요.
-                {!gnnReady && ' (GNN 미로드 시 Lowest Latency로 대체)'}
+                GNN-MAML 시트를 자동 생성해 경로 선택 + 기지국 선택을 모두 RL 정책으로 실행합니다. 결과는 시트 지도·대시보드·분석보고서에서 확인하세요.
+                {!gnnReady && ' (GNN 미로드 시 Dijkstra로 대체)'}
               </div>
               <button className={'btn sm ' + (rlDone ? 'good' : '')} disabled={!ready || rlRunning || batchRunning} onClick={runRLComparison}>
-                {rlRunning ? <><Icon.reset size={13} className="spin" /> 비교 실행 중…</> : rlDone ? <><Icon.check size={13} /> 완료 — 시트·보고서에서 확인</> : <><Icon.spark size={13} /> GNN-MAML 비교 실행</>}
+                {rlRunning ? <><Icon.reset size={13} className="spin" /> GNN-MAML 실행 중…</> : rlDone ? <><Icon.check size={13} /> 완료 — 시트·보고서에서 확인</> : <><Icon.spark size={13} /> GNN-MAML 실행</>}
               </button>
               {!ready && <div className="muted" style={{ fontSize: 10.5 }}>구역·출발지·도착지를 먼저 설정하세요</div>}
               {rlError && <div style={{ fontSize: 10.5, color: 'var(--bad)' }}>{rlError}</div>}
             </div>
           </div>
           )}
-
-          </fieldset>
-          {/* ── 잠금 영역 끝 — 아래는 읽기 전용 표시 ───────────────────────── */}
 
           {/* progress bar */}
           {vehiclePos && (
@@ -2894,6 +3129,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       onToggleGrid={() => setGridView(v => !v)}
       gridView={gridView}
       hasEnv={!!(originDone && destDone)}
+      activeAlgorithms={selectedAlgorithms}
+    />
+    <AlgorithmSheetBar
+      selectedAlgorithms={selectedAlgorithms}
+      onChange={setSelectedAlgorithms}
     />
     </div>
   );

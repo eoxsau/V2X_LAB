@@ -1239,22 +1239,34 @@ function SectionSheetCompare() {
   const cur        = sheetBatches[Math.min(selIdx, sheetBatches.length - 1)];
   const doneRows   = (cur.results || []).filter(r => r.status === 'done');
 
-  // Build display rows
+  // Build display rows — rl_episode(GNN-MAML)와 route_metrics 모두 처리
   const rows = doneRows.map(r => {
-    const rc  = r.route_cost_result || {};
-    const prr = rc.prr_approx != null ? rc.prr_approx
-              : rc.coverage_risk != null ? +(1 - rc.coverage_risk).toFixed(4) : null;
-    // P99 from per_edge latency values
+    const isRl = r.mode === 'rl_episode';
+    const rc   = r.route_cost_result || {};
+    const rl   = r.rl_episode_result || {};  // applyResults에서 저장된 rl_episode 결과
+    // rl_episode는 route_cost_result 없음 → rl 필드에서 직접 읽음
+    const prr = !isRl
+      ? (rc.prr_approx != null ? rc.prr_approx : rc.coverage_risk != null ? +(1 - rc.coverage_risk).toFixed(4) : null)
+      : (r.arrived ? 1.0 : 0.0);  // RL: 목적지 도달 여부
+    // P99 from per_edge latency values (route_metrics only)
     const lats = (rc.per_edge || []).map(e => e.latency_ms).filter(v => v != null).sort((a, b) => a - b);
     const p99  = lats.length ? lats[Math.min(lats.length - 1, Math.ceil(0.99 * lats.length) - 1)] : null;
-    const algo = rc.routing_mode || r.simulation_summary?.selected_algorithm || null;
+    // 알고리즘 표시: rl_episode는 policy 필드 우선
+    const algo = (isRl ? (r.policy || rl.policy) : null)
+      || r.algorithm_config?.route || r.algorithm_config?.route_algorithm
+      || rc.routing_mode || r.simulation_summary?.selected_algorithm || null;
     return {
       label:           r.label || r.id,
-      algo:            algo,
-      avg_latency_ms:  rc.avg_latency_ms,
-      p99_latency_ms:  p99,
-      total_cost:      rc.total_cost,
-      handover_count:  rc.handover_count,
+      algo,
+      isRl,
+      total_reward:    isRl ? (r.total_reward ?? rl.total_reward ?? null) : null,
+      arrived:         isRl ? (r.arrived ?? rl.arrived ?? null) : null,
+      avg_latency_ms:  isRl ? (r.avg_latency_ms ?? rl.avg_latency_ms ?? rc.avg_latency_ms)
+                             : rc.avg_latency_ms,
+      p99_latency_ms:  isRl ? null : p99,
+      total_cost:      isRl ? null : rc.total_cost,
+      handover_count:  isRl ? (r.handover_count ?? rl.handover_count ?? rc.handover_count)
+                             : rc.handover_count,
       prr,
     };
   });
@@ -1333,10 +1345,17 @@ function SectionSheetCompare() {
                   </td>
                   <td className="r"><span className="num">{fmt1(row.p99_latency_ms)}</span></td>
                   <td className="r">
-                    <span className="num" style={{ color: isBestCost ? 'var(--good)' : 'inherit', fontWeight: isBestCost ? 700 : 400 }}>
-                      {fmt2(row.total_cost)}
-                    </span>
-                    {isBestCost && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}
+                    {row.isRl
+                      ? <><span className="num" style={{ color: 'var(--brand-2)', fontWeight: 600 }}>
+                          reward {row.total_reward != null ? row.total_reward.toFixed(2) : '—'}
+                        </span>
+                        {row.arrived != null && <Chip tone={row.arrived ? 'good' : 'bad'} style={{ marginLeft: 5, fontSize: 9 }}>{row.arrived ? '도달' : '미도달'}</Chip>}
+                        </>
+                      : <><span className="num" style={{ color: isBestCost ? 'var(--good)' : 'inherit', fontWeight: isBestCost ? 700 : 400 }}>
+                          {fmt2(row.total_cost)}
+                        </span>
+                        {isBestCost && <Chip tone="good" style={{ marginLeft: 5, fontSize: 9 }}>최적</Chip>}</>
+                    }
                   </td>
                   <td className="r">
                     <span className="num" style={{ color: isBestHO ? 'var(--good)' : 'inherit', fontWeight: isBestHO ? 700 : 400 }}>
