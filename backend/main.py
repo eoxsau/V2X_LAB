@@ -3850,6 +3850,78 @@ def _prepare_traffic_async() -> None:
     threading.Thread(target=_run, args=(str(net_file),), daemon=True).start()
 
 
+class DemandPrewarmRequest(BaseModel):
+    scales: list[float] = [70.0, 100.0]   # 미리 만들어 둘 교통량 배율(%)
+
+
+# 미리 데우기 진행 상태 — 폴링으로 본다(작업이 배율당 수 분이라 응답을 붙잡지 않는다).
+_prewarm_state: dict = {"running": False, "total": 0, "done": [], "failed": [],
+                        "current": None, "message": None, "started_at": None}
+
+
+def _run_prewarm(scales: list[float]) -> None:
+    """배율마다 교통을 한 번씩 만들어 캐시에 넣어둔다(백그라운드 스레드).
+
+    **앱이 실제로 쓰는 경로(`current_traffic_scenario`)를 그대로 부른다.** 캐시 키는
+    net 바이트 + 배율 + 수요 범위 + 통과 비율로 만들어지므로, 다른 방식으로 만들면
+    키가 어긋나 시연 때 적중하지 않는다. 그래서 굳이 정책값을 바꿔가며 같은 함수를 부른다.
+    """
+    pol = _state.get("policy_options") or {}
+    original = pol.get("demand_scale_pct", 100.0)
+    try:
+        for pct in scales:
+            _prewarm_state["current"] = pct
+            _prewarm_state["message"] = f"{pct:.0f}% 교통 준비 중…"
+            try:
+                _state.setdefault("policy_options", {})
+                _state["policy_options"]["demand_scale_pct"] = float(pct)
+                sc = current_traffic_scenario(
+                    log=lambda m: _prewarm_state.update(message=m))
+                if sc is None:
+                    raise RuntimeError("교통 생성 실패")
+                _prewarm_state["done"].append(
+                    {"scale_pct": pct, "total_trips": round(sc.total_trips),
+                     "n_star": round(sc.n_star), "n_vehicles": sc.n_vehicles})
+            except Exception as exc:
+                _prewarm_state["failed"].append({"scale_pct": pct, "error": str(exc)})
+    finally:
+        # 원래 배율로 되돌린다 — 미리 데우기가 사용자의 현재 설정을 바꿔놓으면 안 된다.
+        if _state.get("policy_options") is not None:
+            _state["policy_options"]["demand_scale_pct"] = original
+        _state["traffic_scenario"] = None      # 되돌린 배율과 캐시를 일치시킨다
+        _prewarm_state["current"] = None
+        _prewarm_state["message"] = "완료"
+        _prewarm_state["running"] = False
+
+
+@app.post("/api/demand/prewarm")
+def prewarm_demand(req: DemandPrewarmRequest):
+    """지금 구역에 대해 여러 배율의 교통을 미리 만들어 둔다 (시연 준비용).
+
+    배율마다 수 분이 걸리므로 즉시 반환하고, 진행 상황은 GET /api/demand/prewarm 으로 본다.
+    N* 보정은 구역당 1회라 첫 배율에서만 오래 걸리고 그 뒤는 짧다.
+    """
+    if not _state.get("network_ready") or not _state.get("net_file"):
+        raise HTTPException(status_code=400, detail="구역이 설정되지 않았습니다. 먼저 구역을 설정하세요.")
+    if _prewarm_state["running"]:
+        raise HTTPException(status_code=409, detail="이미 미리 데우기가 진행 중입니다.")
+    scales = [max(10.0, min(float(s), 300.0)) for s in (req.scales or [])]
+    if not scales:
+        raise HTTPException(status_code=400, detail="배율을 하나 이상 지정하세요.")
+
+    _prewarm_state.update(running=True, total=len(scales), done=[], failed=[],
+                          current=None, message="시작합니다…",
+                          started_at=datetime.now(timezone.utc).isoformat())
+    threading.Thread(target=_run_prewarm, args=(scales,), daemon=True).start()
+    return {"ok": True, "scales": scales, "total": len(scales)}
+
+
+@app.get("/api/demand/prewarm")
+def get_prewarm_status():
+    """미리 데우기 진행 상황."""
+    return dict(_prewarm_state)
+
+
 @app.get("/api/demand/status")
 async def demand_status():
     """수요 배율 UI가 쓰는 상태 — N*와 현재 배율에서의 예상 차량 수.
@@ -5041,6 +5113,33 @@ def reset_simulation_state() -> None:
     _state["policy_options"] = None
 
 
+def _purge_nodes_outside_bbox(bbox: dict, margin_deg: float = 0.005) -> int:
+    """새 구역 밖에 있는 user_created 기지국·RSU를 지운다. 지운 개수를 돌려준다.
+
+    ⚠️ 이게 없으면 **구역을 바꿔도 옛 구역의 기지국이 그대로 남는다.**
+    `reset_simulation_state`는 메모리의 network_nodes만 비우고 저장소는 건드리지 않는데,
+    `merged_network_nodes()`는 저장소에 user_created가 하나라도 있으면 그걸 쓴다. 그래서
+    안양에서 만든 기지국 60개가 강남 구역에서도 그대로 계산에 들어가고 지도에도 찍혔다
+    (2026-08-13 실측: 저장된 60개가 전부 새 구역 밖이었다).
+
+    구역 안에 남는 것은 지우지 않는다 — 같은 도시에서 구역만 살짝 조정한 경우에는
+    손으로 찍은 기지국을 살려야 하기 때문. margin은 경계에 걸친 것을 살리는 여유.
+    """
+    if not bbox:
+        return 0
+    s, w = bbox["s"] - margin_deg, bbox["w"] - margin_deg
+    n, e = bbox["n"] + margin_deg, bbox["e"] + margin_deg
+    removed = 0
+    for row in fetch_network_nodes(source="user_created"):
+        lat, lng = row.get("lat"), row.get("lng")
+        if lat is None or lng is None or not (s <= lat <= n and w <= lng <= e):
+            if delete_network_node(row["id"]):
+                removed += 1
+    if removed:
+        print(f"[SETUP] 새 구역 밖 기지국 {removed}개 정리", flush=True)
+    return removed
+
+
 def _store_simulation_summary() -> None:
     """Build and persist SimulationSummary from current _state."""
     if not SUMMARY_AVAILABLE:
@@ -5276,6 +5375,8 @@ async def setup_network(req: SetupRequest):
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
             _state["current_bbox"] = {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e}
+            # 옛 구역에서 만든 기지국이 남아 있으면 새 구역 계산·지도에 그대로 섞인다.
+            _purge_nodes_outside_bbox(_state["current_bbox"])
             # ⚠️ current_bbox **다음에** 부를 것 — 시드 스레드가 `_demand_bbox()`로 그린 구역을
             # 읽는다. 먼저 부르면 아직 None이라 net 전체에 수요를 깔아 몇 배로 느려진다.
             _prepare_traffic_async()            # N* 시드를 미리 구해 둔다(백그라운드)
@@ -5463,10 +5564,17 @@ async def setup_network_region(req: RegionSetupRequest):
             )
 
             # Step 3: netconvert로 SUMO 네트워크 변환
+            # 이미 변환해둔 게 있으면 그대로 쓴다(행정구역은 osm_id로 이름이 고정이라 안전).
+            # ⚠️ 속도만의 문제가 아니다 — netconvert는 같은 입력이라도 결과가 미세하게
+            #    달라져서, 새로 만들면 교통 캐시(net 바이트 해시 키)가 통째로 빗나간다.
+            #    미리 만들어둔 교통을 시연에서 쓰려면 net 파일이 그대로여야 한다.
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, netconvert, osm_file, net_file, bbox
-                )
+                if net_file.exists() and net_file.stat().st_size > 0:
+                    print(f"[SETUP] 이미 변환해둔 도로망 재사용: {net_file.name}", flush=True)
+                else:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, netconvert, osm_file, net_file, bbox
+                    )
             except Exception as exc:
                 raise HTTPException(
                     status_code=502,
@@ -5486,6 +5594,8 @@ async def setup_network_region(req: RegionSetupRequest):
             _state["current_bbox"] = {
                 "s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e
             }
+            # 행정구역 선택 경로도 같다 — 옛 구역 기지국을 정리하지 않으면 그대로 섞인다.
+            _purge_nodes_outside_bbox(_state["current_bbox"])
             # ⚠️ current_bbox **다음에** 부를 것 — 위 bbox 경로와 같은 이유(_demand_bbox 참조)
             _prepare_traffic_async()            # N* 시드를 미리 구해 둔다(백그라운드)
             _state["current_region"] = {
@@ -8022,9 +8132,17 @@ async def replace_user_created_nodes(req: NetworkNodeSetRequest):
         raise HTTPException(status_code=409, detail="시뮬레이션 실행 중에는 기지국을 바꿀 수 없습니다. 먼저 중지하세요.")
 
     delete_user_created_network_nodes()
-    written = 0
+    # 시트는 만들어진 구역에 묶인다 — 다른 구역에서 만든 시트를 복원하면 그 구역의
+    # 기지국이 지금 구역으로 딸려 들어온다. 현재 구역 밖 좌표는 받지 않는다.
+    _bb = _state.get("current_bbox")
+    _m = 0.005
+    written, skipped = 0, 0
     for n in req.nodes:
         if n.get("lat") is None or n.get("lng") is None or not n.get("id"):
+            continue
+        if _bb and not (_bb["s"] - _m <= n["lat"] <= _bb["n"] + _m
+                        and _bb["w"] - _m <= n["lng"] <= _bb["e"] + _m):
+            skipped += 1
             continue
         # ⚠️ upsert_network_nodes가 아니라 insert_network_node를 쓴다 — 전자는 안테나 높이·
         #    설치형태를 아예 안 쓴다. 그걸로 되돌리면 옥상 25m로 세운 기지국이 높이 없는
@@ -8044,8 +8162,10 @@ async def replace_user_created_nodes(req: NetworkNodeSetRequest):
             "antenna_placement": n.get("antenna_placement"),
         })
         written += 1
+    if skipped:
+        print(f"[NODES] 현재 구역 밖이라 건너뛴 기지국 {skipped}개", flush=True)
     _refresh_active_network_nodes()
-    return {"ok": True, "count": written,
+    return {"ok": True, "count": written, "skipped_outside_area": skipped,
             "nodes": [_network_node_response(r) for r in fetch_network_nodes()]}
 
 
