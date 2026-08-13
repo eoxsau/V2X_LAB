@@ -64,6 +64,34 @@ DEFAULT_IGNORE_JUNCTION_BLOCKER_S = 60.0   # 교차로를 막고 선 차를 무�
 DEFAULT_TIME_TO_TELEPORT_S = 300.0   # -1(끔)이면 교착이 영구화된다 — 모듈 상단 설명 참조
 DEFAULT_POLL_S = 2.0         # 조기 종료 판단 주기. summary는 이보다 훨씬 드물게 갱신된다
 
+# 실시간 교통정보를 보고 우회하는 차량 비율 — **이 파이프라인에서는 0(끔)이다.**
+#
+# 실시간 시뮬(main.py)은 0.3으로 돈다. 왜 여기만 0인가 (2026-08-14 결정):
+#
+# N* 보정은 "도로가 못 버티기 시작하는 통행량"을 찾으려고 수요를 올려가며 시뮬을
+# **수십 번** 돌린다. 우회를 켜면 두 가지가 동시에 터진다:
+#   1) 교착이 잘 안 나서 `_is_already_out`의 조기 중단이 안 걸린다 — 예전엔 몇 초 만에
+#      탈락시키던 시행이 끝까지(실측 10분) 돈다.
+#   2) 도로가 더 잘 버티니 탐색이 더 높은 통행량까지 올라가고, 그 시행은 더 무겁다.
+#   실제로 2026-08-13 23:42에 시작한 보정이 끝나지 못했다(시나리오 산출물 0개).
+#
+# ⚠️ **대신 이런 어긋남을 받아들인 것이다.** N*와 생성 교통은 "아무도 우회하지 않는 세계"의
+#    값인데, 실시간 화면은 그 위에 우회 30%를 얹어 돌린다. 그래서 **화면은 N*가 가리키는
+#    운영점보다 덜 막힌다.** 논문에 N*를 쓸 거면 이 점을 반드시 짚어야 한다
+#    (같은 종류의 어긋남을 2026-07-30에 한 번 고쳤던 이력이 있다 — `cached_nstar` 주석).
+#
+# 켜고 싶으면 이 값만 0.3으로 올리면 된다. 단 그때는 `_nstar_cache`를 비우고 다시 보정할 것 —
+# 캐시된 N*는 우회 없는 세계의 값이다. 우회 효과 실측(동안구 20,911대, 같은 통행·같은 도로망):
+#
+#     비율    피크 정지비  피크속도   평균통행   순간이동/도착
+#     0%(끔)      65%    16.5kph    660초      6.9%
+#     30%         47%    26.5kph    431초      2.3%
+#     100%        20%    43.6kph    294초      0.25%
+DEFAULT_REROUTING_PROBABILITY = 0.0
+DEFAULT_REROUTING_PERIOD_S = 180.0
+DEFAULT_REROUTING_ADAPT_INTERVAL_S = 10.0
+DEFAULT_REROUTING_ADAPT_WEIGHT = 0.5
+
 # summary 기록 주기 — **엣지 집계 주기(`interval_s`)와 분리한다** (2026-07-28).
 #
 # sumo는 출력을 ~4KB 버퍼 단위로 흘린다(1.27에 unbuffered 옵션이 없다). summary 한 줄이
@@ -319,6 +347,16 @@ def _run_sumo(
         "--collision.action", "none",
         "--no-step-log", "--no-warnings",
     ]
+    # 우회는 기본이 0(끔)이라 옵션 자체를 붙이지 않는다 — 이유는 DEFAULT_REROUTING_PROBABILITY 주석.
+    # 값을 올리면 그때만 붙으므로, 끈 상태의 명령줄은 이 기능이 생기기 전과 완전히 같다
+    # (예전 실행과 비교할 때 명령줄 차이로 헷갈릴 일이 없다).
+    if DEFAULT_REROUTING_PROBABILITY > 0:
+        cmd += [
+            "--device.rerouting.probability", f"{DEFAULT_REROUTING_PROBABILITY}",
+            "--device.rerouting.period", f"{DEFAULT_REROUTING_PERIOD_S:.0f}",
+            "--device.rerouting.adaptation-interval", f"{DEFAULT_REROUTING_ADAPT_INTERVAL_S:.0f}",
+            "--device.rerouting.adaptation-weight", f"{DEFAULT_REROUTING_ADAPT_WEIGHT}",
+        ]
     stdout_f = summary_f.parent / f"{summary_f.name.split('.')[0]}.sumo.log"
     aborted, reason = False, ""
 

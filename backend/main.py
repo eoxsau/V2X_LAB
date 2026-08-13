@@ -2830,7 +2830,8 @@ def yen_k_paths_mock(
     return [p for _, p in A]
 
 
-# 타겟 차량은 DEFAULT_VEHTYPE로 투입된다(traci.vehicle.add) — vClass는 passenger다.
+# 타겟 차량은 DEFAULT_VEHTYPE의 복사본(EGO_VTYPE)으로 투입된다(traci.vehicle.add) —
+# 복사본이라 vClass는 그대로 passenger다. 복사하는 이유는 EGO_VTYPE 주석 참조.
 _ROUTING_VCLASS = "passenger"
 
 
@@ -4062,6 +4063,42 @@ OSM_LANE_DEFAULTS: dict[str, int] = {
 # 다음 실험을 못 믿게 되기 때문**이다.
 TLS_GUESS_THRESHOLD = 130.0
 
+# 배경 차량 중 **실시간 교통정보를 보고 우회하는 비율**.
+#
+# ⚠️ 2026-08-13 — 이걸 0(끔)으로 두면 정체 수치를 믿을 수 없다. duarouter가 자유류 최단경로를
+# 미리 정하고 주행 중 재계산이 없으면, 한 번 막힌 길에 뒤차가 계속 들어와 앞차가 영영 못 나간다.
+# 동안구 20,911대 실측 — 같은 통행·같은 도로망에서 이 값만 바꿔가며:
+#
+#     비율    피크 정지비  피크속도   평균통행   5분이상정지   순간이동(도착 대비)
+#     0%(끔)      65%    16.5kph    660초      15.7%     1,447건(6.9%)
+#     30%         47%    26.5kph    431초       9.2%       491건(2.3%)
+#     100%        20%    43.6kph    294초       2.5%        53건(0.25%)
+#
+# 30%를 택한 근거 둘:
+#   1) `demand/simulation.py`가 스스로 정해둔 합격선("순간이동 > 도착의 3%면 정체 수치를 믿지
+#      말 것")을 **정체를 살려둔 채** 통과하는 유일한 값이다. 0%는 6.9%로 그 경고선 밖이었다.
+#   2) 100%는 모든 운전자가 3분마다 전역 교통정보를 받는 낙관적 가정이라, 봐야 할 정체까지
+#      지운다(시속 43.6km는 도심 출근시간이 아니다).
+#
+# 우회해도 평균 주행거리는 4.05 → 4.08km로 1%만 늘었다 — 멀리 돌아가는 게 아니라 같은 거리를
+# 여러 도로에 나눠 타는 것이다. 즉 도로가 모자란 게 아니라 몰려 있었던 것이다.
+#
+# ⚠️ **EGO(veh0)에는 적용하지 않는다.** ego의 경로는 이 앱의 라우팅 알고리즘이 정하는데,
+#    SUMO 재라우팅 장치가 3분마다 그걸 덮어쓰면 알고리즘 비교 자체가 무의미해진다.
+#    장치는 투입 시점에 붙고 나중에 뗄 수 없으므로 **ego 전용 차종**(EGO_VTYPE)으로 미리 끈다.
+#
+# ⚠️ **수요 파이프라인은 이 값을 따라가지 않는다** (2026-08-14 결정).
+#    `demand/simulation.py`의 DEFAULT_REROUTING_PROBABILITY는 0이다. N* 보정이 시뮬을 수십 번
+#    돌리는데, 우회를 켜면 조기 중단이 안 걸려 보정이 사실상 끝나지 않았기 때문이다.
+#    그래서 **N*와 생성 교통은 "아무도 우회 안 하는 세계"의 값이고, 이 화면은 그 위에 우회를
+#    얹어 돌린다 — 화면이 N*가 가리키는 것보다 덜 막힌다.** 의도한 어긋남이니 논문에 N*를
+#    쓸 때 짚을 것. 맞추려면 저쪽을 0.3으로 올리고 `_nstar_cache`를 비운 뒤 다시 보정한다.
+BG_REROUTING_PROBABILITY = 0.3
+BG_REROUTING_PERIOD_S = 180      # 우회를 다시 판단하는 주기
+BG_REROUTING_ADAPT_INTERVAL_S = 10   # 도로별 소요시간을 다시 재는 주기
+BG_REROUTING_ADAPT_WEIGHT = 0.5      # 새로 잰 값과 예전 값을 섞는 비율
+EGO_VTYPE = "ego_type"               # DEFAULT_VEHTYPE 복사본 — 재라우팅 장치만 꺼져 있다
+
 
 def _osm_typemap() -> Optional[Path]:
     """`OSM_LANE_DEFAULTS`를 적용한 netconvert 타입 파일 경로. 못 만들면 None.
@@ -4261,6 +4298,12 @@ def simulation_thread(
             "--time-to-teleport", "300",
             "--ignore-junction-blocker", "60",
             "--step-length", "0.5",
+            # 배경 차량 30%만 실시간 교통정보를 보고 우회한다 — 근거는 BG_REROUTING_PROBABILITY 주석.
+            # ego(veh0)는 전용 차종 EGO_VTYPE으로 이 장치에서 제외된다.
+            "--device.rerouting.probability", str(BG_REROUTING_PROBABILITY),
+            "--device.rerouting.period", str(BG_REROUTING_PERIOD_S),
+            "--device.rerouting.adaptation-interval", str(BG_REROUTING_ADAPT_INTERVAL_S),
+            "--device.rerouting.adaptation-weight", str(BG_REROUTING_ADAPT_WEIGHT),
         ]
         if _use_generated:
             # 창(07:00~)에 맞춰 시작. 경로파일의 depart가 25200초부터라 --begin을 맞춰야
@@ -4605,7 +4648,22 @@ def simulation_thread(
                 )
 
         # Define vehicle type and add vehicle
-        # Use DEFAULT_VEHTYPE (always exists in SUMO)
+        # ego 전용 차종 — DEFAULT_VEHTYPE을 복사하고 **재라우팅 장치만 끈다**.
+        #
+        # ⚠️ 차종으로 끄는 이유: 차량을 만든 뒤 `setParameter("has.rerouting.device","false")`로
+        #    떼려고 하면 SUMO가 "Device removal is not supported for device of type 'rerouting'"로
+        #    거절한다(2026-08-13 실측). 장치는 **투입 시점에** 붙으므로 그 전에 차종에 박아야 한다.
+        #    확률 1.0으로 시험해도 ego만 false, 배경 차량은 true로 확인했다.
+        # 왜 꺼야 하나: ego의 경로는 route_algorithm(다익스트라/A*/K-경로/…)이 정하는데,
+        #    재라우팅 장치가 붙으면 SUMO가 3분마다 그걸 갈아치워 알고리즘 비교가 무의미해진다.
+        #    복사본이라 vClass는 그대로 passenger다(_ROUTING_VCLASS 주석 참조).
+        try:
+            traci.vehicletype.copy("DEFAULT_VEHTYPE", EGO_VTYPE)
+            traci.vehicletype.setParameter(EGO_VTYPE, "has.rerouting.device", "false")
+            _ego_vtype = EGO_VTYPE
+        except Exception as _te:
+            _ego_vtype = "DEFAULT_VEHTYPE"
+            print(f"[SIM] ⚠️ ego 차종 생성 실패 — ego 경로가 도중에 바뀔 수 있습니다: {_te}", flush=True)
         traci.route.add("route0", edges)
 
         # 목적지 좌표를 도착 엣지에 투영하여 arrivalPos 계산
@@ -4638,13 +4696,13 @@ def simulation_thread(
         traci.vehicle.add(
             vehID="veh0",
             routeID="route0",
-            typeID="DEFAULT_VEHTYPE",
+            typeID=_ego_vtype,
             depart="0",
             departLane="best",
             departSpeed="0",
             arrivalPos=_arrival_pos,
         )
-        print("[SIM] Vehicle veh0 added to simulation", flush=True)
+        print(f"[SIM] Vehicle veh0 added to simulation (차종 {_ego_vtype}, 재라우팅 제외)", flush=True)
 
         # ── 다중차량 실험군 — 배경 차량 주입 (vehicle_count > 1일 때만, SUMO 모드) ──────
         _bg_vehicle_ids: list[str] = []
