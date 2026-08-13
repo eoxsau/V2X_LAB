@@ -28,6 +28,8 @@ from .report_builder import (
     build_run_summary,
     build_scenario_metadata,
 )
+from . import report_charts as _charts
+from . import report_logo as _logo
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,6 +217,10 @@ class ReportDocument:
     recommendation_text: str = ""
 
     # ── Section 10: Appendix / raw metric notes ───────────────────────────────
+    # per_edge_sample은 표에 싣는 **상위 20개**뿐이다. 지연 분포(CDF) 그림은
+    # 전체 구간을 봐야 하므로 지연값만 따로 담는다 — 20개만 쓰면 "26%가 끊긴다"
+    # 같은 비율이 통째로 틀어진다.
+    latency_all_ms: list = field(default_factory=list)
     per_edge_sample: list = field(default_factory=list)
     per_bs_summary: list = field(default_factory=list)
     metadata_notes: dict = field(default_factory=dict)
@@ -341,6 +347,10 @@ def build_report_document(state: dict) -> ReportDocument:
         trade_offs=list(rec.get("trade_offs") or []),
         risk_factors=list(rec.get("risk_factors") or []),
         recommendation_text=recommendation_text,
+        latency_all_ms=[
+            float(e["latency_ms"]) for e in edges
+            if isinstance(e.get("latency_ms"), (int, float))
+        ],
         per_edge_sample=edges[:20],
         per_bs_summary=bs,
         metadata_notes={k: v for k, v in meta.items() if k not in ("cost_weights", "norm_scales")},
@@ -946,6 +956,47 @@ def render_report_html(doc: ReportDocument) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DOCX 서식 상수 — Word 보고서 디자인은 전부 여기서 바꾼다
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# ⚠️ 한글 폰트는 `font.name`만으로는 절대 안 걸린다. Word는 라틴 문자와 한중일 문자에
+#    **서로 다른 폰트 슬롯**을 쓰기 때문에, 한글에는 `w:eastAsia` 속성을 따로 넣어야 한다.
+#    안 넣으면 Word가 알아서 대체 폰트를 고르고, 그 선택이 PC마다 달라져 같은 파일을
+#    열어도 글꼴이 제각각이 된다(제출본에서 제일 흔한 사고다).
+#
+# ⚠️ 용지 크기도 반드시 명시해야 한다. python-docx 기본 템플릿은 **Letter**(21.6×27.9cm)라,
+#    여백만 A4 기준으로 잡아두면 국내 제출 규격과 어긋난다.
+
+DOCX_PAGE_W_CM  = 21.0               # A4
+DOCX_PAGE_H_CM  = 29.7
+
+DOCX_FONT_KO    = "맑은 고딕"         # 한글 (eastAsia 슬롯)
+DOCX_FONT_EN    = "Times New Roman"  # 영문·숫자 (ascii/hAnsi 슬롯)
+DOCX_FONT_MONO  = "Courier New"      # 수식
+
+DOCX_BODY_PT    = 10.5               # 본문
+DOCX_TABLE_PT   = 9                  # 표 안 글자
+DOCX_CAPTION_PT = 9                  # 표 설명
+
+# 표 색상 — 프런트엔드 브랜드 색과 동일하게 맞춘다
+# (frontend/styles.css: --brand #1E3A5F, --brand-2 #2E75B6)
+DOCX_TBL_HEADER_BG = "1E3A5F"        # 머리글 배경 (브랜드 네이비)
+DOCX_TBL_HEADER_FG = "FFFFFF"        # 머리글 글자 (흰색)
+DOCX_TBL_STRIPE_BG = "F2F5F9"        # 짝수 줄 줄무늬 (거의 안 보일 만큼 옅게)
+DOCX_TBL_BORDER    = "D5DCE6"        # 가로 구분선 (연한 회청)
+
+# 표 여백 — 클로드 아티팩트처럼 "선을 줄이고 여백으로 구분"하는 핵심 값이다.
+# 세로선을 지운 만큼 좌우 여백이 넉넉해야 열이 구분돼 보인다.
+DOCX_CELL_PAD_H = 130                # 좌우 안쪽 여백 (dxa, 1/20 pt → 약 2.3mm)
+DOCX_CELL_PAD_V = 70                 # 위아래 안쪽 여백
+
+# 워터마크
+DOCX_WATERMARK_PT = 320              # 배경 로고 한 변 (pt). A4 폭이 595pt다.
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # DOCX entry point (requires python-docx)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -965,9 +1016,10 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
     """
     try:
         from docx import Document
+        from docx.enum.table import WD_ALIGN_VERTICAL
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
+        from docx.oxml import OxmlElement, parse_xml
         from docx.shared import Cm, Pt, RGBColor
     except ImportError as exc:
         raise ImportError(
@@ -977,12 +1029,51 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
 
     d = Document()
 
-    # A4 margins
+    # A4 용지 + 여백. 용지 크기를 빼먹으면 Letter로 나간다(상단 상수 주석 참조).
     for sec in d.sections:
+        sec.page_width    = Cm(DOCX_PAGE_W_CM)
+        sec.page_height   = Cm(DOCX_PAGE_H_CM)
         sec.top_margin    = Cm(2.5)
         sec.bottom_margin = Cm(2.5)
         sec.left_margin   = Cm(3.0)
         sec.right_margin  = Cm(2.5)
+
+    # ── 폰트 고정 ─────────────────────────────────────────────────────────────
+
+    def _style_font(style_name: str, size_pt: float | None = None,
+                    bold: bool | None = None) -> None:
+        """스타일 하나에 라틴·한글 폰트를 **양쪽 슬롯 모두** 지정한다.
+
+        `style.font.name`만 쓰면 w:ascii/w:hAnsi에만 들어가고 한글이 걸리는
+        w:eastAsia는 비어 있는 채로 남는다 — 그래서 rFonts를 직접 만진다.
+        """
+        try:
+            st = d.styles[style_name]
+        except KeyError:
+            return                      # 템플릿에 없는 스타일이면 조용히 넘어간다
+        st.font.name = DOCX_FONT_EN
+        if size_pt is not None:
+            st.font.size = Pt(size_pt)
+        if bold is not None:
+            st.font.bold = bold
+        rpr = st.element.get_or_add_rPr()
+        rfonts = rpr.get_or_add_rFonts()
+        rfonts.set(qn("w:ascii"),    DOCX_FONT_EN)
+        rfonts.set(qn("w:hAnsi"),    DOCX_FONT_EN)
+        rfonts.set(qn("w:eastAsia"), DOCX_FONT_KO)
+        rfonts.set(qn("w:cs"),       DOCX_FONT_EN)
+
+    _style_font("Normal", DOCX_BODY_PT)
+    for _sn in ("Title", "Heading 1", "Heading 2", "Heading 3", "Heading 4",
+                "Caption", "List Bullet", "List Number"):
+        _style_font(_sn)
+
+    # 제목 스타일의 기본 파랑을 네이비로 맞춘다(표 머리글과 같은 색).
+    for _hn in ("Heading 1", "Heading 2", "Heading 3"):
+        try:
+            d.styles[_hn].font.color.rgb = RGBColor.from_string(DOCX_TBL_HEADER_BG)
+        except (KeyError, ValueError):
+            pass
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -996,34 +1087,156 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
         shd.set(qn("w:fill"), hex_color)
         tcPr.append(shd)
 
+    def _add_watermark() -> None:
+        """배경에 로고를 연하게 깐다.
+
+        python-docx에는 워터마크 기능이 없다. Word가 실제로 쓰는 방식 그대로,
+        **머리글 안에 떠 있는 도형(VML)** 을 넣고 본문 뒤(z-index 음수)로 보낸다.
+        머리글에 넣어야 모든 페이지에 자동으로 깔린다.
+
+        `o:allowincell="f"`가 없으면 표 안에 갇혀 위치가 틀어진다.
+        이미지 자체를 이미 연한 회색으로 그려두므로 별도 washout은 걸지 않는다.
+        """
+        png = _logo.logo_png(watermark=True)
+        if not png:
+            return
+        size = DOCX_WATERMARK_PT
+        for sec in d.sections:
+            header = sec.header
+            header.is_linked_to_previous = False
+            try:
+                rid, _img = header.part.get_or_add_image(io.BytesIO(png))
+            except Exception:
+                return          # 이미지 등록 실패 시 워터마크만 포기한다
+            para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+            xml = (
+                '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                '<w:r><w:pict '
+                'xmlns:v="urn:schemas-microsoft-com:vml" '
+                'xmlns:o="urn:schemas-microsoft-com:office:office" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                f'<v:shape id="v2x-watermark" o:spid="_x0000_s2049" type="#_x0000_t75" '
+                f'style="position:absolute;margin-left:0;margin-top:0;'
+                f'width:{size}pt;height:{size}pt;z-index:-251658752;'
+                'mso-position-horizontal:center;mso-position-horizontal-relative:margin;'
+                'mso-position-vertical:center;mso-position-vertical-relative:margin" '
+                'o:allowincell="f">'
+                f'<v:imagedata r:id="{rid}" o:title="logo"/>'
+                '</v:shape></w:pict></w:r></w:p>'
+            )
+            para._p.addnext(parse_xml(xml))
+
+    def _table_borders(table, hex_color: str) -> None:
+        """가로선만 남기고 세로선·바깥 테두리를 지운다.
+
+        격자를 다 치면 화면이 답답해진다. 세로 구분은 선 대신 **여백**이 맡고
+        (아래 `_cell_padding`), 선은 행을 가르는 최소한만 남긴다.
+        """
+        tbl_pr = table._tbl.tblPr
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = OxmlElement(f"w:{edge}")
+            if edge in ("left", "right", "insideV", "top"):
+                el.set(qn("w:val"), "none")
+                el.set(qn("w:sz"), "0")
+            else:                             # bottom, insideH — 옅은 가로선만
+                el.set(qn("w:val"), "single")
+                el.set(qn("w:sz"), "4")       # 4 = 0.5pt
+                el.set(qn("w:color"), hex_color)
+            el.set(qn("w:space"), "0")
+            borders.append(el)
+        tbl_pr.append(borders)
+
+    def _cell_padding(table) -> None:
+        """표 전체의 칸 안쪽 여백. 세로선을 지운 만큼 이걸로 열을 갈라 보이게 한다."""
+        tbl_pr = table._tbl.tblPr
+        mar = OxmlElement("w:tblCellMar")
+        for side, val in (("top", DOCX_CELL_PAD_V), ("bottom", DOCX_CELL_PAD_V),
+                          ("left", DOCX_CELL_PAD_H), ("right", DOCX_CELL_PAD_H)):
+            el = OxmlElement(f"w:{side}")
+            el.set(qn("w:w"), str(val))
+            el.set(qn("w:type"), "dxa")
+            mar.append(el)
+        tbl_pr.append(mar)
+
+    def _repeat_header(row) -> None:
+        """표가 페이지를 넘어갈 때 머리글 줄을 다음 장에도 반복한다."""
+        tr_pr = row._tr.get_or_add_trPr()
+        el = OxmlElement("w:tblHeader")
+        el.set(qn("w:val"), "true")
+        tr_pr.append(el)
+
     def _styled_table(headers: list[str], rows: list[list[Any]],
                       caption: str | None = None) -> None:
-        """Add a styled table: blue header row, alternating row shading."""
+        """표 하나를 그린다 — 네이비 머리글 + 줄무늬 + 남색 테두리.
+
+        문서 안의 **모든 표가 이 함수 하나를 쓴다.** 색·크기·정렬을 바꾸려면
+        위쪽 DOCX_TBL_* 상수만 손대면 전체에 반영된다.
+        """
         t = d.add_table(rows=len(rows) + 1, cols=len(headers))
         t.style = "Table Grid"
-        # Header row
+        _table_borders(t, DOCX_TBL_BORDER)
+        _cell_padding(t)
+
+        # 머리글 줄 — 네이비 배경 · 흰 글자 · 가운데 정렬 · 페이지 넘겨도 반복
         hdr = t.rows[0]
+        _repeat_header(hdr)
         for i, h_text in enumerate(headers):
             cell = hdr.cells[i]
             cell.text = str(h_text)
-            _cell_bg(cell, "1A6FCF")
-            run = cell.paragraphs[0].runs[0]
-            run.bold = True
-            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-            run.font.size = Pt(9)
-        # Data rows
+            _cell_bg(cell, DOCX_TBL_HEADER_BG)
+            para = cell.paragraphs[0]
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            for run in para.runs:
+                run.bold = True
+                run.font.color.rgb = RGBColor.from_string(DOCX_TBL_HEADER_FG)
+                run.font.size = Pt(DOCX_TABLE_PT)
+
+        # 데이터 줄 — 짝수 줄에만 옅은 남색 줄무늬
         for ri, row_data in enumerate(rows):
             row = t.rows[ri + 1]
             for ci, val in enumerate(row_data):
                 cell = row.cells[ci]
                 cell.text = "—" if val is None else str(val)
-                cell.paragraphs[0].runs[0].font.size = Pt(9) if cell.paragraphs[0].runs else None
+                para = cell.paragraphs[0]
+                # 머리글·본문 모두 가운데 정렬로 통일한다.
+                # (숫자만 우측 정렬하던 때는 열마다 정렬이 달라 들쭉날쭉해 보였다.)
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                for run in para.runs:
+                    run.font.size = Pt(DOCX_TABLE_PT)
                 if ri % 2 == 1:
-                    _cell_bg(cell, "EFF6FF")
+                    _cell_bg(cell, DOCX_TBL_STRIPE_BG)
+
         if caption:
             cp = d.add_paragraph(caption)
-            cp.runs[0].italic = True
-            cp.runs[0].font.size = Pt(9)
+            for run in cp.runs:
+                run.italic = True
+                run.font.size = Pt(DOCX_CAPTION_PT)
+        d.add_paragraph("")
+
+    _fig_no = [0]        # 리스트로 두는 이유: 중첩 함수에서 nonlocal 없이 증가시키려고
+
+    def _figure(png: bytes | None, cap_ko: str, cap_en: str,
+                width_cm: float = 15.5) -> None:
+        """그림 하나를 가운데 정렬로 넣고 'Figure N.' 설명을 단다.
+
+        png가 None이면(=matplotlib 없음 또는 데이터 부족) **아무것도 넣지 않고 넘어간다.**
+        그림 하나 때문에 보고서 생성 전체가 실패하지 않도록 한 것이다.
+        번호도 올리지 않으므로 Figure 번호에 구멍이 생기지 않는다.
+        """
+        if not png:
+            return
+        _fig_no[0] += 1
+        p = d.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run().add_picture(io.BytesIO(png), width=Cm(width_cm))
+        cp = d.add_paragraph(f"Figure {_fig_no[0]}. " + _txt(cap_ko, cap_en))
+        cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in cp.runs:
+            run.italic = True
+            run.font.size = Pt(DOCX_CAPTION_PT)
         d.add_paragraph("")
 
     def _formula(formula_text: str, citation: str = "") -> None:
@@ -1031,7 +1244,7 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
         p = d.add_paragraph()
         p.paragraph_format.left_indent = Cm(1.0)
         run = p.add_run(formula_text)
-        run.font.name = "Courier New"
+        run.font.name = DOCX_FONT_MONO
         run.font.size = Pt(10)
         run.italic = True
         if citation:
@@ -1040,12 +1253,14 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
             crun.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
 
     def _section(num: str, title_ko: str, title_en: str, level: int = 1) -> None:
+        """번호 + 제목. num이 비면 번호 없이 제목만 (초록처럼 번호가 없는 절)."""
         if lang == "en":
-            d.add_heading(f"{num} {title_en}", level=level)
+            body = title_en
         elif lang == "both":
-            d.add_heading(f"{num} {title_ko} / {title_en}", level=level)
+            body = f"{title_ko} / {title_en}"
         else:
-            d.add_heading(f"{num} {title_ko}", level=level)
+            body = title_ko
+        d.add_heading(f"{num} {body}".strip() if num else body, level=level)
 
     def _txt(ko: str, en: str) -> str:
         if lang == "en":  return en
@@ -1071,6 +1286,9 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
             rc2 = p.add_run(ref)
             rc2.font.size = Pt(9)
 
+    # 배경 로고 — 헬퍼 정의가 모두 끝난 뒤에 부른다(중첩 함수라 정의 순서에 걸린다).
+    _add_watermark()
+
     # ── Title page ────────────────────────────────────────────────────────────
     title_text = (
         "V2X 시뮬레이션 분석 보고서" if lang in ("ko", "both")
@@ -1094,7 +1312,9 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
     d.add_page_break()
 
     # ── Abstract ──────────────────────────────────────────────────────────────
-    _section("Abstract" if lang == "en" else "초록", "초록", "Abstract", level=1)
+    # 번호를 비워 넘긴다 — 예전엔 번호 자리에도 "초록"을 넣어 "초록 초록"이 됐다
+    # (영문 모드는 "Abstract Abstract", 양어 모드는 "초록 초록 / Abstract").
+    _section("", "초록", "Abstract", level=1)
 
     avg_lat  = doc.kpis.get("평균 지연 (ms)") or "—"
     cost_imp = doc.improvement.get("비용 개선 (%)")
@@ -1261,6 +1481,13 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
                   caption=_txt("Table 3. 시뮬레이션 핵심 KPI 요약",
                                "Table 3. Simulation KPI summary"))
 
+    _figure(
+        _charts.improvement_delta_bar(doc.improvement, doc.algorithms,
+                                      doc.selected_algorithm, doc.baseline_algorithm),
+        "기준선 대비 변화 — 왼쪽(남색)이 개선, 오른쪽(빨강)이 악화",
+        "Change vs. baseline — left (navy) improved, right (red) worsened",
+    )
+
     _section("4.2", "알고리즘 비교", "Algorithm Comparison", level=2)
     d.add_paragraph(
         _txt(f"선택 알고리즘: {doc.selected_algorithm}  /  기준 알고리즘: {doc.baseline_algorithm}",
@@ -1277,6 +1504,12 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
         _styled_table(a_hdrs, a_rows,
                       caption=_txt("Table 4. 알고리즘 비교 결과",
                                    "Table 4. Algorithm comparison results"))
+
+        _figure(
+            _charts.algorithm_cost_bar(doc.algorithms, doc.selected_algorithm),
+            "알고리즘별 총 경로 비용 (짧을수록 좋음)",
+            "Total route cost by algorithm (shorter is better)",
+        )
 
     _section("4.3", "채널 및 공정성 지표", "Channel and Fairness Metrics", level=2)
     cf_headers = [_txt("지표", "Metric"), _txt("값", "Value"), _txt("출처", "Ref.")]
@@ -1295,6 +1528,13 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
                                "Table 5. Channel and fairness metrics"))
 
     _section("4.4", "구간별 상위 20개", "Top-20 Per-Edge Metrics", level=2)
+
+    _figure(
+        _charts.latency_cdf(doc.latency_all_ms),
+        f"경로 전체 {len(doc.latency_all_ms)}개 구간의 지연 누적분포",
+        f"Latency CDF over all {len(doc.latency_all_ms)} route segments",
+    )
+
     if doc.per_edge_sample:
         pe_cols = ["edge_index", "street_name", "latency_ms", "load_ratio",
                    "handover", "cbr", "path_loss_db", "total_cost"]
@@ -1325,32 +1565,63 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
     # ── 5. Analysis and Discussion ────────────────────────────────────────────
     _section("5.", "분석 및 논의", "Analysis and Discussion")
 
+    # 예전에는 값을 " | "로 이어붙인 글머리 목록이었다. 열이 안 맞아 읽기 어렵고
+    # 4장 표들과 생김새가 따로 놀았다 — 같은 _styled_table로 통일한다.
+    def _finding_table(items: list[dict], fields: list[tuple[str, str, str]],
+                       cap_ko: str, cap_en: str, empty_ko: str, empty_en: str,
+                       limit: int = 8) -> None:
+        """발견 항목 목록을 표로. fields = [(키, 한글 머리글, 영문 머리글), ...]"""
+        if not items:
+            p = d.add_paragraph(_txt(empty_ko, empty_en))
+            for run in p.runs:
+                run.italic = True
+                run.font.size = Pt(DOCX_CAPTION_PT)
+            d.add_paragraph("")
+            return
+        hdrs = [(en if lang == "en" else ko) for _k, ko, en in fields]
+        rows = [[item.get(k) for k, _ko, _en in fields] for item in items[:limit]]
+        _styled_table(hdrs, rows, caption=_txt(cap_ko, cap_en))
+
     _section("5.1", "병목 구간", "Bottleneck Analysis", level=2)
-    if doc.bottleneck_sections:
-        for item in doc.bottleneck_sections[:5]:
-            parts = [str(item.get(f, "")) for f in
-                     ["street_name", "severity", "load_ratio", "latency_ms"] if item.get(f)]
-            d.add_paragraph("  |  ".join(parts), style="List Bullet")
-    else:
-        d.add_paragraph(_txt("병목 구간 없음", "No bottleneck detected"))
+    _finding_table(
+        doc.bottleneck_sections,
+        [("street_name", "도로명", "Street"), ("edge_id", "구간 ID", "Edge ID"),
+         ("severity", "심각도", "Severity"), ("load_ratio", "부하율", "Load"),
+         ("latency_ms", "지연 (ms)", "Latency (ms)")],
+        "Table 8. 병목 구간", "Table 8. Bottleneck sections",
+        "병목 구간이 검출되지 않았습니다.", "No bottleneck detected.",
+    )
 
     _section("5.2", "기지국 과부하", "BS Overload", level=2)
-    if doc.overloaded_bs:
-        for item in doc.overloaded_bs[:5]:
-            parts = [str(item.get(f, "")) for f in
-                     ["bs_name", "severity", "load_ratio"] if item.get(f)]
-            d.add_paragraph("  |  ".join(parts), style="List Bullet")
-    else:
-        d.add_paragraph(_txt("과부하 기지국 없음", "No overloaded BS detected"))
+    _finding_table(
+        doc.overloaded_bs,
+        [("bs_name", "기지국", "Base Station"), ("severity", "심각도", "Severity"),
+         ("load_ratio", "부하율", "Load"), ("capacity", "용량", "Capacity"),
+         ("affected_edge_count", "영향 구간", "Affected Edges")],
+        "Table 9. 과부하 기지국", "Table 9. Overloaded base stations",
+        "과부하 기지국이 검출되지 않았습니다.", "No overloaded BS detected.",
+    )
 
     _section("5.3", "연결성 위험", "Connectivity Risk", level=2)
-    if doc.future_risk_sections:
-        for item in doc.future_risk_sections[:5]:
-            parts = [str(item.get(f, "")) for f in
-                     ["street_name", "severity", "nearest_bs_name"] if item.get(f)]
-            d.add_paragraph("  |  ".join(parts), style="List Bullet")
-    else:
-        d.add_paragraph(_txt("연결성 위험 없음", "No connectivity risk detected"))
+    _finding_table(
+        doc.future_risk_sections,
+        [("street_name", "도로명", "Street"), ("edge_id", "구간 ID", "Edge ID"),
+         ("nearest_bs_name", "최근접 기지국", "Nearest BS"),
+         ("severity", "심각도", "Severity")],
+        "Table 10. 연결성 위험 구간", "Table 10. Connectivity risk sections",
+        "연결성 위험이 검출되지 않았습니다.", "No connectivity risk detected.",
+    )
+
+    _section("5.4", "높은 지연 구간", "High-Latency Sections", level=2)
+    _finding_table(
+        doc.high_latency_sections,
+        [("street_name", "도로명", "Street"), ("edge_id", "구간 ID", "Edge ID"),
+         ("connected_bs", "연결 기지국", "Connected BS"),
+         ("latency_ms", "지연 (ms)", "Latency (ms)"),
+         ("excess_ms", "초과분 (ms)", "Excess (ms)")],
+        "Table 11. 기준을 넘긴 지연 구간", "Table 11. Sections exceeding the latency threshold",
+        "기준을 넘긴 지연 구간이 없습니다.", "No section exceeded the latency threshold.",
+    )
 
     # ── 6. Conclusion ─────────────────────────────────────────────────────────
     _section("6.", "결론", "Conclusion")

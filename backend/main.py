@@ -10107,7 +10107,9 @@ async def websocket_endpoint(ws: WebSocket):
 # Report / Export API
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from fastapi.responses import StreamingResponse
+# JSONResponse는 아래 두 곳(/api/report/bundle 오류 응답, /api/export/report/json)에서
+# 쓰는데 임포트가 빠져 있었다 — 두 경로 모두 호출 즉시 NameError로 500이 났다.
+from fastapi.responses import JSONResponse, StreamingResponse
 
 
 @app.get("/api/report/bundle")
