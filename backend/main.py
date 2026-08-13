@@ -3866,6 +3866,10 @@ def _run_prewarm(scales: list[float]) -> None:
     net 바이트 + 배율 + 수요 범위 + 통과 비율로 만들어지므로, 다른 방식으로 만들면
     키가 어긋나 시연 때 적중하지 않는다. 그래서 굳이 정책값을 바꿔가며 같은 함수를 부른다.
     """
+    # ⚠️ `policy_options`는 구역을 새로 설정하면 **None**이 된다(키가 없는 게 아니라 None).
+    #    setdefault로는 못 채운다 — 저장된 설정을 실제로 적용해서 채워야 한다.
+    if not isinstance(_state.get("policy_options"), dict):
+        _apply_simulation_config(merge_with_default_config(_state.get("simulation_config")))
     pol = _state.get("policy_options") or {}
     original = pol.get("demand_scale_pct", 100.0)
     try:
@@ -3873,7 +3877,6 @@ def _run_prewarm(scales: list[float]) -> None:
             _prewarm_state["current"] = pct
             _prewarm_state["message"] = f"{pct:.0f}% 교통 준비 중…"
             try:
-                _state.setdefault("policy_options", {})
                 _state["policy_options"]["demand_scale_pct"] = float(pct)
                 sc = current_traffic_scenario(
                     log=lambda m: _prewarm_state.update(message=m))
