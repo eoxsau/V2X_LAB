@@ -46,6 +46,7 @@ teleport (⚠️ 여기서 문서의 기존 지침을 뒤집었다 — 2026-07-2
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 import time
@@ -183,6 +184,7 @@ def run_simulation(
     stop_when_drained: bool = True,
     poll_s: float = DEFAULT_POLL_S,
     prefix: str = "sim",
+    sumo_threads: Optional[int] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> SimResult:
     """경로파일을 SUMO로 굴리고 시간곡선 + 피크 엣지 교통량을 돌려준다.
@@ -240,7 +242,7 @@ def run_simulation(
         net_file, routes_file, summary_f, edgedata_f,
         begin_s, end_s, interval_s, step_length, ignore_junction_blocker_s,
         time_to_teleport_s, abort_check,
-        depart_max if stop_when_drained else None, poll_s, log)
+        depart_max if stop_when_drained else None, poll_s, sumo_threads, log)
 
     res = SimResult(
         net_file=str(net_file), routes_file=str(routes_file),
@@ -306,6 +308,7 @@ def _run_sumo(
     ignore_junction_blocker_s: float, time_to_teleport_s: float,
     abort_check: Optional[Callable[[dict], Optional[str]]],
     drain_after_s: Optional[float], poll_s: float,
+    sumo_threads: Optional[int],
     log: Callable[[str], None],
 ) -> tuple[bool, str]:
     """sumo 실행 + `poll_s`마다 summary를 훔쳐보며 조기 종료 판단.
@@ -346,6 +349,7 @@ def _run_sumo(
         "--ignore-junction-blocker", f"{ignore_junction_blocker_s:.0f}",
         "--collision.action", "none",
         "--no-step-log", "--no-warnings",
+        "--threads", str(sumo_threads if sumo_threads is not None else max(1, (os.cpu_count() or 1) // 4)),
     ]
     # 우회는 기본이 0(끔)이라 옵션 자체를 붙이지 않는다 — 이유는 DEFAULT_REROUTING_PROBABILITY 주석.
     # 값을 올리면 그때만 붙으므로, 끈 상태의 명령줄은 이 기능이 생기기 전과 완전히 같다

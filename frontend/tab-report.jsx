@@ -60,7 +60,7 @@ function algoLabel(key) {
     latency_minimizing_allocation: 'Latency Minimizing', priority_based_allocation: 'Priority Based',
     lookahead_resource_allocation: 'Look-ahead',
     // GNN-MAML RL
-    rl_routing: 'GNN-MAML 경로', rl_based_bs_selection: 'GNN-MAML BS',
+    rl_routing: 'GNN-MAML 경로',
     v4_gnn: 'GNN-MAML', rl_bs_placement: 'GNN-MAML 배치',
   };
   return MAP[key] ?? key;
@@ -70,6 +70,7 @@ function inferBatchKind(batch) {
   const label = batch.label || '';
   if (label.startsWith('파라미터 스윕')) return { tone: 'brand', text: '파라미터 스윕' };
   if (label.startsWith('RL 정책 비교'))  return { tone: 'good',  text: 'GNN-MAML 비교' };
+  if (label.startsWith('GNN-MAML 비교')) return { tone: 'good',  text: 'GNN-MAML 비교' };
   if (label.startsWith('시뮬레이션 시트 비교')) return { tone: 'warn', text: '시트 비교' };
   if ((batch.results || []).some(r => r.mode === 'rl_episode')) return { tone: 'good', text: 'RL 배치' };
   return { tone: '', text: '시나리오 배치' };

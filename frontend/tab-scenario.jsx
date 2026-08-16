@@ -12,7 +12,7 @@ let SC_OPTIONS = {
   algorithm_selection: {
     route_algorithm: ['dijkstra', 'astar', 'k_shortest_path', 'network_aware', 'lookahead', 'rl_routing'],
     latency_algorithm: ['tech_latency_v31', 'full_composite_latency', 'blockage_aware_latency', 'mec_aware_latency', 'distance_based_latency', 'load_aware_latency'],
-    base_station_selection_algorithm: ['rsrp_max', 'nearest_bs', 'lowest_latency_bs', 'strongest_signal_bs', 'load_balanced_bs', 'look_ahead_bs_selection', 'rl_based_bs_selection'],
+    base_station_selection_algorithm: ['rsrp_max', 'nearest_bs', 'lowest_latency_bs', 'strongest_signal_bs', 'load_balanced_bs', 'look_ahead_bs_selection', 'v4_gnn'],
     resource_allocation_algorithm: ['traffic_aware_allocation', 'equal_allocation', 'proportional_demand_allocation', 'load_balancing_allocation', 'latency_minimizing_allocation', 'priority_based_allocation', 'lookahead_resource_allocation'],
   },
   policy_options: {

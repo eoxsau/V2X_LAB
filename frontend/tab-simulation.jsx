@@ -30,7 +30,6 @@ const BS_SELECTION_ALGORITHMS = [
   'strongest_signal_bs',
   'load_balanced_bs',
   'look_ahead_bs_selection',
-  'rl_based_bs_selection',
   'v4_gnn',                  // GNN-MAML 직접 BS 선택
 ];
 const RESOURCE_ALLOCATION_ALGORITHMS = [
@@ -81,7 +80,7 @@ function scbSaveBatches(list) {
 }
 
 // 엑셀 시트탭 스트립 — 더블클릭으로 이름 수정, "+"로 새 시트, "전체 비교 실행"으로 일괄 평가.
-function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, onToggleGrid, gridView, hasEnv, activeAlgorithms }) {
+function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, onRunBatch, batchRunning, batchError, batchMsg, onCancelBatch, onToggleGrid, gridView, hasEnv, activeAlgorithms }) {
   const [editingIdx, setEditingIdx] = useState(null);
   const [editValue, setEditValue] = useState('');
 
@@ -172,6 +171,19 @@ function SheetTabBar({ sheets, activeIdx, onSwitch, onAdd, onRename, onRemove, o
         }}>+</button>
         <div style={{ flex: 1 }} />
         {batchError && <span style={{ alignSelf: 'center', fontSize: 11, color: 'var(--bad)', marginRight: 8, whiteSpace: 'nowrap' }}>{batchError}</span>}
+        {batchRunning && batchMsg && (
+          <span style={{ alignSelf: 'center', fontSize: 10, color: 'var(--ink-4)', marginRight: 6, maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={batchMsg}>
+            {batchMsg}
+          </span>
+        )}
+        {batchRunning && onCancelBatch && (
+          <button
+            className="btn sm"
+            onClick={onCancelBatch}
+            style={{ alignSelf: 'center', margin: '0 2px', flex: '0 0 auto', color: 'var(--bad)', borderColor: 'var(--bad)' }}
+            title="배치 잠금을 해제합니다. 백그라운드 스레드는 계속 실행됩니다."
+          >취소</button>
+        )}
         <button
           className="btn sm"
           onClick={onToggleGrid}
@@ -205,7 +217,7 @@ function AlgorithmSheetBar({ selectedAlgorithms, onChange }) {
     network_aware_routing: 'Net-Aware', look_ahead_routing: 'Lookahead', rl_routing: 'RL-Route',
     rsrp_max: 'RSRP Max', nearest_bs: 'Nearest', lowest_latency_bs: 'Low-Lat',
     strongest_signal_bs: 'Strong-Sig', load_balanced_bs: 'Load-Bal',
-    look_ahead_bs_selection: 'Lookahead', rl_based_bs_selection: 'RL-BS', v4_gnn: 'GNN-MAML',
+    look_ahead_bs_selection: 'Lookahead', v4_gnn: 'GNN-MAML',
     tech_latency_v31: 'v3.1', distance_based_latency: 'Dist', load_aware_latency: 'Load',
     blockage_aware_latency: 'Block', mec_aware_latency: 'MEC', full_composite_latency: 'Full',
     equal_allocation: 'Equal', proportional_allocation: 'Prop', traffic_aware_allocation: 'Traffic',
@@ -458,6 +470,22 @@ function SheetMiniMap({ sheet, isActive,
     }
   }, [isActive, liveRouteCoords]);
 
+  // ── 비활성 시트: batch 결과 도착 후 경로 polyline 갱신 ─────────────
+  // map init 시점(sheet.id effect)에는 result가 없을 수 있어 경로가 그려지지 않는다.
+  // routeCoords 길이가 바뀌면(결과 도착) polyline을 새로 그리거나 갱신한다.
+  useEffect(() => {
+    if (isActive || !mapRef.current) return;
+    const route = sheet.result?.routeCoords || [];
+    const norm  = route.map(normPt);
+    if (!norm.length) return;
+    if (polyRef.current) {
+      polyRef.current.setLatLngs(norm);
+    } else {
+      polyRef.current = L.polyline(norm, { color: '#1E88E5', weight: 3, opacity: 0.85, interactive: false }).addTo(mapRef.current);
+    }
+    try { mapRef.current.fitBounds(polyRef.current.getBounds(), { padding: [18, 18] }); } catch (_) {}
+  }, [isActive, sheet.result?.routeCoords?.length]);
+
   // ── 활성 시트: 실시간 자차 + BS + 접속선 ───────────────────────────
   useEffect(() => {
     if (!isActive || !mapRef.current) return;
@@ -694,6 +722,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const groups  = useRef({});
   const prevVehPos = useRef(null);
   const bgVehMarkers = useRef({}); // 다중차량 실험군 — 배경 차량 마커 풀 (id → circleMarker), setLatLng로 재사용
+  const bgVehAnimRef = useRef(null); // 배경 차량 route_coords 애니메이션 — { id → { step, intervalId } }
   const stationMarkers = useRef({});   // 기지국 마커 풀 (id → circleMarker) — networkTelemetry가 초당 10회 들어와도 매번 재생성하지 않음
   const candidateMarkers = useRef({}); // 후보 노드 마커 풀 (id → circleMarker), 위와 동일한 이유
   const buildingsSigRef = useRef(null); // 직전에 그린 차폐 건물 집합의 서명 — 안 바뀌었으면 폴리곤 다시 안 그림
@@ -764,6 +793,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
   const [batchRunning, setBatchRunning] = useState(false);
   const [gridView, setGridView] = useState(false); // CCTV grid view — all sheets side by side
   const [batchError, setBatchError] = useState(null);
+  const [batchMsg, setBatchMsg] = useState(null);
   const prevArrived = useRef(false);
 
   // ── 시트별 독립 루프 애니메이션 ──────────────────────────────────────
@@ -948,6 +978,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (groups.current.route)  groups.current.route.clearLayers();
     if (groups.current.bgVeh)  groups.current.bgVeh.clearLayers();
     bgVehMarkers.current = {};
+    if (bgVehAnimRef.current) {
+      Object.values(bgVehAnimRef.current).forEach(({ intervalId }) => clearInterval(intervalId));
+      bgVehAnimRef.current = {};
+    }
   }
 
   function renameSheet(idx, name) {
@@ -1036,7 +1070,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (setSimHistory) setSimHistory([]);
     if (setRouteEdges) setRouteEdges(null);
 
-    setBatchRunning(true); setBatchError(null);
+    setBatchRunning(true); setBatchError(null); setBatchMsg(null);
     try {
       const res = await fetch(`${api}/api/scenarios/batch`, {
         method: 'POST',
@@ -1123,7 +1157,19 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 disconnection_steps: r.disconnection_steps,
               } : null,
               simLogs:             s.result?.simLogs    || [],
-              simHistory:          s.result?.simHistory || [],
+              // batch 결과에는 step-by-step history가 없으므로 per_edge로 합성한다.
+              // 기존 live 시뮬 history가 있으면 그대로 보존(덮어쓰지 않음).
+              simHistory: (() => {
+                if (s.result?.simHistory?.length) return s.result.simHistory;
+                const edges = r.route_cost_result?.per_edge || [];
+                if (edges.length < 2) return [];
+                return edges.map((e, i) => ({
+                  t: i * 10,
+                  latency: e.latency_ms ?? 0,
+                  bs: e.bs_name ?? null,
+                  progress: (i + 1) / edges.length,
+                }));
+              })(),
             },
           };
         });
@@ -1164,9 +1210,11 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
           prevProcessed = allResults.length;
         }
 
+        if (data.message) setBatchMsg(data.message);
         if (data.status === 'completed') {
           clearInterval(timer);
           setBatchRunning(false);
+          setBatchMsg(null);
           // 분석보고서용 저장 (storage event로 report 탭이 자동 갱신됨)
           const saved = scbLoadBatches();
           saved.push({ batch_id: batchId, label: data.label, started_at: data.started_at, ended_at: data.ended_at, results: data.results });
@@ -1248,7 +1296,7 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       const res = await fetch(`${api}/api/scenarios/batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: 'GNN-MAML 실행', scenarios: [spec] }),
+        body: JSON.stringify({ label: 'GNN-MAML 비교', scenarios: [spec] }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || res.statusText);
@@ -1257,6 +1305,14 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       setRlRunning(false); setBatchRunning(false);
       setRlError(e.message || 'GNN-MAML 실행 중 오류가 발생했습니다.');
     }
+  }
+
+  async function cancelBatch() {
+    try {
+      await fetch(`${api}/api/scenarios/batch/active`, { method: 'DELETE' });
+    } catch {}
+    setBatchRunning(false);
+    setBatchMsg(null);
   }
 
   const coordStr = (ll) => `${ll.lat.toFixed(4)}, ${ll.lng.toFixed(4)}`;
@@ -1634,6 +1690,38 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     });
   }, [backgroundVehicles, showLayers.vehicles]);
 
+  /* ── 배경 차량 route_coords 애니메이션 — route_coords가 있는 배경 차량만 ──── */
+  useEffect(() => {
+    // 기존 애니메이션 정리
+    const prev = bgVehAnimRef.current;
+    if (prev) {
+      Object.values(prev).forEach(({ intervalId }) => clearInterval(intervalId));
+    }
+    bgVehAnimRef.current = {};
+
+    const list = (backgroundVehicles || []).filter(v => v.route_coords?.length >= 2);
+    if (!list.length || !showLayers.vehicles) return;
+
+    list.forEach((v) => {
+      let step = Math.floor(Math.random() * v.route_coords.length); // 시작 위치를 분산
+      const speed = v.speed || 30; // km/h
+      const msPerStep = Math.max(200, Math.round(1000 * 30 / Math.max(speed, 1)));
+      const intervalId = setInterval(() => {
+        const m = bgVehMarkers.current[v.id];
+        if (!m) return;
+        step = (step + 1) % v.route_coords.length;
+        const [lat, lng] = v.route_coords[step];
+        m.setLatLng([lat, lng]);
+      }, msPerStep);
+      bgVehAnimRef.current[v.id] = { step, intervalId };
+    });
+
+    return () => {
+      Object.values(bgVehAnimRef.current || {}).forEach(({ intervalId }) => clearInterval(intervalId));
+      bgVehAnimRef.current = {};
+    };
+  }, [backgroundVehicles, showLayers.vehicles]);
+
   /* ── mode interaction handlers ───────────────────────────────── */
   // 실행이 시작되면 지도 상호작용 모드도 강제 해제한다 — 패널만 잠그면, 잠기기 직전에
   // 켜둔 모드(구역 그리기·기지국 배치/삭제 등)가 지도에서 그대로 살아있어 우회로가 된다.
@@ -1818,19 +1906,19 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
         // 행정구역 찾음 → setup-network-region 시도 (로컬 PBF + 캐시 활용)
         const { region } = await byCoordRes.json();
         setOsmStage(2);
+        const drawnBbox = { s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() };
         const res = await fetch(`${api}/api/setup-network-region`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ osm_id: region.osm_id }),
+          body: JSON.stringify({ osm_id: region.osm_id, user_bbox: drawnBbox }),
         });
         const body = await res.json();
         if (res.ok) {
           usedRegionPath = true;
           setOsmSource(body.cached ? 'cache' : 'local_pbf');
           if (body.warning) setOsmWarning(body.warning);
-          const rb = body.bbox;
-          if (mapObj.current && rb) mapObj.current.fitBounds([[rb.s, rb.w], [rb.n, rb.e]], { padding: [50, 50] });
-          else if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
+          // 사용자가 그린 구역으로 지도를 맞춘다 (admin region bbox가 아님)
+          if (mapObj.current) mapObj.current.fitBounds(bounds, { padding: [50, 50] });
         }
         // res not ok → fall through to setup-network below
       }
@@ -1880,6 +1968,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     const id = setInterval(tick, 5000);
     return () => { alive = false; clearInterval(id); };
   }, [area, api]);
+
+  /* ── 교통량 배율 백엔드 동기화 ───────────────────────────────
+     슬라이더를 움직이면 800ms 디바운스 후 /api/demand/set-scale을 호출해
+     policy_options를 즉시 반영하고 백그라운드 교통 재계산을 유발한다.
+     이렇게 하면 SA 배치 시 이미 올바른 배율의 교통이 준비돼 있다. */
+  const _demandScaleSyncTimer = React.useRef(null);
+  useEffect(() => {
+    if (!area) return;
+    if (_demandScaleSyncTimer.current) clearTimeout(_demandScaleSyncTimer.current);
+    _demandScaleSyncTimer.current = setTimeout(() => {
+      fetch(`${api}/api/demand/set-scale`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ demand_scale_pct: demandScalePct }),
+      }).catch(() => {});
+    }, 800);
+    return () => { if (_demandScaleSyncTimer.current) clearTimeout(_demandScaleSyncTimer.current); };
+  }, [demandScalePct, area, api]);
 
   /* ── button actions ──────────────────────────────────────────── */
   const tryArea   = () => setMode(mode === 'area' ? null : 'area');
@@ -2052,6 +2158,10 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
     if (groups.current.connLines) { groups.current.connLines.clearLayers(); }
     if (groups.current.bgVeh)     { groups.current.bgVeh.clearLayers(); }
     bgVehMarkers.current = {};
+    if (bgVehAnimRef.current) {
+      Object.values(bgVehAnimRef.current).forEach(({ intervalId }) => clearInterval(intervalId));
+      bgVehAnimRef.current = {};
+    }
     dispatch({ type: 'reset' });
   }
 
@@ -2796,27 +2906,24 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
                 <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
                   누르면 기존 배치를 지우고 새로 배치합니다 (번호 1부터).
                 </div>
-                {/* 교통이 만들어지기 전에는 누르지 못하게 막는다.
-                    `calibrated`는 곧 "교통 시나리오가 실제로 존재한다"는 뜻이다
-                    (백엔드 /api/demand/status — current_traffic_scenario(build=False)가 값을 냈을 때만 true).
-                    최적화가 쓰는 optimize_placement_v2()도 같은 build=False로 교통을 집으므로,
-                    이 값이 false인 동안 누르면 (a) 교통 생성이 끝날 때까지 요청이 수 분~수십 분
-                    매달리거나 (b) 생성이 실패하면 실측 교통 대신 균일 수요로 폴백해
-                    "골고루 뿌리기"에 가까운 배치가 나온다(v2 §8-1). 둘 다 사용자가 알기 어렵다. */}
-                {!demandStatus?.calibrated && area && (
+                {/* 교통 계산 중일 때만 막는다. 계산이 끝나면(배율 불일치 포함) SA를 진행할 수 있다.
+                    백엔드가 build=False로 교통을 집고, 없으면 ITS·균일 수요로 폴백하므로
+                    calibrated=false라도 SA는 동작한다 — 다만 결과가 덜 정교할 수 있다. */}
+                {demandStatus?.preparing && area && (
                   <div className="muted" style={{ fontSize: 10, marginBottom: 8, color: 'var(--warn)' }}>
-                    {demandStatus?.preparing
-                      ? `교통량 계산이 끝나야 누를 수 있습니다${demandStatus?.stage ? ` (${demandStatus.stage} 단계)` : ''} — 실측 교통을 수요로 써야 배치가 의미가 있습니다.`
-                      : '교통이 아직 준비되지 않았습니다. 시뮬레이션을 한 번 시작하거나 교통 준비가 끝날 때까지 기다려 주세요.'}
+                    교통량 계산 중{demandStatus?.stage ? ` (${demandStatus.stage} 단계)` : ''}… 완료 후 SA가 실측 수요를 사용합니다.
+                  </div>
+                )}
+                {!demandStatus?.calibrated && !demandStatus?.preparing && area && (
+                  <div className="muted" style={{ fontSize: 10, marginBottom: 8 }}>
+                    실측 교통 없음 — SA 배치는 ITS·균일 수요로 진행됩니다.
                   </div>
                 )}
                 <button className="btn sm block accent"
-                  disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0 || !demandStatus?.calibrated}
+                  disabled={!area || saPlacing || (saN.bs + saN.rsu) === 0 || !!demandStatus?.preparing}
                   onClick={() => placeNodes('sa', saN, true, setSaPlacing)}>
                   <Icon.antenna size={13} /> {saPlacing
                     ? (placementProgress ? `최적화 중… ${placementProgress.pct}%` : '최적화 중…')
-                    : !demandStatus?.calibrated && area
-                    ? '교통량 계산 대기 중…'
                     : `최적화 배치 (BS ${saN.bs} · RSU ${saN.rsu})`}
                 </button>
                 {/* 진행률 막대 — 예전엔 콘솔에만 찍혀서 사용자는 수 분 동안 멈춘 건지
@@ -3126,6 +3233,8 @@ function SimulationTab({ sim, dispatch, active, vehiclePos, routeCoords, setRout
       onRunBatch={runAllSheetsAsBatch}
       batchRunning={batchRunning}
       batchError={batchError}
+      batchMsg={batchMsg}
+      onCancelBatch={cancelBatch}
       onToggleGrid={() => setGridView(v => !v)}
       gridView={gridView}
       hasEnv={!!(originDone && destDone)}

@@ -37,7 +37,7 @@ from typing import Callable, Optional, Sequence
 
 from .assignment import gate_routable_edges, read_net, routable_edges
 from .pipeline import DEFAULT_CELL_M, build_demand_context, generate_demand
-from .simulation import DEFAULT_STEP_LENGTH, run_simulation
+from .simulation import DEFAULT_STEP_LENGTH, _depart_range, run_simulation
 
 # 시드용 목표 자유류 밀도 (veh / lane-km).
 #
@@ -89,24 +89,20 @@ DEFAULT_SAFETY_FACTOR = 0.9
 #     시드 44,968  vs  실제 통과 최대 ~11,000  →  0.24
 # 시드 공식의 T_ff는 *자유류* 통행시간이라 정체 구간에서 3~4배로 늘어난다. 즉 시드는
 # 원리적으로 크게 나오고, k_target=2.8이 근거 없는 값이라 그 위에 오차가 더 얹힌다.
-SEED_TRUST = 0.25
+SEED_TRUST = 0.50   # 0.25→0.50: 1라운드 시작점을 실제 N* 근처로 올려 바로 브래킷
 
-# 중심 대비 배수 — 3배 폭. 아래쪽을 촘촘히 두는 이유는 **비용 비대칭** 때문이다.
-# 'low' 실행은 ~180초에 끝나지만 'high'(교착)는 320~380초가 걸린다(실측). 위쪽을 촘촘히
-# 깔면 비싼 실행만 골라 밟는다.
-SEARCH_SPREAD = (0.5, 0.75, 1.0, 1.5)
+# 중심 대비 배수 — 3개 포인트. SEED_TRUST=0.5로 중심이 이미 N* 근처라
+# 4점 대신 3점으로도 1라운드 내 브래킷이 충분하다.
+SEARCH_SPREAD = (0.7, 1.0, 1.35)
 
 # 조기 종료가 성급해지지 않게 하는 하한 — 도착이 이보다 적으면 순간이동 비율을 안 본다.
 # (초반 몇십 대 구간에서는 텔포 2~3건만으로도 비율이 튄다)
-MIN_ARRIVED_FOR_ABORT = 200
+# 200→100: 소형 구역에서 abort가 더 빨라진다.
+MIN_ARRIVED_FOR_ABORT = 100
 
 # 탐색 종료 폭 — (hi − lo)가 lo의 이 비율 아래로 좁혀지면 멈춘다.
-#
-# 예전 5%는 **노이즈보다 작은 값을 쫓고 있었다.** 위 DEFAULT_SAFETY_FACTOR 주석의 실측이
-# 그대로 근거다 — 같은 조건에서 5,500 실패 / 5,742 통과 / 5,993 통과 / 6,244 실패로
-# 뒤섞인다(경계가 확률적이라 run-to-run 변동이 ±10% 수준). 그보다 좁게 좁히려고
-# 라운드를 하나 더 쓰는 건 순수한 낭비다. 어차피 뒤에 안전계수 0.9를 곱한다.
-DEFAULT_TOLERANCE = 0.15
+# N* 자체의 run-to-run 변동이 ±10%이므로 20%는 노이즈 안에 있다. 속도 우선.
+DEFAULT_TOLERANCE = 0.20
 
 # N* 캐시를 재사용해도 되는 도로망 변화 한계 (차로연장 상대차). 근거는 `_nstar_cache_key`.
 # 같은 bbox를 다시 그렸을 때 netconvert 흔들림은 1% 안이고, N* 자체의 run-to-run 변동이
@@ -301,6 +297,37 @@ def _verdict(sim) -> str:
     return "ok"
 
 
+def _peak_calibration_profile(
+    time_profile: Optional[Sequence[tuple[float, float, float]]],
+    morning_cutoff_h: float = 10.0,
+    min_frac: float = 0.10,
+) -> tuple:
+    """보정 전용: 오전 피크 슬라이스만 추려 SUMO 창을 단축한다.
+
+    반환: (cal_profile, frac_covered)
+
+    아침·저녁 첨두는 **독립적**: 어느 한 첨두에서 정체가 생겼다 풀리면 N* 기준은 성립한다.
+    10시 커트오프: depart_max ~10:00 → stop_when_drained가 ~12:00에 발동 — 시뮬 창 ~5h.
+    (이전: 13시 커트오프 → ~7h, 풀 프로파일 → ~17h)
+
+    N* 의미 보존: `_evaluate` 안에서 `total_trips = level × frac_covered`로 넘기되
+    generate_demand가 _cal_profile 비율로 재분배하므로 피크 시간당 출발대수는 전일 기준과 동일.
+    lo/hi/best는 **전일 기준 level**을 그대로 추적하므로 최종 N*는 전일 기준이다.
+
+    frac_covered가 `min_frac` 미만이면 (비정형 프로파일) 전체를 그대로 쓴다.
+    """
+    if not time_profile:
+        return time_profile, 1.0
+    morning = [(b, e, s) for b, e, s in time_profile if b < morning_cutoff_h]
+    if not morning:
+        return time_profile, 1.0
+    total = sum(s for _, _, s in time_profile) or 1.0
+    frac = sum(s for _, _, s in morning) / total
+    if frac < min_frac:
+        return time_profile, 1.0
+    return sorted(morning, key=lambda x: x[0]), frac
+
+
 def _lane_km(net_file, bbox, log, through_ratio: float = 0.0) -> float:
     """그린 구역에 걸치는 lane-km. 0이 나오면 net 전체로 폴백한다.
 
@@ -354,12 +381,12 @@ def calibrate_nstar(
     *,
     seed: Optional[float] = None,
     k_target: float = K_TARGET,
-    max_rounds: int = 3,
+    max_rounds: int = 1,
     n_parallel: Optional[int] = None,
     seed_trust: float = SEED_TRUST,
     search_spread: Sequence[float] = SEARCH_SPREAD,
     lane_km: Optional[float] = None,
-    up_factor: float = 2.0,
+    up_factor: float = 1.5,
     down_factor: float = 0.5,
     tolerance: float = DEFAULT_TOLERANCE,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
@@ -394,7 +421,7 @@ def calibrate_nstar(
         lane_km = _lane_km(net_file, demand_kwargs.get("bbox"), log,
                            demand_kwargs.get("through_ratio", 0.0))
     r_peak = peak_rate_per_hour(time_profile)
-    workers = n_parallel or max(1, min(4, (os.cpu_count() or 4) // 2))
+    workers = n_parallel or max(1, min(6, (os.cpu_count() or 4) // 2))
 
     # seed를 직접 넘겨도 T_ff는 계산한다 — 진단(k_freeflow)에 필요하고, 시뮬 없이 ~15초면 된다.
     seed_supplied = seed is not None
@@ -442,6 +469,16 @@ def calibrate_nstar(
     res = NStarResult(n_star=seed, seed=seed, lane_km=lane_km,
                       freeflow_travel_s=t_ff_s, peak_rate_per_h=r_peak)
 
+    # 보정 전용: 오전 슬라이스만으로 SUMO 창을 줄인다 (저녁 피크는 독립적이라 불필요).
+    # depart_max가 ~22:00 → ~13:00으로 당겨지면 stop_when_drained가
+    # 피크 종료 2~3h 안에 SUMO를 끊어 실행시간이 약 2.5x 줄어든다.
+    _cal_profile, _cal_frac = _peak_calibration_profile(time_profile)
+    if time_profile and _cal_frac < 0.999:
+        _peak_end_h = max(e for _, e, _ in _cal_profile)
+        log(f"보정 창 단축: {len(time_profile)}개 슬라이스 → 오전 {len(_cal_profile)}개 "
+            f"({_cal_frac * 100:.0f}%, ~{_peak_end_h:.1f}h까지) "
+            f"— N* 전일 환산 x{1 / _cal_frac:.2f}")
+
     lo: Optional[float] = None      # 확인된 '너무 낮음'
     hi: Optional[float] = None      # 확인된 '너무 높음'
     best: Optional[float] = None    # 통과한 것 중 최대
@@ -451,14 +488,28 @@ def calibrate_nstar(
         """레벨 하나를 굴려 판정. **스레드로 병렬 호출되므로 prefix가 겹치면 안 된다.**"""
         t0 = time.time()
         prefix = f"nstar_{tag}"
-        d = generate_demand(net_file=net_file, out_dir=out_dir, total_trips=level,
-                            time_profile=time_profile, prefix=prefix, **demand_kwargs)
+        # 피크 슬라이스만 사용: depart_max를 당겨 stop_when_drained가 일찍 발동하게 한다.
+        # N* 단위는 전일 기준이므로 level은 그대로 추적하고 SUMO에는 축소된 통행만 넘긴다.
+        cal_level = level * _cal_frac
+        d = generate_demand(net_file=net_file, out_dir=out_dir, total_trips=cal_level,
+                            time_profile=_cal_profile, prefix=prefix, **demand_kwargs)
+        # end_s: routes 파일의 실제 마지막 출발 + 1시간으로 하드캡.
+        # simulation.py 기본 공식은 window×2 tail이라 오전 2h 창 → 13시까지 잡힌다.
+        # 1h 안에 안 빠지는 차량은 leftover > 0 → _verdict "high" 판정이 맞다.
+        _, _dm = _depart_range(str(d.routes_file))
+        _cal_end_s_local = int(_dm) + 3600
         # ⚠️ step_length는 **운영 시뮬과 같은 값**이어야 한다 (2026-07-27 실측).
         # 보정을 빠르게 하려고 1.0으로 키웠더니 영등포 N*가 5,000 → 4,094로 18% 낮게 나왔다.
         # 스텝이 거칠면 차들이 충돌을 못 피해 교착이 더 낮은 수요에서 터진다.
         # 보정값은 운영 조건에서만 의미가 있으므로 속도보다 일치가 우선이다.
+        # 보정 전용 설정:
+        #   time_to_teleport=60  — 교착 판정을 2× 빠르게 (운영 시뮬은 300s).
+        #   sumo_threads=1       — 4~6개 병렬 프로세스가 코어를 나눠 쓰므로 스레드 경합 방지.
         sim = run_simulation(net_file=net_file, routes_file=d.routes_file,
                              out_dir=out_dir, prefix=prefix, step_length=step_length,
+                             time_to_teleport_s=60.0,
+                             sumo_threads=1,
+                             end_s=_cal_end_s_local,
                              abort_check=_gridlock_abort)
         v = _verdict(sim)
         rec = {
@@ -467,7 +518,7 @@ def calibrate_nstar(
             # 내부/통과로 쪼개면서 총량을 바꾸므로(대수 보존) 실제 생성량을 따로 남긴다.
             # 시나리오 생성도 같은 변환을 거치니 N*를 요청 단위로 두는 게 맞다.
             "trips": round(level),
-            "trips_actual": round(d.total_trips),
+            "trips_actual": round(d.total_trips / _cal_frac),  # 전일 환산
             "vehicles": d.n_vehicles,
             "peak_running": sim.peak_running,
             "halting_ratio": sim.congestion_ratio,
@@ -485,9 +536,8 @@ def calibrate_nstar(
             flags.append("매우빡빡")
         if sim.aborted:
             flags.append(sim.abort_reason.split(":")[0])
-        _act = (f"(실제 {d.total_trips:.0f})"
-                if abs(d.total_trips - level) > max(level * 0.01, 1.0) else "")
-        log(f"  [{tag}] {level:.0f}통행{_act} → 피크 {sim.peak_running}대 "
+        _peak_note = (f" (피크 {d.total_trips:.0f}통행)" if _cal_frac < 0.999 else "")
+        log(f"  [{tag}] {level:.0f}통행{_peak_note} → 피크 {sim.peak_running}대 "
             f"정지 {sim.congestion_ratio * 100:.0f}% 잔류 {rec['leftover']} "
             f"텔포 {rec['teleports']} → **{v}**"
             f"{' [' + '·'.join(flags) + ']' if flags else ''} ({rec['seconds']}s)")
@@ -496,7 +546,8 @@ def calibrate_nstar(
     # 1라운드 — 시드를 신뢰도로 보정한 지점을 중심으로 펼친다
     center = seed * seed_trust
     levels = [center * f for f in search_spread][:workers]
-    log(f"1라운드 중심 {center:.0f}통행 (시드 {seed:.0f} × 신뢰도 {seed_trust})")
+    log(f"1라운드 중심 {center:.0f}통행 (시드 {seed:.0f} × 신뢰도 {seed_trust}) | "
+        f"최대 {max_rounds}라운드, {workers}병렬")
     for rnd in range(max_rounds):
         levels = [lv for lv in levels
                   if lv >= 1.0 and not any(abs(lv - t) < max(t * 0.02, 1.0) for t in tested)]
@@ -533,7 +584,16 @@ def calibrate_nstar(
             levels = [lo * (up_factor ** (i + 1)) for i in range(workers)]
 
     _cleanup_round_files(out_dir)
-    raw_best = best if best is not None else (lo or seed)
+    # 전부 "high"(gridlock)일 때 seed는 과대추정값이라 쓰면 안 된다.
+    # hi × 0.5를 쓰면 "가장 낮은 gridlock 수준의 절반" → 실질적인 운영 수준에 가깝다.
+    if best is not None:
+        raw_best = best
+    elif lo is not None:
+        raw_best = lo
+    elif hi is not None:
+        raw_best = hi * down_factor   # 전부 high → 최솟값의 절반으로 폴백
+    else:
+        raw_best = seed
     res.n_star = raw_best * safety_factor       # 확률적 경계 → 안전 계수(위 설명)
     res.converged = best is not None
     res.stats = {

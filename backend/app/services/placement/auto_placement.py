@@ -140,6 +140,81 @@ def blue_noise_place(
     return result
 
 
+def grid_stratified_place(
+    pool: list[PlacePoint],
+    n: int,
+    bbox: Optional[dict] = None,
+    seed: Optional[int] = None,
+) -> list[PlacePoint]:
+    """공간을 격자로 나눠 각 셀에서 대표 노드를 하나씩 선택한다.
+
+    blue_noise_place는 도로망 밀집 지역에 편중된다 — 도로가 많은 주거지 쪽에 기지국이
+    몰리고 도로가 적은 녹지·강변 인근은 비게 된다. 이 함수는 각 풀 노드를 속한 격자 셀에
+    배정하고(셀 하나에 여러 노드 가능), 각 셀에서 노드를 한 개씩 뽑으므로 도로망 밀도와
+    무관하게 지리적으로 고르게 배치된다.
+
+    알고리즘:
+      1. bbox를 rows×cols 격자로 나눈다 (rows×cols >= n).
+      2. 각 풀 노드를 자신이 속한 셀 버킷에 넣는다.
+      3. 비어 있지 않은 셀에서 각각 1개를 무작위로 뽑는다.
+      4. 셀 수가 n보다 적으면 blue_noise로 보충 (도로망이 극히 희박한 구역).
+      5. n보다 많이 뽑혔으면 blue_noise 기준으로 가장 균등한 n개를 남긴다.
+    """
+    import math as _math
+
+    if not pool:
+        return []
+    k = min(n, len(pool))
+
+    # bbox가 없으면 풀에서 자동 추출
+    if bbox is None:
+        lats = [p.lat for p in pool]
+        lngs = [p.lng for p in pool]
+        bbox = {"s": min(lats), "n": max(lats), "w": min(lngs), "e": max(lngs)}
+
+    lat_s, lat_n = bbox["s"], bbox["n"]
+    lng_w, lng_e = bbox["w"], bbox["e"]
+
+    # 격자 크기: n개 요청 → rows×cols >= n이 되도록
+    cols = max(1, round(_math.sqrt(k)))
+    rows = max(1, _math.ceil(k / cols))
+
+    dlat = (lat_n - lat_s) / rows or 1e-9
+    dlng = (lng_e - lng_w) / cols or 1e-9
+
+    # 각 노드를 셀 버킷에 배정 — 셀 인덱스 (r, c)
+    buckets: dict[tuple[int, int], list[PlacePoint]] = {}
+    for p in pool:
+        r = min(int((p.lat - lat_s) / dlat), rows - 1)
+        c = min(int((p.lng - lng_w) / dlng), cols - 1)
+        r = max(r, 0)
+        c = max(c, 0)
+        buckets.setdefault((r, c), []).append(p)
+
+    rng = _rng_module.Random(seed)
+
+    # 비어 있지 않은 셀에서 각 1개씩 무작위 선택
+    chosen: list[PlacePoint] = []
+    for pts in buckets.values():
+        chosen.append(rng.choice(pts))
+
+    # 셀이 너무 많아 k를 초과하면: 선택된 것들 중 blue_noise 기준으로 가장 균등한 k개 추출
+    if len(chosen) >= k:
+        chosen_ids = {p.node_id for p in chosen}
+        return blue_noise_place(chosen, k, m=min(len(chosen), max(k * 3, 300)), seed=seed)
+
+    # 셀이 부족하면(도로망이 희박) blue_noise로 나머지 보충
+    chosen_ids = {p.node_id for p in chosen}
+    remaining_n = k - len(chosen)
+    leftover = [p for p in pool if p.node_id not in chosen_ids]
+    if leftover and remaining_n > 0:
+        extra = blue_noise_place(leftover, remaining_n,
+                                 m=min(len(leftover), max(remaining_n * 3, 300)), seed=seed)
+        chosen.extend(extra)
+
+    return chosen[:k]
+
+
 def nearest_neighbor_cv(points: list[PlacePoint]) -> float:
     """배치 균등성 지표: 최근접이웃 거리의 변동계수(CV).
 

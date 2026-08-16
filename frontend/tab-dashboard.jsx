@@ -49,7 +49,6 @@ const ALGO_LABELS = {
   lookahead_resource_allocation: 'Look-ahead',
   // GNN-MAML RL
   rl_routing:              'GNN-MAML 경로',
-  rl_based_bs_selection:   'GNN-MAML BS',
   v4_gnn:                  'GNN-MAML',
   rl_bs_placement:         'GNN-MAML 배치',
 };

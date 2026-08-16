@@ -230,7 +230,8 @@ except ImportError:
 from app.services.regions.region_service import (
     get_sido_list, get_sigungu_list, get_dong_list,
     get_region, get_children, get_region_by_bbox,
-    extract_osm_from_pbf, get_area_km2, mark_network_built, db_available,
+    extract_osm_from_pbf, expected_bbox_osm_path,
+    get_area_km2, mark_network_built, db_available,
     resolve_local_pbf,
 )
 from app.services.export.report_builder import (
@@ -434,11 +435,9 @@ MAX_SETUP_AREA_KM2_LOCAL  = 300.0  # 로컬 PBF 추출 모드 상한 (구/시 �
 # RSU 안테나 높이 — C-V2X 표준 도로변 폴 높이 고정값. RSU는 교차로 폴 설치라 건물 높이를
 # 쓰지 않고 항상 이 값을 쓴다(옥상 스냅 대상 아님). 수동/자동 배치 모두 이 상수를 참조.
 RSU_ANTENNA_HEIGHT_M      = 6.0
-# 전국 OSM PBF 경로 — region_service.resolve_local_pbf()가 유일한 출처다.
-# 여기서 한 번 잡아두되, 서버를 켠 뒤 파일을 넣는 경우도 있어 존재 확인은 요청 때마다 한다.
-DEFAULT_LOCAL_PBF = resolve_local_pbf() or (
-    Path(__file__).parent.parent / "south-korea.osm.pbf"
-)
+# 전국 OSM PBF 경로 — 직접 경로를 사용한다.
+# 파일명이 바뀌면 이 한 줄만 고친다(resolve_local_pbf glob 검색 불필요).
+DEFAULT_LOCAL_PBF = Path(__file__).parent.parent / "data" / "raw" / "south-korea-260812.osm.pbf"
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
@@ -652,6 +651,14 @@ _sim_speed_value = 1.0
 # 대안이 있을 때만 피하고 없으면 그대로 쓰므로 실패하지 않는다.
 # 값 근거: 구역 대각선이 수 km라 정상 경로의 자유류 통행시간은 길어야 수백 초다.
 # 1e5초(약 28시간)면 어떤 정상 경로보다도 압도적으로 비싸다.
+# ── 시뮬레이션 반복 시작 비용 캐시 ──────────────────────────────────────────────
+# 같은 구역에서 시뮬레이션을 여러 번 돌리면 sumolib.net.readNet / OSM 이름 파싱 /
+# 구역 밖 엣지 탐색이 매번 반복됐다. 이 세 가지가 경로 표시까지 수 초 지연의 주 원인이다.
+# net_file과 osm_file이 바뀔 때만(구역 재설정 시) 자동으로 무효화한다.
+_cached_sumo_net: dict = {}          # {net_file_str: sumolib.net.NetReader 객체}
+_cached_out_of_area: dict = {}       # {(net_file_str, bbox_key): frozenset[edge_id]}
+_cached_osm_way_names: dict = {}     # {osm_file_str: {way_id: name}}
+
 OUT_OF_AREA_TRAVELTIME_S = 1e5
 
 # 위 벌점은 `traci.edge.adaptTraveltime`으로 **실행 중인 SUMO에** 거는 것이라, SUMO 자체
@@ -784,7 +791,7 @@ _VALID_ROUTE_ALGORITHMS = frozenset({
 #    LLM이 옳은 값을 골라도 화면이 "허용되지 않은 값"으로 거절했다(2026-08-12).
 _VALID_BS_SELECTION_ALGORITHMS = frozenset({
     "rsrp_max", "nearest_bs", "lowest_latency_bs", "strongest_signal_bs",
-    "load_balanced_bs", "look_ahead_bs_selection", "rl_based_bs_selection",
+    "load_balanced_bs", "look_ahead_bs_selection",
     "look_ahead_bs",  # _bs_score가 받아주는 별칭
     "v4_gnn",         # GNN-MAML 추론으로 직접 선택(모델 미로드 시 내부에서 폴백)
 })
@@ -1830,7 +1837,9 @@ def update_network_telemetry(vehicle_pos: dict | None) -> None:
 
 def load_osm_way_names(osm_file: Path) -> dict[str, str]:
     """Parse OSM XML and return {way_id_str: road_name} for named highway ways."""
-    import re as _re
+    key = str(osm_file)
+    if key in _cached_osm_way_names:
+        return _cached_osm_way_names[key]
     way_names: dict[str, str] = {}
     try:
         tree = ET.parse(osm_file)
@@ -1844,6 +1853,7 @@ def load_osm_way_names(osm_file: Path) -> dict[str, str]:
                 way_names[way.get("id", "")] = name
     except Exception as exc:
         print(f"[OSM] Failed to load way names: {exc}", flush=True)
+    _cached_osm_way_names[key] = way_names
     return way_names
 
 
@@ -4018,6 +4028,32 @@ async def demand_status():
     }
 
 
+class DemandScaleRequest(BaseModel):
+    demand_scale_pct: float
+
+
+@app.post("/api/demand/set-scale")
+async def set_demand_scale(req: DemandScaleRequest):
+    """수요 배율을 즉시 적용하고 백그라운드에서 교통을 다시 만든다.
+
+    프론트엔드가 슬라이더를 움직이면 이 엔드포인트를 호출해 policy_options에 반영한다.
+    이렇게 하면 SA 배치·시뮬레이션 시작 전에 교통이 미리 올바른 배율로 준비된다.
+    """
+    scale_pct = round(clamp_demand_scale(req.demand_scale_pct / 100.0) * 100, 1)
+    pol = dict(_state.get("policy_options") or {})
+    old_scale = float(pol.get("demand_scale_pct", 100.0))
+    pol["demand_scale_pct"] = scale_pct
+    _state["policy_options"] = pol
+
+    if abs(old_scale - scale_pct) > 0.1:
+        cached = _state.get("traffic_scenario")
+        if cached is not None and abs(getattr(cached, "demand_scale", 1.0) * 100 - scale_pct) > 0.1:
+            _state["traffic_scenario"] = None  # 배율이 다른 캐시는 무효화
+        _prepare_traffic_async()  # 새 배율로 백그라운드 재계산
+
+    return {"ok": True, "demand_scale_pct": scale_pct}
+
+
 # OSM에 `lanes` 태그가 없는 도로에 줄 **차로 수 기본값** (방향당).
 #
 # ⚠️ 왜 덮어쓰나 (2026-07-31 실측). 통행 가능 도로의 **83%에 lanes 태그가 없다.**
@@ -4181,8 +4217,9 @@ def netconvert(osm_file: Path, net_file: Path, bbox: Optional[BBox] = None):
     typemap = _osm_typemap()
     if typemap is not None:
         args += ["--type-files", str(typemap)]
-    if bbox is not None:
-        args += ["--keep-edges.in-geo-boundary", f"{bbox.w},{bbox.s},{bbox.e},{bbox.n}"]
+    # bbox 클리핑을 하지 않는다 — osmium이 추출한 OSM을 그대로 사용.
+    # --keep-edges.in-geo-boundary를 쓰면 bbox 경계를 걸친 도로가 잘려
+    # 사용자가 그린 구역 가장자리에 도로가 없는 것처럼 보인다.
     print(f"[NET] Running netconvert: {osm_file.name} → {net_file.name}", flush=True)
     rc, out, err = run_cmd(args, extra_env={"SUMO_HOME": SUMO_HOME} if SUMO_HOME else None)
     if rc != 0:
@@ -4268,8 +4305,15 @@ def simulation_thread(
     print(f"[SIM] origin={origin}  dest={dest}", flush=True)
 
     try:
-        # Load network with sumolib for edge lookup + route coords
-        net = sumolib.net.readNet(net_file, withInternal=False)
+        # Load network with sumolib for edge lookup + route coords.
+        # 같은 net_file이면 재사용 — 파싱 비용(수 초)을 시뮬 첫 실행 때만 치른다.
+        if net_file in _cached_sumo_net:
+            net = _cached_sumo_net[net_file]
+            print(f"[SIM] sumolib net cache hit: {Path(net_file).name}", flush=True)
+        else:
+            net = sumolib.net.readNet(net_file, withInternal=False)
+            _cached_sumo_net[net_file] = net
+            print(f"[SIM] sumolib net loaded (first time): {Path(net_file).name}", flush=True)
         from_candidates = nearest_edge_candidates(net, origin["lat"], origin["lng"], k=8)
         to_candidates   = nearest_edge_candidates(net, dest["lat"],   dest["lng"],   k=8)
         print(f"[SIM] from_candidates={from_candidates[:3]}…  to_candidates={to_candidates[:3]}…", flush=True)
@@ -4352,16 +4396,28 @@ def simulation_thread(
         #     기본 모드 54 → 10 (10개 중 6개가 완전히 안쪽으로)
         #     집계 모드 54 → 54 (전혀 안 먹힘)
         # 나머지 4개는 안쪽만으로 길이 없어 우회한 것이고, 그건 아래에서 경고로 알린다.
-        _out_of_area: set[str] = set()
         _area_bbox = _demand_bbox()
+        _bbox_key = str(_area_bbox) if _area_bbox else ""
+        _oa_cache_key = (net_file, _bbox_key)
+
+        if _oa_cache_key in _cached_out_of_area:
+            _out_of_area: frozenset = _cached_out_of_area[_oa_cache_key]
+            print(f"[SIM] 구역 밖 엣지 캐시 재사용 ({len(_out_of_area)}개)", flush=True)
+        else:
+            _out_of_area_set: set[str] = set()
+            if _area_bbox:
+                from app.services.demand.calibration import _edge_touches_bbox
+                for _e in net.getEdges():
+                    try:
+                        if not _edge_touches_bbox(net, _e, _area_bbox):
+                            _out_of_area_set.add(_e.getID())
+                    except Exception:
+                        continue
+            _out_of_area = frozenset(_out_of_area_set)
+            _cached_out_of_area[_oa_cache_key] = _out_of_area
+
+        # TraCI adaptTraveltime은 SUMO 인스턴스마다 매번 적용해야 한다(세션이 새로 시작되므로).
         if _area_bbox:
-            from app.services.demand.calibration import _edge_touches_bbox
-            for _e in net.getEdges():
-                try:
-                    if not _edge_touches_bbox(net, _e, _area_bbox):
-                        _out_of_area.add(_e.getID())
-                except Exception:
-                    continue
             for _eid in _out_of_area:
                 try:
                     traci.edge.adaptTraveltime(_eid, OUT_OF_AREA_TRAVELTIME_S)
@@ -4501,21 +4557,91 @@ def simulation_thread(
                 print(f"[SIM] Look-ahead routing failed: {_la_exc} — using Dijkstra baseline", flush=True)
                 _state["warning"] = "Look-ahead 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
 
-        # rl_routing — 학습된 PPO/DQN 에이전트로 경로 탐색
-        if _sumo_routing_mode == "rl_routing" and RL_AVAILABLE:
+        elif route_algorithm == "rl_routing" and RL_AVAILABLE:
+            # V4 GNN 체크포인트(v4_policy.pt)로 OSM 노드 경로를 구한 뒤
+            # 각 waypoint를 가장 가까운 SUMO 엣지로 변환해 findRoute로 이어 붙인다.
             try:
-                _registry = _get_rl_registry()
-                if _registry.is_ready:
-                    _rl_result = _registry.run_route(
-                        _state["mock_graph"],
-                        _state.get("network_nodes") or [],
-                        from_edge,
-                        to_edge,
-                        allocation_output=_state.get("last_allocation_result"),
+                from app.services.rl.rl_trainer import _v4_adapter as _rl_adap_s
+                if _rl_adap_s is not None:
+                    _bs_for_rl_s = _state.get("network_nodes") or []
+                    _mock_nodes_s = (_state.get("mock_graph") or {}).get("nodes", {})
+                    _type_map_s = {"5G": "5G", "4G": "4G", "6G": "6G", "bs": "5G", "BS": "5G"}
+                    _net_mode_s = _type_map_s.get(
+                        next((n.get("type", "5G") for n in _bs_for_rl_s if n.get("type")), "5G"), "5G"
                     )
-                    _rl_candidate = _rl_result.get("node_sequence") or []
-                    if len(_rl_candidate) >= 2 and _try_use_candidate(_rl_candidate, "RL"):
-                        _sumo_routing_mode = "rl_routing"
+                    # origin/dest 에서 가장 가까운 OSM 노드를 출발·도착으로 삼는다
+                    def _nearest_osm_node(lat, lng):
+                        best_id, best_d2 = None, float("inf")
+                        for nid, nd in _mock_nodes_s.items():
+                            d2 = (nd.get("lat", 0) - lat) ** 2 + (nd.get("lng", 0) - lng) ** 2
+                            if d2 < best_d2:
+                                best_d2, best_id = d2, nid
+                        return best_id
+
+                    _rl_start = _nearest_osm_node(origin["lat"], origin["lng"])
+                    _rl_end   = _nearest_osm_node(dest["lat"],   dest["lng"])
+
+                    if _rl_start and _rl_end:
+                        from app.services.rl.v2x_routing_env import V2XRoutingEnv as _V2XEnv_s
+                        _rl_adap_s.build_graph(
+                            _state["mock_graph"], _bs_for_rl_s, _rl_end, network_mode=_net_mode_s
+                        )
+                        _rl_adap_s.set_episode_start(_rl_start)
+                        _rl_env_s = _V2XEnv_s(
+                            graph=_state["mock_graph"],
+                            road_nodes=_mock_nodes_s,
+                            bs_nodes=_bs_for_rl_s,
+                            origin_id=_rl_start,
+                            dest_id=_rl_end,
+                        )
+                        _rl_ep_s = run_episode(_rl_env_s, policy="v4_gnn", record_trajectory=True)
+                        _rl_osm_path = [step.node_id for step in (_rl_ep_s.trajectory or [])]
+
+                        if len(_rl_osm_path) >= 2:
+                            # OSM 노드 경로 → SUMO 엣지 경로: 균등 간격 waypoint 5개를 뽑아
+                            # findRoute로 이어 붙인다.
+                            _N_WP = 5
+                            _step_s = max(1, len(_rl_osm_path) // _N_WP)
+                            _wp_nids = _rl_osm_path[::_step_s]
+                            if _wp_nids[-1] != _rl_osm_path[-1]:
+                                _wp_nids.append(_rl_osm_path[-1])
+
+                            _wp_edges: list[str] = []
+                            for _wp_nid in _wp_nids:
+                                _wp_nd = _mock_nodes_s.get(_wp_nid, {})
+                                _wp_lat, _wp_lng = _wp_nd.get("lat"), _wp_nd.get("lng")
+                                if _wp_lat is None:
+                                    continue
+                                try:
+                                    _cands = nearest_edge_candidates(net, _wp_lat, _wp_lng, k=3)
+                                    if _cands:
+                                        _wp_edges.append(_cands[0])
+                                except Exception:
+                                    continue
+
+                            # from_edge → waypoints → to_edge 를 findRoute로 이어 붙이기
+                            _rl_sumo_path: list[str] = []
+                            _all_wp = [from_edge] + _wp_edges + [to_edge]
+                            for _wi in range(len(_all_wp) - 1):
+                                if _all_wp[_wi] == _all_wp[_wi + 1]:
+                                    continue
+                                _seg = traci.simulation.findRoute(_all_wp[_wi], _all_wp[_wi + 1])
+                                if _seg.edges:
+                                    if _rl_sumo_path and _rl_sumo_path[-1] == _seg.edges[0]:
+                                        _rl_sumo_path.extend(_seg.edges[1:])
+                                    else:
+                                        _rl_sumo_path.extend(_seg.edges)
+
+                            if _try_use_candidate(_rl_sumo_path, "RL(V4 GNN)"):
+                                _sumo_routing_mode = "rl_routing"
+                                print(
+                                    f"[SIM] RL(V4 GNN) route: {len(_rl_osm_path)} OSM nodes "
+                                    f"→ {len(_wp_edges)} waypoints → {len(_rl_sumo_path)} SUMO edges "
+                                    f"(arrived={_rl_ep_s.arrived})",
+                                    flush=True,
+                                )
+                else:
+                    print("[SIM] RL routing: V4 adapter not ready — Dijkstra baseline", flush=True)
             except Exception as _rl_exc:
                 print(f"[SIM] RL routing failed: {_rl_exc} — using Dijkstra baseline", flush=True)
                 _state["warning"] = "RL 에이전트 경로 계산 실패 — 기본 Dijkstra 경로를 사용합니다."
@@ -5227,6 +5353,10 @@ def reset_simulation_state() -> None:
     _state["synthetic_network_nodes"] = []
     # Stage-1: keep simulation_config across resets (user's saved config persists)
     _state["policy_options"] = None
+    # 시뮬 시작 캐시 무효화 — 새 구역은 다른 net/osm 파일이므로 모두 비운다.
+    _cached_sumo_net.clear()
+    _cached_out_of_area.clear()
+    _cached_osm_way_names.clear()
 
 
 def _purge_nodes_outside_bbox(bbox: dict, margin_deg: float = 0.005) -> int:
@@ -5414,7 +5544,11 @@ async def setup_network(req: SetupRequest):
     # 이름이 같아지면 아래에서 이미 만들어둔 파일을 그대로 재사용한다.
     # 소수점 6자리 ≈ 0.1m — 마우스로 같은 자리를 두 번 그리긴 어렵지만, 초기화 후 복귀나
     # 프로그램이 같은 좌표로 다시 부르는 경우가 통째로 공짜가 된다.
-    _bbox_key = f"{download_bbox.s:.6f},{download_bbox.w:.6f},{download_bbox.n:.6f},{download_bbox.e:.6f}"
+    # PBF 파일이 바뀌면(mtime 변경) 구역 좌표가 같아도 새로 추출해야 한다.
+    # mtime을 캐시 키에 포함하면 새 PBF를 두었을 때 자동으로 재추출된다.
+    _pbf_mtime = int(DEFAULT_LOCAL_PBF.stat().st_mtime) if use_local_pbf and DEFAULT_LOCAL_PBF.exists() else 0
+    # v2 접미사: --keep-edges.in-geo-boundary 제거 이후 net 캐시와 구별.
+    _bbox_key = f"{download_bbox.s:.6f},{download_bbox.w:.6f},{download_bbox.n:.6f},{download_bbox.e:.6f},pbf{_pbf_mtime},v2"
     req_id = hashlib.sha1(_bbox_key.encode()).hexdigest()[:8]
     osm_file = WORK_DIR / f"area-{req_id}.osm"
     net_file = WORK_DIR / f"area-{req_id}.net.xml"
@@ -5631,6 +5765,7 @@ def regions_children(osm_id: int):
 class RegionSetupRequest(BaseModel):
     osm_id: int
     pbf_path: Optional[str] = None  # 기본값: ~/Desktop/south-korea-260711.osm.pbf
+    user_bbox: Optional[dict] = None  # {s,w,n,e} — 사용자가 실제로 그린 bbox. 배치 후보 필터에 사용.
 
 
 @app.post("/api/setup-network-region")
@@ -5655,32 +5790,40 @@ async def setup_network_region(req: RegionSetupRequest):
             ),
         )
 
-    # 경로를 요청으로 넘기면 그걸 쓰고, 아니면 resolve_local_pbf()가 찾아준다
-    # (예전에는 여기에 바탕화면 경로가 따로 박혀 있어, 위 DEFAULT_LOCAL_PBF를 고쳐도
-    #  행정구역 선택 경로만 옛 자리를 계속 봤다).
-    pbf_path = _Path(req.pbf_path) if req.pbf_path else (resolve_local_pbf() or DEFAULT_LOCAL_PBF)
+    pbf_path = _Path(req.pbf_path) if req.pbf_path else DEFAULT_LOCAL_PBF
     if not pbf_path.exists():
         raise HTTPException(status_code=400, detail=f"PBF 파일을 찾을 수 없습니다: {pbf_path}")
 
-    req_id = f"region-{req.osm_id}"
-    net_file = WORK_DIR / f"{req_id}.net.xml"
+    # user_bbox가 있으면 그걸 기준으로, 없으면 행정구역 bbox 기준으로 동작한다.
+    _has_user_bbox = req.user_bbox and all(k in req.user_bbox for k in ("s", "w", "n", "e"))
+    _pbf_mtime_r = int(pbf_path.stat().st_mtime) if pbf_path.exists() else 0
 
-    # bbox 구성
-    bbox = BBox(
-        s=region["min_lat"],
-        w=region["min_lon"],
-        n=region["max_lat"],
-        e=region["max_lon"],
-    )
+    if _has_user_bbox:
+        _ub = {k: float(req.user_bbox[k]) for k in ("s", "w", "n", "e")}
+        # bbox 해시 기반 req_id — 같은 구역이라도 그린 범위가 다르면 별도 캐시
+        _cached_osm = expected_bbox_osm_path(
+            _ub["s"], _ub["w"], _ub["n"], _ub["e"], _pbf_mtime_r, WORK_DIR
+        )
+        _bbox_tag = _cached_osm.stem.split("_")[1]   # "bbox_{tag}_p{mtime}" 에서 tag
+        req_id = f"bbox-{_bbox_tag}"
+        nc_bbox = BBox(s=_ub["s"], w=_ub["w"], n=_ub["n"], e=_ub["e"])
+    else:
+        safe_name = region["name_ko"].replace("/", "_").replace(" ", "_")
+        _cached_osm = WORK_DIR / f"region_{req.osm_id}_{safe_name}_p{_pbf_mtime_r}.osm"
+        req_id = f"region-{req.osm_id}"
+        nc_bbox = BBox(
+            s=region["min_lat"], w=region["min_lon"],
+            n=region["max_lat"], e=region["max_lon"],
+        )
+
+    # v2: --keep-edges.in-geo-boundary 제거 → 이전 캐시와 구별하기 위해 접미사 추가
+    net_file = WORK_DIR / f"{req_id}-v2.net.xml"
 
     with _network_lock:
         reset_simulation_state()
 
         try:
             # Fast-path: .osm + .net.xml 모두 캐시돼 있으면 osmium + netconvert를 건너뜀
-            # extract_osm_from_pbf 내부 캐시 경로와 동일한 파일명 규칙을 따른다.
-            safe_name = region["name_ko"].replace("/", "_").replace(" ", "_")
-            _cached_osm = WORK_DIR / f"region_{req.osm_id}_{safe_name}.osm"
             _cached = _cached_osm.exists() and net_file.exists()
 
             if _cached:
@@ -5690,14 +5833,14 @@ async def setup_network_region(req: RegionSetupRequest):
                     None, load_mock_graph, osm_file
                 )
             else:
-                # Step 1: 로컬 PBF에서 OSM 추출
-                osm_file = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                import functools as _functools
+                # Step 1: 로컬 PBF에서 OSM 추출 (user_bbox가 있으면 그 범위로)
+                _extract_fn = _functools.partial(
                     extract_osm_from_pbf,
-                    req.osm_id,
-                    pbf_path,
-                    WORK_DIR,
+                    req.osm_id, pbf_path, WORK_DIR, 0.001,
+                    _ub if _has_user_bbox else None,
                 )
+                osm_file = await asyncio.get_event_loop().run_in_executor(None, _extract_fn)
 
                 # Step 2: mock graph 파싱
                 mock_graph = await asyncio.get_event_loop().run_in_executor(
@@ -5713,7 +5856,7 @@ async def setup_network_region(req: RegionSetupRequest):
                         print(f"[SETUP] 이미 변환해둔 도로망 재사용: {net_file.name}", flush=True)
                     else:
                         await asyncio.get_event_loop().run_in_executor(
-                            None, netconvert, osm_file, net_file, bbox
+                            None, netconvert, osm_file, net_file, nc_bbox
                         )
                 except Exception as exc:
                     raise HTTPException(
@@ -5731,9 +5874,14 @@ async def setup_network_region(req: RegionSetupRequest):
             _state["nstar_seed"] = None
             _state["sim_mode"] = "sumo"
             _state["network_ready"] = True
-            _state["current_bbox"] = {
-                "s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e
-            }
+            # user_bbox가 있으면 사용자가 실제로 그린 bbox를 current_bbox로 사용한다.
+            # 없으면 행정구역 전체 bbox를 사용한다.
+            # current_bbox는 기지국 배치 후보 필터로 쓰이므로, 사용자가 그린 구역과 정확히
+            # 일치해야 "내가 그린 구역 전체에 배치"가 된다.
+            if _has_user_bbox:
+                _state["current_bbox"] = {k: float(req.user_bbox[k]) for k in ("s", "w", "n", "e")}
+            else:
+                _state["current_bbox"] = {"s": nc_bbox.s, "w": nc_bbox.w, "n": nc_bbox.n, "e": nc_bbox.e}
             # 행정구역 선택 경로도 같다 — 옛 구역 기지국을 정리하지 않으면 그대로 섞인다.
             _purge_nodes_outside_bbox(_state["current_bbox"])
             # ⚠️ current_bbox **다음에** 부를 것 — 위 bbox 경로와 같은 이유(_demand_bbox 참조)
@@ -5766,7 +5914,7 @@ async def setup_network_region(req: RegionSetupRequest):
                 "region": region["name_ko"],
                 "net_file": str(net_file),
                 "area_km2": area_km2,
-                "bbox": {"s": bbox.s, "w": bbox.w, "n": bbox.n, "e": bbox.e},
+                "bbox": _state["current_bbox"],
                 "mapping": mapping_stats,
             }
 
@@ -5945,15 +6093,21 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
     # 여기서는 **이미 만들어진 것만** 쓴다. 이 함수는 동기이고 async 엔드포인트에서
     # 직접 호출되므로, 여기서 교통을 만들면 이벤트 루프가 수 분간 멈춘다.
     # 생성은 호출부(start_simulation)가 executor에서 미리 해둔다.
+    # 배율이 달라도 주입된 공유 교통의 형상(피크 엣지 부하)은 배경 차량에 쓸 수 있다.
     _scn = current_traffic_scenario(build=False)
+    if _scn is None:
+        _scn = _state.get("traffic_scenario")  # 배율 불일치 시 직접 읽기(배치 공유 교통)
     if _scn is not None and _scn.peak_edge_loads:
         _bg_vehicles = background_vehicles_from_scenario(_scn)
         print(f"[BG-VEHICLES] 생성 교통 피크 스냅샷 {len(_bg_vehicles)}대 "
               f"(N* {_scn.n_star:.0f} × {_scn.demand_scale * 100:.0f}%)", flush=True)
-    elif req.vehicle_count and req.vehicle_count > 1 and _state.get("current_bbox"):
+    elif _state.get("mock_graph") and _state.get("current_bbox"):
+        # 교통 시나리오가 없으면 구역 내 무작위 배경 차량으로 폴백한다.
+        # vehicle_count=1(배치 기본값)이어도 route_coords 애니메이션용으로 최소 10대를 만든다.
+        _bg_count = max(10, (req.vehicle_count or 1) - 1)
         try:
             _bg_vehicles = _generate_background_vehicles(
-                _state["mock_graph"], _state["current_bbox"], req.vehicle_count - 1, _rng,
+                _state["mock_graph"], _state["current_bbox"], _bg_count, _rng,
                 (_state.get("policy_options") or {}).get("traffic_time_period", "peak"),
             )
         except Exception as _bg_exc:
@@ -6035,7 +6189,7 @@ def _evaluate_mock_route(req: SimStartRequest, _rng: random.Random, *, synchrono
         try:
             # V4 GNN adapter — 서버 기동 시 로드된 모델 (PPO/DQN registry가 아님)
             from app.services.rl.rl_trainer import _v4_adapter as _rl_adap
-            if _rl_adap is not None and _rl_adap.is_ready:
+            if _rl_adap is not None:
                 _bs_for_rl = _state.get("network_nodes") or []
                 _type_map_rl = {"5G": "5G", "4G": "4G", "6G": "6G", "bs": "5G", "BS": "5G"}
                 _net_mode_rl = _type_map_rl.get(
@@ -6217,11 +6371,6 @@ async def start_simulation(req: SimStartRequest):
     """
     if not _state["network_ready"]:
         raise HTTPException(status_code=400, detail="네트워크가 준비되지 않았습니다. 먼저 구역을 설정하세요.")
-    if _active_batch_id is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="시나리오 배치가 실행 중입니다(같은 _state를 공유하므로 동시 실행 불가). 배치가 끝난 후 다시 시도하세요.",
-        )
 
     # 이미 준비 중이면 새로 만들지 않고 같은 상태를 돌려준다 — 중복 시작 방지.
     # ⚠️ 이 가드가 없으면 준비 대기 중 눌린 시작들이 락에 줄을 섰다가 한꺼번에 통과해
@@ -6286,19 +6435,16 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
     #    세게 된다(진행문서 §2-8). 여기서 미리 만들어 두면 그쪽이 "있음"으로 보고 건너뛴다.
     _apply_simulation_config(merge_with_default_config(spec.simulation_config))
 
-    _note("preparing", "교통 준비를 시작합니다…")
-    _state["traffic_preparing"] = True
-    _state["traffic_stage"] = "calibrating"
-    try:
-        traffic = current_traffic_scenario(log=_log)
-    finally:
-        _state["traffic_preparing"] = False
-        _state["traffic_stage"] = None
+    # 공유 교통을 build=False로 가져온다 — 배치 워커가 이미 주입했으므로 즉시 반환된다.
+    # 배율 불일치로 캐시 미스 시 현재 _state에 있는 것을 직접 읽는다(형상은 같다).
+    traffic = current_traffic_scenario(build=False)
     if traffic is None:
-        raise RuntimeError(
-            "교통 생성에 실패해 평가를 중단했습니다. 교통 없이 계산하면 배경 차량 몇 대짜리 "
-            "결과가 나와 다른 시나리오와 비교할 수 없습니다. 구역 설정을 확인하세요."
-        )
+        traffic = _state.get("traffic_scenario")  # 배율 다른 캐시라도 교통 형상은 쓸 수 있다
+    if traffic is not None:
+        _note("evaluating", f"경로·자원 배분을 평가하는 중… "
+                            f"(교통 {traffic.total_trips:,.0f}통행, {traffic.demand_scale * 100:.0f}%)")
+    else:
+        _note("evaluating", "경로·자원 배분을 평가하는 중… (교통 없음 — ITS/균일 수요 폴백)")
 
     req = SimStartRequest(
         origin=spec.origin,
@@ -6312,8 +6458,6 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
     )
     _state["sim_mode"] = "mock"  # 배치는 항상 mock-graph 즉시평가만 사용(SUMO 실시간 스레드 없음)
     _rng = _prepare_simulation_run(req)
-    _note("evaluating", f"경로·자원 배분을 평가하는 중… "
-                        f"(생성 교통 {traffic.total_trips:,.0f}통행 = 기준 {traffic.n_star:,.0f} × {traffic.demand_scale * 100:.0f}%)")
     _evaluate_mock_route(req, _rng, synchronous=True)
 
     # 대시보드가 실시간으로 보여주는 network_telemetry(L_base/L_signal/L_queue 분해,
@@ -6335,7 +6479,11 @@ def _evaluate_route_scenario(spec: ScenarioSpec, scenario_id: str, batch_id: str
             "network_telemetry": telemetry,
         })
     _bg_out = [
-        {"id": v["id"], "lat": v["lat"], "lng": v["lng"], "speed": v.get("speed_kmh", v.get("speed", 30))}
+        {
+            "id": v["id"], "lat": v["lat"], "lng": v["lng"],
+            "speed": v.get("speed_kmh", v.get("speed", 30)),
+            **({"route_coords": v["route_coords"]} if v.get("route_coords") else {}),
+        }
         for v in (_state.get("background_vehicles") or [])
     ]
     return {
@@ -6473,6 +6621,18 @@ def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
         dict.__setitem__(_state, "network_nodes", _prev_nodes)
         shared_mock_graph = dict.__getitem__(_state, "mock_graph")
 
+        # 교통 시나리오 1회 공유 빌드 — 시나리오마다 새로 만들면 시나리오당 최대 10분.
+        # 이미 만들어진 게 있으면(배율 불일치 포함) 그대로 쓴다; 없으면 1회 빌드를
+        # 시도하되 실패해도 배치는 계속 — _evaluate_route_scenario가 ITS/균일로 폴백.
+        _progress("preparing", "배치 공유 교통 시나리오를 확인하는 중…")
+        shared_traffic = dict.__getitem__(_state, "traffic_scenario")
+        if shared_traffic is None:
+            try:
+                _progress("preparing", "공유 교통을 처음 만드는 중… (최대 10분)")
+                shared_traffic = current_traffic_scenario()
+            except Exception as _te:
+                print(f"[BATCH] 교통 생성 실패 — ITS/균일 폴백으로 배치 진행: {_te}", flush=True)
+
         for i, spec in enumerate(scenarios):
             item_id = spec.id or spec.label or str(i)
             run["current_index"] = i
@@ -6497,6 +6657,9 @@ def _run_scenario_batch(batch_id: str, scenarios: list[ScenarioSpec]) -> None:
             scenario_st["background_vehicles"]    = []
             scenario_st["error"]                  = None
             scenario_st["warning"]                = None
+            # 공유 교통 주입 — build=False로 빠르게 가져가도록 미리 세팅.
+            # 배율이 달라도 교통 *형상*(어느 엣지가 혼잡한지)은 동일하게 쓸 수 있다.
+            scenario_st["traffic_scenario"]       = shared_traffic
 
             try:
                 BatchStateProxy.push_local(scenario_st)
@@ -6579,6 +6742,15 @@ def get_scenario_batch(batch_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail=f"배치 '{batch_id}'를 찾을 수 없습니다.")
     return run
+
+
+@app.delete("/api/scenarios/batch/active")
+def cancel_active_batch():
+    """비상용: 멈춘 배치 잠금을 강제 해제. 배치 스레드는 백그라운드에서 계속 완료를 향해 실행된다."""
+    global _active_batch_id
+    prev = _active_batch_id
+    _active_batch_id = None
+    return {"ok": True, "cleared": prev}
 
 
 @app.post("/api/scenarios/generate")
@@ -8453,7 +8625,7 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
         (_state.get("policy_options") or {}).get("network_mode", "5G")
     spread = max(1, int(req.spread))
 
-    from app.services.placement.auto_placement import build_pool, blue_noise_place, nearest_neighbor_cv, PlacePoint
+    from app.services.placement.auto_placement import build_pool, blue_noise_place, grid_stratified_place, nearest_neighbor_cv, PlacePoint
     from app.services.placement.sa_placement import optimize_placement
     from app.services.buildings.bs_placement import resolve_placement
 
@@ -8479,7 +8651,12 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
     sa_its: list[dict] = []
     sa_demand: list = []
     if method == "sa":
-        _scn = await asyncio.get_event_loop().run_in_executor(None, current_traffic_scenario)
+        # build=False — 이미 백그라운드 스레드가 만들고 있다면 기다리지 않고 즉시 반환.
+        # 캐시에 없으면(배율 불일치 포함) 기존 어떤 배율이든 현재 캐시를 시도한다.
+        _scn = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: current_traffic_scenario(build=False))
+        if _scn is None:
+            _scn = _state.get("traffic_scenario")  # 배율이 달라도 수요 형상은 쓸 수 있다
         if _scn is not None and _scn.demand_points:
             sa_demand = _scn.demand_points
             print(f"[PLACE] 생성 교통 수요점 {len(sa_demand)}개 사용 "
@@ -8530,7 +8707,15 @@ async def auto_place_network_nodes(req: AutoPlaceRequest):
         if len(pool) < n:
             label = "RSU 교차로(degree≥3)" if node_type == "rsu" else "BS 도로 노드"
             warnings.append(f"{label} 후보가 {len(pool)}개뿐이라 요청 {n}개 대신 {len(pool)}개만 배치합니다.")
-        return blue_noise_place(pool, n, m=spread, seed=seed, anchors=base_anchors)
+        # 격자 분할 배치: bbox를 √n × √n 셀로 나눠 각 셀에서 가장 가까운 노드를 선택.
+        # blue_noise는 도로망 밀도에 편중되므로 공간 균등성이 낮다(2026-08-14).
+        if base_anchors:
+            # 기존 노드가 있으면 그 근처를 제외하고 blue_noise로 채운다
+            effective_m = max(spread, min(len(pool), max(300, len(pool) // max(n // 3, 1))))
+            return blue_noise_place(pool, n, m=effective_m, seed=seed, anchors=base_anchors)
+        # bbox를 넘기지 않는다 — 격자를 pool의 실제 노드 범위로 만들어야 한다.
+        # user_bbox를 넘기면 고속도로·녹지 등 도로 노드가 없는 셀이 생겨 중앙에 편중된다.
+        return grid_stratified_place(pool, n, seed=seed)
 
     # ── BS: 위치 산출 → 옥상 스냅 → 저장 ───────────────────────────────────────
     if n_bs > 0:
@@ -9779,7 +9964,6 @@ _BS_SELECTION_DESC = {
     "strongest_signal_bs": "거리의 제곱에 반비례하는 자유공간 경로손실 근사값으로 신호가 가장 강한 기지국 선택",
     "load_balanced_bs": "부하율(load/capacity)이 가장 낮은 기지국을 우선하고, 거리는 동률일 때만 보조 기준으로 사용",
     "look_ahead_bs_selection": "lowest_latency_bs와 동일하지만, 곧 커버리지를 벗어날 기지국에는 강한 페널티를 추가",
-    "rl_based_bs_selection": "강화학습 기반 기지국 선택 — 아직 학습된 에이전트가 없어 미구현 상태, 선택해도 lowest_latency_bs로 동작함",
     "v4_gnn": "GNN-MAML 학습 모델이 기지국을 직접 고름 — 모델이 안 올라와 있으면 기본 점수 방식으로 폴백",
 }
 _COST_WEIGHT_DESC = {

@@ -33,7 +33,7 @@ VEHICLE_HEIGHT_M = 1.5           # building_obstruction_analyzer._VEHICLE_HEIGHT
 
 # 이 규모 아래면 직렬이 더 빠르다 — 윈도우는 spawn이라 워커 하나 띄우는 데 1~2초가 든다.
 # (수요 × 후보)는 거리 컷오프 전 상한이라 실제 계산량보다 크지만, 문턱 판단에는 충분하다.
-_PARALLEL_MIN_PAIRS = 200_000
+_PARALLEL_MIN_PAIRS = 50_000
 
 
 def _log_noop(_: str) -> None:
@@ -44,7 +44,7 @@ def _worker_count(n_demand: int, n_cand: int) -> int:
     """쓸 워커 수. 작은 작업은 1(직렬)."""
     if n_demand * n_cand < _PARALLEL_MIN_PAIRS:
         return 1
-    return max(1, min(os.cpu_count() or 1, 8, n_demand))
+    return max(1, min(os.cpu_count() or 1, 12, n_demand))
 
 
 # ── 워커 프로세스 ─────────────────────────────────────────────────────────────

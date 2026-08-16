@@ -215,35 +215,68 @@ def get_region_by_bbox(lat: float, lon: float, level: int = 6) -> Optional[dict]
     return dict(rows[0]) if rows else None
 
 
+def _bbox_cache_tag(s: float, w: float, n: float, e: float) -> str:
+    """bbox 좌표 → 10자 16진수 캐시 태그 (여백 적용 후 좌표를 넘겨야 한다)."""
+    import hashlib
+    return hashlib.md5(f"{s:.5f},{w:.5f},{n:.5f},{e:.5f}".encode()).hexdigest()[:10]
+
+
+def expected_bbox_osm_path(
+    s: float, w: float, n: float, e: float,
+    pbf_mtime: int,
+    out_dir: Path,
+    margin_deg: float = 0.001,
+) -> Path:
+    """사용자 bbox 기반 OSM 추출 캐시 경로를 실제 추출 없이 반환한다.
+
+    extract_osm_from_pbf(bbox_override=...) 가 생성할 파일과 동일한 경로를 돌려주므로
+    fast-path 캐시 판단에 쓰면 된다.
+    """
+    s2, w2, n2, e2 = s - margin_deg, w - margin_deg, n + margin_deg, e + margin_deg
+    tag = _bbox_cache_tag(s2, w2, n2, e2)
+    return out_dir / f"bbox_{tag}_p{pbf_mtime}.osm"
+
+
 def extract_osm_from_pbf(
     osm_id: int,
     pbf_path: Path = DEFAULT_PBF,
     output_dir: Path = None,
     margin_deg: float = 0.001,
+    bbox_override: Optional[dict] = None,
 ) -> Path:
     """
     osmium extract를 사용해 PBF에서 해당 구역 OSM 추출.
     반환값: 생성된 .osm 파일 경로
 
+    bbox_override({s,w,n,e})가 주어지면 DB 행정구역 bbox 대신 그 좌표로 추출한다.
+    파일명도 bbox 해시 기반으로 달라져 같은 구역이라도 다른 bbox면 다른 캐시가 생긴다.
+
     osmium이 없으면 pyosmium으로 fallback.
     """
-    region = get_region(osm_id)
-    if not region:
-        raise ValueError(f"구역 osm_id={osm_id}를 DB에서 찾을 수 없습니다.")
-    if region["min_lat"] is None:
-        raise ValueError(f"구역 '{region['name_ko']}'의 bbox 정보가 없습니다.")
-
     out_dir = output_dir or (Path(tempfile.gettempdir()) / "v2x_regions")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # bbox에 약간의 여백 추가
-    s = region["min_lat"] - margin_deg
-    w = region["min_lon"] - margin_deg
-    n = region["max_lat"] + margin_deg
-    e = region["max_lon"] + margin_deg
+    _pbf_mtime = int(pbf_path.stat().st_mtime) if pbf_path.exists() else 0
 
-    safe_name = region["name_ko"].replace("/", "_").replace(" ", "_")
-    out_file = out_dir / f"region_{osm_id}_{safe_name}.osm"
+    if bbox_override and all(k in bbox_override for k in ("s", "w", "n", "e")):
+        s = float(bbox_override["s"]) - margin_deg
+        w = float(bbox_override["w"]) - margin_deg
+        n = float(bbox_override["n"]) + margin_deg
+        e = float(bbox_override["e"]) + margin_deg
+        tag = _bbox_cache_tag(s, w, n, e)
+        out_file = out_dir / f"bbox_{tag}_p{_pbf_mtime}.osm"
+    else:
+        region = get_region(osm_id)
+        if not region:
+            raise ValueError(f"구역 osm_id={osm_id}를 DB에서 찾을 수 없습니다.")
+        if region["min_lat"] is None:
+            raise ValueError(f"구역 '{region['name_ko']}'의 bbox 정보가 없습니다.")
+        s = region["min_lat"] - margin_deg
+        w = region["min_lon"] - margin_deg
+        n = region["max_lat"] + margin_deg
+        e = region["max_lon"] + margin_deg
+        safe_name = region["name_ko"].replace("/", "_").replace(" ", "_")
+        out_file = out_dir / f"region_{osm_id}_{safe_name}_p{_pbf_mtime}.osm"
 
     if out_file.exists():
         return out_file

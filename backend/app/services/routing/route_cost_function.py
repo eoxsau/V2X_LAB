@@ -248,7 +248,6 @@ def _bs_score(
     strongest_signal_bs: quadratic distance loss proxy (free-space path loss ∝ d²)
     load_balanced_bs:    load ratio dominates; small distance tiebreaker
     look_ahead_bs:       lowest-latency + hard penalty when out of coverage
-    rl_based_bs:         falls back to lowest_latency_bs (RL agent not yet trained)
     v4_gnn:              GNN-MAML 추론 결과 사용 (_find_best_bs_light/full에서 직접 처리,
                          _bs_score까지 도달하지 않음)
     """
@@ -268,7 +267,7 @@ def _bs_score(
     if algo in ("look_ahead_bs_selection", "look_ahead_bs"):
         within_cov = dist_m <= cov_r
         return dist_pen + cong + edge_lat + (0.0 if within_cov else 10.0)
-    # lowest_latency_bs, rl_based_bs_selection, and any unknown → legacy formula
+    # lowest_latency_bs and any unknown → legacy formula
     return dist_pen + cong + edge_lat
 
 

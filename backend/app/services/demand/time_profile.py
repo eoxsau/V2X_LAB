@@ -40,6 +40,16 @@ def default_profile_path() -> Path:
     return (ROOT_DIR / "data/processed/traffic_survey/시간대_프로파일.csv").resolve()
 
 
+_SYNTHETIC_HOURLY = [
+    # 0~23시, 2010 TVOS 전국 상시조사 기반 합성 곡선 (CSV 없을 때 폴백)
+    # 아침 첨두 08~09시 ≈6.76%, 저녁 18~19시 ≈6.59%, 새벽 저점 03~04시 ≈0.72%
+    0.90, 0.65, 0.55, 0.72, 1.20, 2.10,   # 0~5시
+    3.80, 5.50, 6.76, 5.90, 4.80, 4.40,   # 6~11시
+    4.60, 4.50, 4.40, 4.60, 5.00, 5.80,   # 12~17시
+    6.59, 5.80, 4.80, 3.90, 2.80, 1.68,   # 18~23시
+]
+
+
 def load_hourly_profile(
     path: Optional[str] = None,
     column: str = DEFAULT_COLUMN,
@@ -48,13 +58,16 @@ def load_hourly_profile(
 
     column : "전체"(기본) 또는 등급별 열("시도·간선", "기타도로" 등). 구역 성격에 맞는
         등급을 고르면 곡선이 조금 달라지지만, 배치 비교가 목적이라 보통 전체로 충분하다.
+    CSV가 없으면 _SYNTHETIC_HOURLY 기본 곡선으로 폴백한다(경고 출력).
     """
     p = Path(path) if path else default_profile_path()
     if not p.exists():
-        raise FileNotFoundError(
-            f"시간대 프로파일이 없습니다: {p}\n"
-            f"  scripts/preprocess_traffic_survey.py 로 생성하세요."
+        import warnings
+        warnings.warn(
+            f"시간대 프로파일 CSV 없음: {p} — 기본 합성 곡선으로 대체합니다.",
+            stacklevel=2,
         )
+        return list(_SYNTHETIC_HOURLY)
     with open(p, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     if column not in (rows[0].keys() if rows else {}):

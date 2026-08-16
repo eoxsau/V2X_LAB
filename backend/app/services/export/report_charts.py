@@ -274,3 +274,181 @@ def improvement_delta_bar(improvement: dict,
     if selected and baseline:
         ax.set_title(f"{baseline}  →  {selected}", fontsize=9.5, color=NAVY, pad=10)
     return _save(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 그림 4 — 구간 지연 히스토그램
+# ──────────────────────────────────────────────────────────────────────────────
+
+def latency_histogram(latencies_ms: list) -> Optional[bytes]:
+    """구간 지연 분포 히스토그램. 막대 색 = 3-구간 신호등 (녹·황·적).
+
+    CDF가 '어느 비율까지 x ms 이하인가'를 보여준다면,
+    히스토그램은 '지연이 어디에 가장 많이 모여 있는가'를 바로 읽을 수 있다.
+    """
+    if not CHARTS_AVAILABLE or not latencies_ms:
+        return None
+    _ensure_font()
+
+    vals = [v for v in (_num(x) for x in latencies_ms) if v is not None]
+    if len(vals) < 2:
+        return None
+
+    n_bins = min(20, max(5, len(vals) // 3))
+    GREEN  = "#27AE60"
+    ORANGE = "#E67E22"
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.4))
+    counts, edges, patches = ax.hist(vals, bins=n_bins,
+                                     color=NAVY_LIGHT, edgecolor="white",
+                                     linewidth=0.6, zorder=3)
+    for patch, left in zip(patches, edges[:-1]):
+        patch.set_facecolor(GREEN if left < 20 else ORANGE if left < 100 else RED)
+
+    ax.axvline(20,  color=GREEN,  linestyle="--", linewidth=1.2, zorder=4,
+               label="URLLC 20 ms")
+    ax.axvline(100, color=ORANGE, linestyle="--", linewidth=1.2, zorder=4,
+               label="안전 100 ms")
+
+    ax.set_xlabel("구간 지연 (ms)", fontsize=9)
+    ax.set_ylabel("구간 수", fontsize=9)
+    ax.legend(fontsize=8, framealpha=0.85)
+    ax.grid(True, axis="y", color=GRID, linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(labelsize=8)
+    return _save(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 그림 5 — 기지국 부하율 가로 막대
+# ──────────────────────────────────────────────────────────────────────────────
+
+def bs_load_bar(per_bs_summary: list) -> Optional[bytes]:
+    """기지국별 부하율을 가로 막대로.
+
+    90 % 이상 = 빨강(과부하), 70-90 % = 주황(주의), 그 이하 = 녹색(정상).
+    최대 12개만 표시 (부하 높은 순).
+    """
+    if not CHARTS_AVAILABLE or not per_bs_summary:
+        return None
+    _ensure_font()
+
+    rows = [(str(b.get("bs_name", "—")), _num(b.get("load_ratio")))
+            for b in per_bs_summary]
+    rows = [(n, lr) for n, lr in rows if lr is not None]
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: r[1], reverse=True)
+    rows = rows[:12]
+    names  = [r[0] for r in rows]
+    pcts   = [r[1] * 100 for r in rows]
+    GREEN  = "#27AE60"
+    ORANGE = "#E67E22"
+    colors = [RED if p > 90 else ORANGE if p > 70 else GREEN for p in pcts]
+
+    fig, ax = plt.subplots(figsize=(7.0, max(2.4, 0.5 * len(rows) + 1.0)))
+    bars = ax.barh(names, pcts, color=colors, height=0.60, zorder=3)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 118)
+    ax.axvline(70, color=ORANGE, linestyle=":", linewidth=1.0, zorder=4, alpha=0.8)
+    ax.axvline(90, color=RED,    linestyle=":", linewidth=1.0, zorder=4, alpha=0.8)
+
+    for bar, pct in zip(bars, pcts):
+        ax.text(bar.get_width() + 1.2,
+                bar.get_y() + bar.get_height() / 2,
+                f"{pct:.0f}%", va="center", fontsize=8.5,
+                color="#333333")
+
+    ax.set_xlabel("부하율 (%)   · · · 점선: 70 % 주의 / 90 % 과부하", fontsize=9)
+    ax.xaxis.grid(True, color=GRID, linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y", length=0, labelsize=8.5)
+    ax.tick_params(axis="x", labelsize=8)
+    return _save(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 그림 6 — 알고리즘별 다지표 비교 (정규화 그룹 막대)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def algorithm_multi_metric(algorithms: list[dict], selected: str) -> Optional[bytes]:
+    """알고리즘별로 비용·지연·PRR·핸드오버 4개 지표를 정규화하여 묶음 막대로 비교.
+
+    각 지표는 [0, 1]로 정규화하고 '높을수록 좋음'으로 방향을 통일한다.
+    (비용·지연·핸드오버는 낮을수록 좋으므로 1−정규화).
+    알고리즘이 1개이면 비교 의미가 없으므로 None을 반환한다.
+    """
+    if not CHARTS_AVAILABLE or len(algorithms) < 2:
+        return None
+    _ensure_font()
+
+    AXES = [
+        ("total_cost",          "비용",     True),   # (키, 라벨, 낮을수록 좋음)
+        ("average_latency_ms",  "지연",     True),
+        ("prr_approx",          "PRR",      False),
+        ("handover_count",      "핸드오버", True),
+        ("average_bs_load",     "BS 부하",  True),
+    ]
+    PALETTE = [NAVY, "#E67E22", "#27AE60", "#8E44AD", "#C0392B", NAVY_LIGHT]
+
+    # 정규화
+    norm: dict[str, dict[str, float]] = {}
+    for key, _label, lower_better in AXES:
+        vals = [_num(a.get(key)) for a in algorithms]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        mn, mx = min(vals), max(vals)
+        span = mx - mn or 1.0
+        for a in algorithms:
+            v = _num(a.get(key))
+            if v is None:
+                continue
+            raw = (v - mn) / span
+            norm.setdefault(str(a.get("algorithm", "")), {})[key] = (
+                1.0 - raw if lower_better else raw
+            )
+
+    algo_ids = [str(a.get("algorithm", "")) for a in algorithms]
+    valid_axes = [(k, lbl) for k, lbl, _ in AXES if any(k in norm.get(ai, {}) for ai in algo_ids)]
+    if not valid_axes:
+        return None
+
+    n_algos = len(algo_ids)
+    n_axes  = len(valid_axes)
+    width   = 0.7 / n_algos
+    x       = list(range(n_axes))
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.6))
+    for i, algo_id in enumerate(algo_ids):
+        heights = [norm.get(algo_id, {}).get(k, 0.0) for k, _ in valid_axes]
+        offset  = (i - (n_algos - 1) / 2.0) * width
+        xs      = [xi + offset for xi in x]
+        alpha   = 1.0 if algo_id == selected else 0.55
+        ax.bar(xs, heights, width=width * 0.92,
+               color=PALETTE[i % len(PALETTE)], alpha=alpha, zorder=3,
+               label=algo_id)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([lbl for _, lbl in valid_axes], fontsize=9)
+    ax.set_ylabel("정규화 점수 (높을수록 좋음)", fontsize=9)
+    ax.set_ylim(0, 1.12)
+    ax.yaxis.grid(True, color=GRID, linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="x", length=0)
+    ax.tick_params(axis="y", labelsize=8)
+
+    legend = ax.legend(fontsize=7.5, loc="upper right",
+                       framealpha=0.9, ncol=min(n_algos, 3))
+    for lh in legend.legend_handles:
+        lh.set_alpha(1.0)
+
+    ax.set_title(f"선택: {selected}", fontsize=9, color=NAVY, pad=8)
+    return _save(fig)

@@ -20,10 +20,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from .calibration import cached_nstar
+from .calibration import _gridlock_abort, cached_nstar
 from .pipeline import DemandResult, generate_demand
-from .simulation import (SimResult, edge_loads_to_demand, pick_target_depart_time,
-                         run_simulation)
+from .simulation import (SimResult, _depart_range, edge_loads_to_demand,
+                         pick_target_depart_time, run_simulation)
 from .time_profile import build_time_profile
 
 # UI 노브 범위 — 2026-07-27 사용자 확정 (상·하한은 잠정, 실사용 보고 조정)
@@ -201,9 +201,16 @@ def build_traffic_scenario(
         through_ratio=through_ratio, log=log, **_gen_kw)
 
     # 3. 동적 SUMO — 정체 만들고 피크 스냅샷
+    _, _scn_depart_max = _depart_range(str(d.routes_file))
     sim: SimResult = run_simulation(
         net_file=net_file, routes_file=d.routes_file, out_dir=str(out),
-        prefix=f"scn{round(scale * 100)}", log=log)
+        prefix=f"scn{round(scale * 100)}", log=log,
+        end_s=int(_scn_depart_max) + 3600,
+        step_length=1.0,           # 스텝 수 절반 → 2× 빠름 (피크 스냅샷엔 1s 정밀도로 충분)
+        time_to_teleport_s=60.0,   # 막힌 차 1분 후 텔포 (기본 300s → 5× 빠른 정체 해소)
+        sumo_threads=6,            # 12코어 절반 활용 (캘리브레이션 끝난 뒤 여유 코어 사용)
+        abort_check=_gridlock_abort,  # gridlock 감지 시 조기 종료 (피크 데이터는 이미 캡처됨)
+    )
 
     points = edge_loads_to_demand(sim.peak_edges)
 

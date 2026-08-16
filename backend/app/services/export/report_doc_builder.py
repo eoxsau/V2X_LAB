@@ -1511,6 +1511,12 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
             "Total route cost by algorithm (shorter is better)",
         )
 
+        _figure(
+            _charts.algorithm_multi_metric(doc.algorithms, doc.selected_algorithm),
+            "알고리즘별 다지표 비교 — 비용·지연·PRR·핸드오버·BS 부하 정규화 점수 (높을수록 우수)",
+            "Multi-metric algorithm comparison — normalized scores for cost, latency, PRR, handover, BS load (higher is better)",
+        )
+
     _section("4.3", "채널 및 공정성 지표", "Channel and Fairness Metrics", level=2)
     cf_headers = [_txt("지표", "Metric"), _txt("값", "Value"), _txt("출처", "Ref.")]
     cf_rows = [
@@ -1528,6 +1534,12 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
                                "Table 5. Channel and fairness metrics"))
 
     _section("4.4", "구간별 상위 20개", "Top-20 Per-Edge Metrics", level=2)
+
+    _figure(
+        _charts.latency_histogram(doc.latency_all_ms),
+        f"구간 지연 분포 히스토그램 — 녹색 ≤20 ms, 주황 ≤100 ms, 빨강 >100 ms ({len(doc.latency_all_ms)}개 구간)",
+        f"Per-edge latency histogram — green ≤20 ms, orange ≤100 ms, red >100 ms ({len(doc.latency_all_ms)} edges)",
+    )
 
     _figure(
         _charts.latency_cdf(doc.latency_all_ms),
@@ -1559,6 +1571,12 @@ def generate_docx(doc: ReportDocument, lang: str = "ko") -> bytes:
         _styled_table(bs_hdrs, bs_rows,
                       caption=_txt("Table 7. 기지국 부하 분석",
                                    "Table 7. Base station load analysis"))
+
+        _figure(
+            _charts.bs_load_bar(doc.per_bs_summary),
+            "기지국별 부하율 — 녹색 ≤70 % 정상, 주황 ≤90 % 주의, 빨강 >90 % 과부하",
+            "Per-BS load ratio — green ≤70 % normal, orange ≤90 % warning, red >90 % overloaded",
+        )
     else:
         d.add_paragraph(_txt("데이터 없음", "No data"))
 
